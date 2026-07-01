@@ -53,9 +53,15 @@ shared age key for you via `clan.vars` — so you configure nothing about age:
 
 ```nix
 # in your clan inventory
-instances.ssync.roles.peer.machines = {
-  laptop.settings.user = "alice";
-  desktop.settings.user = "alice";
+instances.ssync = {
+  module = {
+    name = "ssync";
+    input = "ssync";
+  }; # resolves from the ssync flake input
+  roles.peer.machines = {
+    laptop.settings.user = "alice";
+    desktop.settings.user = "alice";
+  };
 };
 ```
 

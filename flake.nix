@@ -36,7 +36,8 @@
 
       nixosModules.default = import ./nix/nixos-module.nix { inherit self; };
       homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };
-      clanModules.default = import ./nix/clan-service.nix { inherit self; };
+      # clan resolves external services via the `clan.modules.<name>` output.
+      clan.modules.ssync = import ./nix/clan-service.nix { inherit self; };
 
       formatter = forEachSystem (system: treefmtEval.${system}.config.build.wrapper);
 
