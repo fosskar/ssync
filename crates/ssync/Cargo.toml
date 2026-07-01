@@ -1,0 +1,20 @@
+[package]
+name = "ssync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ssync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ssync-core.workspace = true
+ssync-adapters.workspace = true
+ssync-crypto.workspace = true
+ssync-net.workspace = true
+tokio.workspace = true
+clap.workspace = true
+toml.workspace = true
