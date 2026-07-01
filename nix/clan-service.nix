@@ -1,12 +1,15 @@
 # Optional clan service: a thin wrapper over the NixOS module (DECISIONS §11).
 # ssync is leaderless, so there is a single role, `peer`; every machine in an
 # instance runs the same daemon as an equal. Exposed from flake.nix as
-# `clanModules.default`.
+# `clan.modules.ssync`.
 #
-# The shared age identity is generated and distributed by clan.vars (a `share`d
-# generator running `age-keygen -pq`), so the user configures nothing about age.
+# clan.vars provides everything so the user configures nothing but the peers:
+#   - a shared age key (encryption),
+#   - a shared namespace secret (one deterministic namespace, no ticket), and
+#   - a per-machine node key whose public node-id is shared to the other peers,
+#     so they auto-connect.
 { self }:
-{ ... }:
+{ clanLib, ... }:
 {
   _class = "clan.service";
   manifest.name = "ssync";
@@ -14,10 +17,9 @@
   manifest.categories = [ "Utility" ];
   manifest.readme = ''
     Runs the ssync daemon on each machine as an equal peer (role `peer`), syncing
-    coding-agent session files. The shared age key is generated and distributed
-    across peers via a shared clan.vars generator, so no age configuration is
-    needed. See the ssync repo docs (setup.md, identity.md) for pairing and the
-    same-absolute-path requirement.
+    coding-agent session files. clan.vars generates and distributes the shared age
+    key, a shared namespace secret, and each machine's node-id, so peers connect
+    automatically with no manual pairing. Just list the peer machines.
   '';
 
   roles.peer = {
@@ -44,15 +46,29 @@
       };
 
     perInstance =
-      { settings, ... }:
+      {
+        settings,
+        machine,
+        roles,
+        ...
+      }:
       {
         nixosModule =
-          { config, pkgs, ... }:
+          {
+            config,
+            pkgs,
+            lib,
+            ...
+          }:
+          let
+            ssync = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+            gens = config.clan.core.vars.generators;
+            otherPeers = lib.filterAttrs (name: _: name != machine.name) roles.peer.machines;
+          in
           {
             imports = [ self.nixosModules.default ];
 
-            # one shared age key for the whole instance, generated once and
-            # deployed to every peer.
+            # shared age key (encryption) — one value across all peers.
             clan.core.vars.generators.ssync-age = {
               share = true;
               files.key = {
@@ -61,20 +77,60 @@
                 owner = settings.user;
               };
               runtimeInputs = [ pkgs.age ];
-              # age-keygen writes the identity file directly (ssync reads the
-              # AGE-SECRET-KEY line, ignoring the comment lines), so no grep is
-              # needed in the sandbox.
               script = ''
                 age-keygen -pq -o "$out"/key
+              '';
+            };
+
+            # shared namespace secret — one value across all peers.
+            clan.core.vars.generators.ssync-namespace = {
+              share = true;
+              files.secret = {
+                secret = true;
+                deploy = true;
+                owner = settings.user;
+              };
+              runtimeInputs = [ ssync ];
+              script = ''
+                ssync keygen-namespace "$out"/secret
+              '';
+            };
+
+            # per-machine node key; its public node-id is non-secret and read by
+            # the other peers to connect.
+            clan.core.vars.generators.ssync-node = {
+              files.key = {
+                secret = true;
+                deploy = true;
+                owner = settings.user;
+              };
+              files.id = {
+                secret = false;
+                deploy = true;
+              };
+              runtimeInputs = [ ssync ];
+              script = ''
+                ssync keygen-node "$out"/key > "$out"/id
               '';
             };
 
             services.ssync = {
               enable = true;
               inherit (settings) user agent;
-              ageIdentityFile = config.clan.core.vars.generators.ssync-age.files.key.path;
+              ageIdentityFile = gens.ssync-age.files.key.path;
+              namespaceSecretFile = gens.ssync-namespace.files.secret.path;
+              nodeKeyFile = gens.ssync-node.files.key.path;
+              peers = lib.mapAttrsToList (
+                name: _:
+                clanLib.getPublicValue {
+                  flake = config.clan.core.settings.directory;
+                  machine = name;
+                  generator = "ssync-node";
+                  file = "id";
+                }
+              ) otherPeers;
             }
-            // pkgs.lib.optionalAttrs (settings.sessionDir != null) {
+            // lib.optionalAttrs (settings.sessionDir != null) {
               inherit (settings) sessionDir;
             };
           };

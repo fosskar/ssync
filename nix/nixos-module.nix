@@ -9,12 +9,23 @@
 }:
 let
   cfg = config.services.ssync;
-  configFile = pkgs.writeText "ssync-config.toml" ''
-    agent = "${cfg.agent}"
-    session_dir = "${cfg.sessionDir}"
-    age_identity_path = "${cfg.ageIdentityFile}"
-    data_dir = "${cfg.dataDir}"
-  '';
+  configFile = pkgs.writeText "ssync-config.toml" (
+    ''
+      agent = "${cfg.agent}"
+      session_dir = "${cfg.sessionDir}"
+      age_identity_path = "${cfg.ageIdentityFile}"
+      data_dir = "${cfg.dataDir}"
+    ''
+    + lib.optionalString (cfg.namespaceSecretFile != null) ''
+      namespace_secret_path = "${cfg.namespaceSecretFile}"
+    ''
+    + lib.optionalString (cfg.nodeKeyFile != null) ''
+      node_key_path = "${cfg.nodeKeyFile}"
+    ''
+    + lib.optionalString (cfg.peers != [ ]) ''
+      peers = [ ${lib.concatMapStringsSep ", " (p: "\"${p}\"") cfg.peers} ]
+    ''
+  );
 in
 {
   options.services.ssync = {
@@ -64,6 +75,28 @@ in
       type = lib.types.str;
       default = "/var/lib/ssync";
       description = "ssync's own managed state (node key, blobs, docs, index).";
+    };
+
+    namespaceSecretFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Shared namespace secret file (same on every peer). When set, peers join
+        one deterministic namespace with no ticket exchange. The clan service
+        sets this via clan.vars.
+      '';
+    };
+
+    nodeKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Override the iroh node key path (default: dataDir/node.key).";
+    };
+
+    peers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Peer node-ids to sync with (the clan service fills these in).";
     };
   };
 
