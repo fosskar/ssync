@@ -22,6 +22,16 @@ pub struct Config {
     /// Shared age identity file (same key on every machine).
     pub age_identity_path: PathBuf,
     pub data_dir: PathBuf,
+    /// Shared namespace secret (same on every peer). When set, peers auto-join
+    /// this one namespace with no ticket exchange (clan provides it).
+    #[serde(default)]
+    pub namespace_secret_path: Option<PathBuf>,
+    /// Override the node key path (default: `data_dir/node.key`).
+    #[serde(default)]
+    pub node_key_path: Option<PathBuf>,
+    /// Peer node-ids to sync with (clan fills this from the other machines).
+    #[serde(default)]
+    pub peers: Vec<String>,
 }
 
 impl Config {
@@ -42,6 +52,9 @@ impl Config {
             session_dir: home.join(".pi/agent/sessions"),
             age_identity_path: config.join("ssync/age.key"),
             data_dir: data.join("ssync"),
+            namespace_secret_path: None,
+            node_key_path: None,
+            peers: Vec::new(),
         })
     }
 

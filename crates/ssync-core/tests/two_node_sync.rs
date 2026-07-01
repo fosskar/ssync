@@ -142,6 +142,72 @@ async fn live_write_propagates_without_restart() {
 }
 
 #[tokio::test]
+async fn shared_namespace_auto_connects_without_ticket() {
+    let base = scratch("shared");
+    let ns_secret = ssync_net::generate_key_bytes();
+    let age = AgeIdentity::generate().unwrap().to_secret_string();
+
+    let root_a = base.join("a/sessions");
+    std::fs::create_dir_all(&root_a).unwrap();
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let mut node_a = Node::spawn(&base.join("a/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+
+    // the same secret must yield the same namespace on both — no ticket exchange
+    let id_a = node_a.open_shared_namespace(ns_secret).await.unwrap();
+    let id_b = node_b.open_shared_namespace(ns_secret).await.unwrap();
+    assert_eq!(id_a, id_b, "shared secret must yield the same namespace");
+
+    // connect the two peers (addresses here; in production resolved from node-ids)
+    let addr_a = node_a.endpoint_addr();
+    let addr_b = node_b.endpoint_addr();
+    node_a.sync_with(vec![addr_b]).await.unwrap();
+    node_b.sync_with(vec![addr_a]).await.unwrap();
+
+    let engine_a = Engine::new(
+        PiAdapter::new(&root_a),
+        AgeIdentity::from_secret_string(&age).unwrap(),
+        node_a,
+    );
+    let engine_b = Engine::new(
+        PiAdapter::new(&root_b),
+        AgeIdentity::from_secret_string(&age).unwrap(),
+        node_b,
+    );
+
+    let sa = base.join("a/status.toml");
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    tokio::spawn(async move { engine_b.run(&sb).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019eshared0001eeee71acbe20shared01.jsonl";
+    let src = root_a.join(rel);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents = b"shared namespace session\n";
+    std::fs::write(&src, contents).unwrap();
+
+    let dest = root_b.join(rel);
+    let mut ok = false;
+    for _ in 0..80 {
+        if let Ok(got) = std::fs::read(&dest) {
+            if got == contents {
+                ok = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "session did not sync over the shared namespace");
+}
+
+#[tokio::test]
 async fn deletion_propagates_and_does_not_resurrect() {
     let base = scratch("del");
     let secret = AgeIdentity::generate().unwrap().to_secret_string();
