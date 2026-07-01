@@ -124,12 +124,14 @@
                 name: _:
                 # keygen-node prints the node-id with a trailing newline; strip
                 # it so the value stays a single TOML string.
-                lib.removeSuffix "\n" (clanLib.getPublicValue {
-                  flake = config.clan.core.settings.directory;
-                  machine = name;
-                  generator = "ssync-node";
-                  file = "id";
-                })
+                lib.removeSuffix "\n" (
+                  clanLib.getPublicValue {
+                    flake = config.clan.core.settings.directory;
+                    machine = name;
+                    generator = "ssync-node";
+                    file = "id";
+                  }
+                )
               ) otherPeers;
             }
             // lib.optionalAttrs (settings.sessionDir != null) {

@@ -276,6 +276,34 @@ clan are strictly opt-in layers on top.
 
 ---
 
+## 12. systemd hardening
+
+**Decision:** the NixOS module runs the daemon under a strict systemd sandbox
+(`ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`, empty
+`CapabilityBoundingSet`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service
+~@privileged ~@resources`, `ProtectProc=invisible`/`ProcSubset=pid`, `PrivateTmp`,
+`PrivateDevices`, the `ProtectKernel*`/`ProtectClock`/`ProtectControlGroups` set,
+`RestrictNamespaces`/`RestrictRealtime`/`RestrictSUIDSGID`/`LockPersonality`/`RemoveIPC`).
+
+**Allow-list (what the sandbox must keep open, and why):**
+
+- `ReadWritePaths = [ sessionDir ]` — watch-and-import needs to write imported sessions
+  back atomically. A `systemd.tmpfiles` rule pre-creates `sessionDir` (owner = the run
+  user, `0700`) so the bind succeeds on first boot before the agent has created it.
+- `StateDirectory=ssync` — the only other writable path (`/var/lib/ssync`: node key, blobs,
+  docs, index, status).
+- `RestrictAddressFamilies = AF_INET AF_INET6 AF_UNIX AF_NETLINK` — iroh needs QUIC/UDP
+  over IPv4/IPv6 and `AF_NETLINK` to enumerate local interfaces for address discovery.
+- secrets (`/run/secrets/…`) and the Nix store stay readable via `ProtectSystem=strict`
+  (read-only, not hidden), so the age key / namespace secret / node key are reachable.
+
+**Verified:** the daemon starts under the full profile (`vm-module` check), and
+`age-keygen -pq` plus PQ-hybrid encrypt/decrypt round-trip cleanly under the same
+`MemoryDenyWriteExecute` + syscall filter — the `age` CLI is a Go binary spawned per
+encrypt/decrypt (DECISIONS §7), so that combination was the real risk and it holds.
+
+---
+
 ## Summary table
 
 | Axis                | Decision                                                                                     |

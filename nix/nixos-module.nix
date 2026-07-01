@@ -23,7 +23,7 @@ let
       node_key_path = "${cfg.nodeKeyFile}"
     ''
     + lib.optionalString (cfg.peers != [ ]) ''
-      peers = [ ${lib.concatMapStringsSep ", " (p: "\"${p}\"") cfg.peers} ]
+      peers = [ ${lib.concatMapStringsSep ", " (p: "\"${lib.removeSuffix "\n" p}\"") cfg.peers} ]
     ''
   );
 in
@@ -101,6 +101,12 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # ensure the watched session dir exists so the sandbox's ReadWritePaths bind
+    # succeeds on first boot (owner cfg.user, 0700).
+    systemd.tmpfiles.rules = [
+      "d ${cfg.sessionDir} 0700 ${cfg.user} - - -"
+    ];
+
     systemd.services.ssync = {
       description = "ssync coding-agent session sync";
       wantedBy = [ "multi-user.target" ];
@@ -112,6 +118,47 @@ in
         StateDirectory = "ssync";
         Restart = "on-failure";
         RestartSec = 5;
+
+        # --- hardening ---
+        # The daemon needs: RW to sessionDir (under $HOME) and its StateDirectory,
+        # read access to the secrets it is pointed at (/run/secrets, /nix/store),
+        # and outbound QUIC/UDP plus netlink for iroh. Everything else is denied.
+        ReadWritePaths = [ cfg.sessionDir ];
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = "read-only";
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        RestrictAddressFamilies = [
+          "AF_INET"
+          "AF_INET6"
+          "AF_UNIX"
+          "AF_NETLINK"
+        ];
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        RemoveIPC = true;
+        CapabilityBoundingSet = "";
+        AmbientCapabilities = "";
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
+        SystemCallErrorNumber = "EPERM";
+        SystemCallArchitectures = "native";
+        UMask = "0077";
       };
     };
   };
