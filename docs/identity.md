@@ -40,6 +40,17 @@ place projects at, e.g., `~/projects/<repo>` everywhere. ssync writes session
 files back byte-for-byte and never rewrites the header, keeping the store-as-is
 rule intact.
 
+### The username is part of the path
+
+Because the encoded cwd includes the home directory, a project under `$HOME`
+embeds the **username** in the key: `/home/alice/projects/foo` and
+`/home/bob/projects/foo` are different sessions. So for home-based projects the
+**OS username must be the same on every machine**. The NixOS module's `user`
+option is not a cross-user bridge — it only selects which user the daemon runs as;
+set the *same* username everywhere. Usernames may differ only for projects placed
+at a user-independent absolute path (e.g. `/srv/foo`), where no `$HOME` appears in
+the cwd.
+
 ## Provenance vs identity
 
 The originating machine is **metadata (provenance)**, not part of identity. A

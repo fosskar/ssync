@@ -26,11 +26,9 @@ nix build git+https://codeberg.org/fosskar/ssync
 ```nix
 {
   imports = [ inputs.ssync.homeManagerModules.default ];
-  services.ssync = {
-    enable = true;
-    # sessionDir defaults to ~/.pi/agent/sessions
-    ageIdentityFile = config.sops.secrets.ssync-age.path; # your shared key
-  };
+  services.ssync.enable = true;
+  # sessionDir defaults to ~/.pi/agent/sessions; the age key is auto-generated.
+  # For multi-machine, point ageIdentityFile at a key you share across machines.
 }
 ```
 
@@ -42,14 +40,24 @@ nix build git+https://codeberg.org/fosskar/ssync
   services.ssync = {
     enable = true;
     user = "alice";
-    sessionDir = "/home/alice/.pi/agent/sessions";
-    ageIdentityFile = "/run/secrets/ssync-age";
+    # sessionDir defaults to alice's ~/.pi/agent/sessions; age key auto-generated.
   };
 }
 ```
 
-A `clanModules.default` clan service (single `peer` role) is also exposed for
-clan users; it is a thin wrapper over the NixOS module and is entirely optional.
+### clan service
+
+A `clanModules.default` clan service (single `peer` role) is exposed for clan
+users. It wraps the NixOS module and, crucially, generates and distributes the
+shared age key for you via `clan.vars` — so you configure nothing about age:
+
+```nix
+# in your clan inventory
+instances.ssync.roles.peer.machines = {
+  laptop.settings.user = "alice";
+  desktop.settings.user = "alice";
+};
+```
 
 ## Configuration
 
