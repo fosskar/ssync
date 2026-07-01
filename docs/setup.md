@@ -47,9 +47,11 @@ nix build git+https://codeberg.org/fosskar/ssync
 
 ### clan service
 
-A `clanModules.default` clan service (single `peer` role) is exposed for clan
-users. It wraps the NixOS module and, crucially, generates and distributes the
-shared age key for you via `clan.vars` — so you configure nothing about age:
+A clan service (`clan.modules.ssync`, single `peer` role) is exposed for clan
+users. It wraps the NixOS module and uses `clan.vars` to generate and distribute
+**everything** — the shared age key, a shared namespace secret, and each machine's
+node-id — so peers **auto-connect with no manual pairing** and you configure
+nothing but the peer list:
 
 ```nix
 # in your clan inventory
@@ -64,6 +66,9 @@ instances.ssync = {
   };
 };
 ```
+
+That's the whole setup for clan — no `ssync ticket` / `ssync join`. The manual
+pairing below is only for the non-clan (standalone) modules.
 
 ## Configuration
 
