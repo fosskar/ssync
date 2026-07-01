@@ -611,6 +611,52 @@ mod tests {
     use super::*;
     use ssync_adapters::pi::PiAdapter;
     use ssync_net::iroh::SecretKey;
+    use std::path::Path;
+
+    #[test]
+    fn config_round_trips_with_peers() {
+        // mirrors the daemon config the nix modules render, including the
+        // shared-namespace fields and a multi-element peers array.
+        let toml_str = r#"
+            agent = "pi"
+            session_dir = "/home/x/.pi/agent/sessions"
+            age_identity_path = "/run/secrets/age/key"
+            data_dir = "/var/lib/ssync"
+            namespace_secret_path = "/run/secrets/ns/secret"
+            node_key_path = "/run/secrets/node/key"
+            peers = [ "aaa", "bbb" ]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.peers, vec!["aaa".to_string(), "bbb".to_string()]);
+        assert_eq!(
+            cfg.namespace_secret_path.as_deref(),
+            Some(Path::new("/run/secrets/ns/secret"))
+        );
+        assert_eq!(
+            cfg.node_key_path.as_deref(),
+            Some(Path::new("/run/secrets/node/key"))
+        );
+        // render back out and reparse: the fields survive a full round-trip.
+        let rendered = toml::to_string(&cfg).unwrap();
+        let cfg2: Config = toml::from_str(&rendered).unwrap();
+        assert_eq!(cfg.peers, cfg2.peers);
+        assert_eq!(cfg.namespace_secret_path, cfg2.namespace_secret_path);
+    }
+
+    #[test]
+    fn config_defaults_when_shared_fields_absent() {
+        // a pre-shared-namespace config (ticket flow) still parses.
+        let toml_str = r#"
+            agent = "pi"
+            session_dir = "/s"
+            age_identity_path = "/a"
+            data_dir = "/d"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.peers.is_empty());
+        assert_eq!(cfg.namespace_secret_path, None);
+        assert_eq!(cfg.node_key_path, None);
+    }
 
     #[test]
     fn merge_superset_is_the_superset() {
