@@ -43,9 +43,12 @@ in
 
     ageIdentityFile = lib.mkOption {
       type = lib.types.str;
+      default = "${cfg.dataDir}/age.key";
+      defaultText = lib.literalExpression "\"\${dataDir}/age.key\"";
       description = ''
-        Path to the shared age identity (same key on every machine). Provision it
-        out of band (e.g. sops-nix); it must not be world-readable.
+        Shared age identity file. If it does not exist the daemon generates one
+        on first run. It must be the *same* key on every machine, so for a
+        multi-machine setup point this at a secret you distribute (e.g. sops-nix).
       '';
     };
 

@@ -1,6 +1,5 @@
-# NixOS module: run `ssync daemon` as a system service for a given user.
-# Wired from flake.nix as `nixosModules.default` (captures `self` for the default
-# package). pi sessions are per-user, so `user` must own the session dir.
+# NixOS module: run `ssync daemon` as a system service for a given user. Wired
+# from flake.nix as `nixosModules.default`.
 { self }:
 {
   config,
@@ -29,7 +28,11 @@ in
 
     user = lib.mkOption {
       type = lib.types.str;
-      description = "User to run the daemon as; must own {option}`sessionDir`.";
+      description = ''
+        User to run the daemon as; must own {option}`sessionDir`. Not a cross-user
+        bridge: for projects under `$HOME` the username is part of the session key,
+        so use the *same* username on every machine (see docs/identity.md).
+      '';
     };
 
     agent = lib.mkOption {
@@ -40,14 +43,20 @@ in
 
     sessionDir = lib.mkOption {
       type = lib.types.str;
-      description = "The agent's session directory to watch (absolute path).";
+      default = "${config.users.users.${cfg.user}.home}/.pi/agent/sessions";
+      defaultText = lib.literalExpression "\"\${user home}/.pi/agent/sessions\"";
+      description = "The agent's session directory to watch. Defaults to pi's location.";
     };
 
     ageIdentityFile = lib.mkOption {
       type = lib.types.str;
+      default = "${cfg.dataDir}/age.key";
+      defaultText = lib.literalExpression "\"\${dataDir}/age.key\"";
       description = ''
-        Path to the shared age identity (same key on every machine). Provision it
-        out of band (e.g. sops-nix); it must not be world-readable.
+        Shared age identity file. If it does not exist the daemon generates one
+        on first run. It must be the *same* key on every machine, so for a
+        multi-machine setup point this at a secret you distribute yourself (e.g.
+        sops-nix). The clan service handles this for you via clan.vars.
       '';
     };
 
@@ -67,6 +76,7 @@ in
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/ssync --config ${configFile} daemon";
         User = cfg.user;
+        StateDirectory = "ssync";
         Restart = "on-failure";
         RestartSec = 5;
       };

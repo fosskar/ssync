@@ -1,8 +1,10 @@
 # Optional clan service: a thin wrapper over the NixOS module (DECISIONS §11).
 # ssync is leaderless, so there is a single role, `peer`; every machine in an
 # instance runs the same daemon as an equal. Exposed from flake.nix as
-# `clanModules.default`. This is inert unless evaluated by clan — no clan
-# dependency is added to the flake.
+# `clanModules.default`.
+#
+# The shared age identity is generated and distributed by clan.vars (a `share`d
+# generator running `age-keygen -pq`), so the user configures nothing about age.
 { self }:
 { ... }:
 {
@@ -27,17 +29,9 @@
             description = "Agent whose sessions to sync (v1: pi).";
           };
           sessionDir = lib.mkOption {
-            type = lib.types.str;
-            description = "The agent's session directory to watch (absolute).";
-          };
-          ageIdentityFile = lib.mkOption {
-            type = lib.types.str;
-            description = "Shared age identity file (same key on every machine).";
-          };
-          dataDir = lib.mkOption {
-            type = lib.types.str;
-            default = "/var/lib/ssync";
-            description = "ssync's own managed state.";
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            description = "Session directory to watch. Defaults to pi's location.";
           };
         };
       };
@@ -45,19 +39,35 @@
     perInstance =
       { settings, ... }:
       {
-        nixosModule = {
-          imports = [ self.nixosModules.default ];
-          services.ssync = {
-            enable = true;
-            inherit (settings)
-              user
-              agent
-              sessionDir
-              ageIdentityFile
-              dataDir
-              ;
+        nixosModule =
+          { config, pkgs, ... }:
+          {
+            imports = [ self.nixosModules.default ];
+
+            # one shared age key for the whole instance, generated once and
+            # deployed to every peer.
+            clan.core.vars.generators.ssync-age = {
+              share = true;
+              files.key = {
+                secret = true;
+                deploy = true;
+                owner = settings.user;
+              };
+              runtimeInputs = [ pkgs.age ];
+              script = ''
+                age-keygen -pq | grep AGE-SECRET-KEY > "$out"/key
+              '';
+            };
+
+            services.ssync = {
+              enable = true;
+              inherit (settings) user agent;
+              ageIdentityFile = config.clan.core.vars.generators.ssync-age.files.key.path;
+            }
+            // pkgs.lib.optionalAttrs (settings.sessionDir != null) {
+              inherit (settings) sessionDir;
+            };
           };
-        };
       };
   };
 }
