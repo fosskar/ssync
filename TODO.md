@@ -12,6 +12,16 @@ Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on eac
 - [ ] **Advisory soft-lease.** Optional synced "machine X is actively editing session Y"
       flag to warn before simultaneous edits. Not load-bearing consensus. (DECISIONS §4/§8)
 
+## Deletion
+
+- [ ] **Deletion by any participant, not just the author.** Today deleting a session only
+      removes this node's own author entry (`index_delete` tombstones one author), so a
+      session deleted on a machine other than the one that created it survives (its author's
+      live entry remains and re-syncs). Make any participating machine able to delete a shared
+      session for everyone — e.g. delete/tombstone all author entries for the key, or a
+      separate per-key deletion marker that overrides live entries and is guarded against
+      resurrection.
+
 ## More agents (each = one Adapter impl + append-only determination)
 
 - [ ] Claude Code (`~/.claude/projects/**`)
