@@ -18,9 +18,10 @@ Early. v1 targets the **pi** agent only and is under active construction. See
 
 - ✅ Syncs session **files** across your machines, peer-to-peer, automatically.
 - ✅ Encrypted at rest by default ([age](https://github.com/FiloSottile/age)).
-- ✅ No central server, no VPS, no relay you have to run. LAN sync needs zero
-  infrastructure; internet sync uses iroh's free public discovery (which only ever sees
-  ciphertext).
+- ✅ Self-converging: diverged append-only sessions are merged losslessly (pi), and
+  deletions propagate.
+- ✅ No central server, no VPS, no relay you have to run. Internet sync uses iroh's free
+  public discovery + hole-punching (which only ever sees ciphertext).
 - ❌ Not a live "continue a running process on another machine" tool.
 - ❌ Not an agent orchestrator or dashboard (see cctl, ccmanager, etc. for that).
 
@@ -31,13 +32,21 @@ session directory, encrypts changed sessions with age, and publishes them into a
 self-converging index ([iroh-docs](https://github.com/n0-computer/iroh-docs)) with the file
 contents moved as content-addressed blobs ([iroh-blobs](https://github.com/n0-computer/iroh-blobs)).
 Sessions are identified by the agent's own session id, so "the same session" is coherent on
-every machine. Peers find each other on a LAN via mDNS, or across the internet via iroh's
-public discovery + NAT hole-punching — then sync directly.
+every machine. Peers connect either from a one-off pairing ticket (standalone) or
+automatically when managed by [clan](https://clan.lol) (which distributes a shared
+namespace secret and each machine's node-id), then sync directly via iroh discovery and NAT
+hole-punching.
 
 ## Quick start
 
 ssync needs one **shared age key** on all your machines, and each synced project
 must live at the **same absolute path** everywhere (see `docs/identity.md`).
+
+**With [clan](https://clan.lol):** just list the peer machines — the clan service generates
+and distributes the shared age key, a shared namespace secret and each machine's node-id, so
+peers auto-connect with no `ticket`/`join`. See `docs/setup.md`.
+
+**Standalone** (plain binary / NixOS / home-manager), pair once with a ticket:
 
 ```bash
 # first machine
@@ -51,8 +60,8 @@ ssync join '<ticket-from-first-machine>'
 ssync daemon        # joins the namespace and syncs
 ```
 
-Run `ssync daemon` on each machine (the Nix modules do this as a service). Full
-instructions: `docs/setup.md`. Pairing details: `docs/pairing.md`.
+Run `ssync daemon` on each machine (the Nix modules do this as a hardened systemd service).
+Full instructions: `docs/setup.md`. Pairing details: `docs/pairing.md`.
 
 ```bash
 ssync status        # namespace, session count, conflicts
@@ -64,7 +73,8 @@ ssync conflicts     # sessions that diverged across machines
 Sessions often contain secrets (API keys, file contents). ssync encrypts every session at
 rest with age before it ever leaves the machine, so peers and any relay see only ciphertext.
 See `docs/threat-model.md`. Sessions are encrypted with post-quantum hybrid keys by default
-(ML-KEM-768 + X25519, via `age-keygen -pq`).
+(ML-KEM-768 + X25519, via `age-keygen -pq`). The NixOS module runs the daemon under a strict
+systemd sandbox (`docs/DECISIONS.md` §12).
 
 ## License
 
