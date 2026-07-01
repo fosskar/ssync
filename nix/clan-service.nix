@@ -12,6 +12,13 @@
   manifest.name = "ssync";
   manifest.description = "p2p sync of coding-agent session files";
   manifest.categories = [ "Utility" ];
+  manifest.readme = ''
+    Runs the ssync daemon on each machine as an equal peer (role `peer`), syncing
+    coding-agent session files. The shared age key is generated and distributed
+    across peers via a shared clan.vars generator, so no age configuration is
+    needed. See the ssync repo docs (setup.md, identity.md) for pairing and the
+    same-absolute-path requirement.
+  '';
 
   roles.peer = {
     description = "An equal peer that syncs its agent sessions with the others.";
