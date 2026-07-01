@@ -54,8 +54,11 @@
                 owner = settings.user;
               };
               runtimeInputs = [ pkgs.age ];
+              # age-keygen writes the identity file directly (ssync reads the
+              # AGE-SECRET-KEY line, ignoring the comment lines), so no grep is
+              # needed in the sandbox.
               script = ''
-                age-keygen -pq | grep AGE-SECRET-KEY > "$out"/key
+                age-keygen -pq -o "$out"/key
               '';
             };
 
