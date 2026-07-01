@@ -142,6 +142,138 @@ async fn live_write_propagates_without_restart() {
 }
 
 #[tokio::test]
+async fn deletion_propagates_and_does_not_resurrect() {
+    let base = scratch("del");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019edddd0001eeee71acbe20delete001.jsonl";
+
+    let root_a = base.join("a/sessions");
+    std::fs::create_dir_all(root_a.join("--proj--")).unwrap();
+    // keep a second unrelated session so the dir is never empty (deletion guard)
+    std::fs::write(
+        root_a.join("--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl"),
+        b"keep\n",
+    )
+    .unwrap();
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let node_a = Node::spawn(&base.join("a/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_a = Engine::new(
+        PiAdapter::new(&root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.create_namespace().await.unwrap();
+    let ticket = engine_a.share().await.unwrap();
+
+    let node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_b = Engine::new(
+        PiAdapter::new(&root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.join(ticket).await.unwrap();
+
+    std::fs::write(root_a.join(rel), b"header\nto-be-deleted\n").unwrap();
+
+    let sa = base.join("a/status.toml");
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    tokio::spawn(async move { engine_b.run(&sb).await });
+
+    // it appears on B
+    let dest = root_b.join(rel);
+    let mut appeared = false;
+    for _ in 0..40 {
+        if dest.exists() {
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(appeared, "session never reached B");
+
+    // delete on A -> must disappear on B and stay gone
+    std::fs::remove_file(root_a.join(rel)).unwrap();
+    let mut gone = false;
+    for _ in 0..80 {
+        if !dest.exists() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(gone, "deletion did not propagate to B");
+
+    // confirm it does not resurrect
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!dest.exists(), "deleted session resurrected on B");
+}
+
+#[tokio::test]
+async fn divergent_sessions_merge_and_converge() {
+    let base = scratch("merge");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019eccccdddd71acbe20merge0000001.jsonl";
+
+    let root_a = base.join("a/sessions");
+    std::fs::create_dir_all(root_a.join("--proj--")).unwrap();
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(root_b.join("--proj--")).unwrap();
+
+    let node_a = Node::spawn(&base.join("a/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_a = Engine::new(
+        PiAdapter::new(&root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.create_namespace().await.unwrap();
+    let ticket = engine_a.share().await.unwrap();
+
+    let node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_b = Engine::new(
+        PiAdapter::new(&root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.join(ticket).await.unwrap();
+
+    // each machine has its own divergent version of the same session
+    std::fs::write(root_a.join(rel), b"header\ncommon\nonly-on-a\n").unwrap();
+    std::fs::write(root_b.join(rel), b"header\ncommon\nonly-on-b\n").unwrap();
+
+    let sa = base.join("a/status.toml");
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    tokio::spawn(async move { engine_b.run(&sb).await });
+
+    // both files must converge to the lossless union (nothing dropped)
+    let want_lines = ["header", "common", "only-on-a", "only-on-b"];
+    let mut ok = false;
+    for _ in 0..80 {
+        let a = std::fs::read_to_string(root_a.join(rel)).unwrap_or_default();
+        let b = std::fs::read_to_string(root_b.join(rel)).unwrap_or_default();
+        let a_ok = want_lines.iter().all(|l| a.lines().any(|x| x == *l));
+        let b_ok = want_lines.iter().all(|l| b.lines().any(|x| x == *l));
+        if a_ok && b_ok && a == b {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "divergent sessions did not merge/converge to the union");
+}
+
+#[tokio::test]
 async fn divergent_writes_are_detected_as_conflict() {
     let base = scratch("conflict");
     let secret = AgeIdentity::generate().unwrap().to_secret_string();

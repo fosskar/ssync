@@ -173,14 +173,15 @@ impl<A: Adapter> Engine<A> {
         Ok(written)
     }
 
+    /// Sessions still genuinely diverged — the newest version does not already
+    /// contain every line of every author's version.
     pub async fn conflict_paths(&self) -> Result<Vec<String>> {
-        let prefix = format!("{}/", self.adapter.agent());
-        let mut out = Vec::new();
-        for key in self.node.conflicts().await? {
-            let key = String::from_utf8(key).context("index key not utf-8")?;
-            out.push(key.strip_prefix(&prefix).unwrap_or(&key).to_string());
-        }
-        Ok(out)
+        Ok(self
+            .divergent()
+            .await?
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .collect())
     }
 
     pub async fn status_report(&self) -> Result<StatusReport> {
@@ -189,6 +190,77 @@ impl<A: Adapter> Engine<A> {
             sessions: self.node.index_latest().await?.len(),
             conflicts: self.conflict_paths().await?,
         })
+    }
+
+    async fn get_plain(&self, hash: ssync_net::iroh_blobs::Hash) -> Option<Vec<u8>> {
+        let ciphertext = self.node.get_blob(hash).await.ok()?;
+        self.identity.decrypt(&ciphertext).ok()
+    }
+
+    /// Sessions where several authors' versions exist and the newest does not
+    /// contain the union of all lines. Since pi is append-only, the union is the
+    /// correct lossless resolution. Returns `(relative_path, merged_plaintext)`.
+    /// A stale duplicate (one version a subset of the newest) is not divergent.
+    async fn divergent(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        use std::collections::{BTreeMap, HashSet};
+        let prefix = format!("{}/", self.adapter.agent());
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, ssync_net::iroh_blobs::Hash)>> =
+            BTreeMap::new();
+        for (key, ts, hash) in self.node.index_entries_full().await? {
+            by_key.entry(key).or_default().push((ts, hash));
+        }
+        let mut out = Vec::new();
+        for (key, mut versions) in by_key {
+            let distinct: HashSet<String> = versions.iter().map(|(_, h)| h.to_string()).collect();
+            if distinct.len() <= 1 {
+                continue;
+            }
+            let key = String::from_utf8(key).context("index key not utf-8")?;
+            let Some(rel) = key.strip_prefix(&prefix).map(str::to_string) else {
+                continue;
+            };
+            versions.sort_by_key(|(ts, _)| *ts);
+            let (_, winner) = *versions.last().unwrap();
+            let Some(winner_pt) = self.get_plain(winner).await else {
+                continue;
+            };
+            let mut plaintexts = Vec::new();
+            let mut seen = HashSet::new();
+            for (_, h) in &versions {
+                if seen.insert(h.to_string()) {
+                    if let Some(p) = self.get_plain(*h).await {
+                        plaintexts.push(p);
+                    }
+                }
+            }
+            let merged = merge_lines(&plaintexts);
+            if merged != winner_pt {
+                out.push((rel, merged));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Publish the merged version of every genuinely-diverged session as the new
+    /// winner (under this node's author), converging all peers. Logs each merge
+    /// once. Returns whether anything was merged.
+    async fn resolve_divergences(
+        &self,
+        logged: &mut std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        let mut merged_any = false;
+        for (rel, merged) in self.divergent().await? {
+            let key = format!("{}/{}", self.adapter.agent(), rel);
+            let ciphertext = self.identity.encrypt(&merged)?;
+            let size = ciphertext.len() as u64;
+            let hash = self.node.add_blob(ciphertext).await?;
+            self.node.index_set(key.clone(), hash, size).await?;
+            if logged.insert(key) {
+                eprintln!("ssync: merged divergent session {rel} (lossless union, nothing lost)");
+            }
+            merged_any = true;
+        }
+        Ok(merged_any)
     }
 
     async fn write_status(&self, path: &Path) {
@@ -210,14 +282,21 @@ impl<A: Adapter> Engine<A> {
     pub async fn run(&self, status_path: &Path) -> Result<()> {
         self.import_all().await?;
         self.write_status(status_path).await;
+        // Paths the exporter removed (peer deletion), so the import loop doesn't
+        // mistake them for a local deletion and echo it back.
+        let exporter_deleted: Deleted = Default::default();
         tokio::try_join!(
-            self.watch_import_loop(status_path),
-            self.export_loop(status_path),
+            self.watch_import_loop(status_path, &exporter_deleted),
+            self.export_loop(status_path, &exporter_deleted),
         )?;
         Ok(())
     }
 
-    async fn watch_import_loop(&self, status_path: &Path) -> Result<()> {
+    async fn watch_import_loop(
+        &self,
+        status_path: &Path,
+        exporter_deleted: &Deleted,
+    ) -> Result<()> {
         use std::collections::{HashMap, HashSet};
         use std::time::{Duration, SystemTime};
 
@@ -277,9 +356,31 @@ impl<A: Adapter> Engine<A> {
                     }
                 }
                 _ = rescan.tick() => {
+                    let files = session_files(self.adapter.session_root(), &self.adapter);
                     let mut changed = false;
-                    for path in session_files(self.adapter.session_root(), &self.adapter) {
-                        changed |= self.import_if_changed(&path, &mut seen).await;
+                    for path in &files {
+                        changed |= self.import_if_changed(path, &mut seen).await;
+                    }
+                    // Propagate user deletions. Guard: never delete everything at
+                    // once (a transiently empty/unmounted dir must not wipe peers).
+                    if !files.is_empty() {
+                        let present: HashSet<PathBuf> = files.into_iter().collect();
+                        let gone: Vec<PathBuf> =
+                            seen.keys().filter(|p| !present.contains(*p)).cloned().collect();
+                        for path in gone {
+                            seen.remove(&path);
+                            if exporter_deleted.lock().unwrap().remove(&path) {
+                                continue; // our own exporter removed it
+                            }
+                            if let Ok(id) = self.adapter.identify(&path) {
+                                match self.node.index_delete(self.index_key(&id)).await {
+                                    Ok(()) => changed = true,
+                                    Err(e) => {
+                                        eprintln!("ssync: delete {}: {e:#}", path.display())
+                                    }
+                                }
+                            }
+                        }
                     }
                     if changed {
                         self.write_status(status_path).await;
@@ -314,12 +415,17 @@ impl<A: Adapter> Engine<A> {
         }
     }
 
-    async fn export_loop(&self, status_path: &Path) -> Result<()> {
-        use std::collections::HashMap;
+    async fn export_loop(&self, status_path: &Path, exporter_deleted: &Deleted) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
         use std::time::Duration;
 
         let mut exported: HashMap<String, String> = HashMap::new();
-        if self.export_changed(&mut exported).await? {
+        let mut merged_logged: HashSet<String> = HashSet::new();
+        let merged = self
+            .resolve_divergences(&mut merged_logged)
+            .await
+            .unwrap_or(false);
+        if self.export_changed(&mut exported, exporter_deleted).await? || merged {
             self.write_status(status_path).await;
         }
 
@@ -349,7 +455,8 @@ impl<A: Adapter> Engine<A> {
                 }
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
-                    if self.export_changed(&mut exported).await? {
+                    let merged = self.resolve_divergences(&mut merged_logged).await.unwrap_or(false);
+                    if self.export_changed(&mut exported, exporter_deleted).await? || merged {
                         self.write_status(status_path).await;
                     }
                 }
@@ -363,11 +470,14 @@ impl<A: Adapter> Engine<A> {
     async fn export_changed(
         &self,
         exported: &mut std::collections::HashMap<String, String>,
+        exporter_deleted: &Deleted,
     ) -> Result<bool> {
         let prefix = format!("{}/", self.adapter.agent());
         let mut wrote = false;
+        let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (key, hash) in self.node.index_latest().await? {
             let key = String::from_utf8(key).context("index key not utf-8")?;
+            current.insert(key.clone());
             let hash_str = hash.to_string();
             if exported.get(&key) == Some(&hash_str) {
                 continue;
@@ -386,8 +496,53 @@ impl<A: Adapter> Engine<A> {
             exported.insert(key, hash_str);
             wrote = true;
         }
+        // Sessions removed from the index (deleted on a peer) -> remove locally.
+        let removed: Vec<String> = exported
+            .keys()
+            .filter(|k| !current.contains(*k))
+            .cloned()
+            .collect();
+        for key in removed {
+            exported.remove(&key);
+            if let Some(relative) = key.strip_prefix(&prefix) {
+                let dest = self.adapter.session_root().join(relative);
+                exporter_deleted.lock().unwrap().insert(dest.clone());
+                let _ = tokio::fs::remove_file(&dest).await;
+                wrote = true;
+            }
+        }
         Ok(wrote)
     }
+}
+
+/// Shared set of paths the exporter removed, so the importer won't re-delete.
+type Deleted = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>;
+
+/// Merge append-only session versions by unioning their lines: longest version
+/// first (so a superset stays intact), then any unique lines from the others.
+/// Lossless — safe for pi, whose sessions only ever grow (compaction is an
+/// appended marker, never a rewrite; see docs/pi-format-notes.md).
+fn merge_lines(versions: &[Vec<u8>]) -> Vec<u8> {
+    let mut order: Vec<&Vec<u8>> = versions.iter().collect();
+    order.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let mut lines: Vec<&[u8]> = Vec::new();
+    for v in order {
+        for line in v.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if seen.insert(line) {
+                lines.push(line);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for line in &lines {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Metadata stamp (mtime, len) used to detect whether a file changed.
@@ -443,6 +598,29 @@ mod tests {
     use super::*;
     use ssync_adapters::pi::PiAdapter;
     use ssync_net::iroh::SecretKey;
+
+    #[test]
+    fn merge_superset_is_the_superset() {
+        let short = b"h\na\nb\n".to_vec();
+        let long = b"h\na\nb\nc\n".to_vec();
+        assert_eq!(merge_lines(&[short, long.clone()]), long);
+    }
+
+    #[test]
+    fn merge_fork_unions_all_lines_losslessly() {
+        let a = b"h\na1\na2\n".to_vec();
+        let b = b"h\na1\nb2\n".to_vec();
+        let m = merge_lines(&[a, b]);
+        let s = String::from_utf8(m).unwrap();
+        for line in ["h", "a1", "a2", "b2"] {
+            assert!(s.lines().any(|l| l == line), "missing {line} in {s:?}");
+        }
+        assert_eq!(
+            s.lines().filter(|l| *l == "h").count(),
+            1,
+            "header duplicated"
+        );
+    }
 
     #[tokio::test]
     async fn imported_session_round_trips_decrypted() {
