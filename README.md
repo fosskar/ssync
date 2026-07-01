@@ -11,8 +11,8 @@ and writes incoming sessions back so the agent can `--resume` them anywhere.
 
 ## Status
 
-Early. v1 targets the **pi** agent only and is under active construction. See `PLAN.md` for
-the build plan and `DECISIONS.md` for the design rationale.
+Early. v1 targets the **pi** agent only and is under active construction. See
+`docs/DECISIONS.md` for the design rationale.
 
 ## What it is / isn't
 
@@ -34,26 +34,38 @@ Sessions are identified by the agent's own session id, so "the same session" is 
 every machine. Peers find each other on a LAN via mDNS, or across the internet via iroh's
 public discovery + NAT hole-punching — then sync directly.
 
-## Quick start (planned)
+## Quick start
+
+ssync needs one **shared age key** on all your machines, and each synced project
+must live at the **same absolute path** everywhere (see `docs/identity.md`).
 
 ```bash
-# on your first machine
-ssync init                 # generates keys, prints this node's public key
-ssync daemon               # start syncing
+# first machine
+ssync init          # writes config.toml, generates the age key
+ssync daemon        # creates a namespace and starts syncing
+ssync ticket        # prints this machine's pairing ticket
 
-# on your second machine
-ssync init --import-age <path-to-shared-age-key>
-ssync peer add <first-machine-public-key>
-ssync daemon
+# second machine (after copying the same age key over)
+ssync init
+ssync join '<ticket-from-first-machine>'
+ssync daemon        # joins the namespace and syncs
+```
+
+Run `ssync daemon` on each machine (the Nix modules do this as a service). Full
+instructions: `docs/setup.md`. Pairing details: `docs/pairing.md`.
+
+```bash
+ssync status        # namespace, session count, conflicts
+ssync conflicts     # sessions that diverged across machines
 ```
 
 ## Security
 
 Sessions often contain secrets (API keys, file contents). ssync encrypts every session at
 rest with age before it ever leaves the machine, so peers and any relay see only ciphertext.
-See `docs/threat-model.md`. Post-quantum (hybrid) encryption is targeted where a mature age
-plugin is available.
+See `docs/threat-model.md`. Sessions are encrypted with post-quantum hybrid keys by default
+(ML-KEM-768 + X25519, via `age-keygen -pq`).
 
 ## License
 
-Dual MIT / Apache-2.0 (matching the iroh ecosystem).
+MIT. See `LICENSE`.

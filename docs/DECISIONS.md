@@ -1,7 +1,6 @@
 # ssync — Decisions
 
-This document records **what** we decided and **why**. It is the rationale companion
-to `PLAN.md` (which records _how_ to build it). Read this first.
+This document records **what** we decided and **why**. Read this first.
 
 ssync is a tool that keeps **coding-agent session files** continuously in sync across
 a person's own machines, peer-to-peer, with no central server they have to run. The
@@ -84,7 +83,7 @@ _same_ session id is genuinely written on two machines independently.
 directory named after the **absolute cwd** and also embeds the absolute `cwd` in the session
 header. It keys purely on absolute path, not git/repo identity. This means **the same
 project must live at the same absolute path on every machine** for sessions to line up — a
-hard v1 requirement (PLAN section 3.3). Rewriting paths to relax this is possible but
+hard v1 requirement (see docs/pi-format-notes.md). Rewriting paths to relax this is possible but
 violates store-as-is, so it is deferred to TODO.
 
 ---
@@ -187,13 +186,13 @@ other secrets. Storing them in plaintext — even on the user's own central stor
 transit over a relay — is unacceptable. age is the right choice: modern, FOSS, widely
 trusted, already idiomatic in this user's ecosystem (sops-nix etc.).
 
-**Post-quantum:** Plain `age` is X25519 and is **not** post-quantum. PQ is added via age's
-plugin mechanism using a post-quantum KEM (e.g. ML-KEM/Kyber), deployed in **hybrid** form
-(X25519 + PQ KEM, so data is safe even if either breaks). Target: a hybrid PQ age recipient
-via a PQ age plugin, gated by config. If no plugin is production-ready at build time, ship
-standard X25519 age with a documented upgrade path. We do NOT block shipping on PQ and do
-NOT label a specific plugin production-grade without verification — but PQ-hybrid is the
-preferred target, not a "v2 feature."
+**Post-quantum:** ssync uses **post-quantum hybrid keys by default** (ML-KEM-768 + X25519),
+native in `age` >= 1.3 via `age-keygen -pq` (recipients `age1pq1…`). Hybrid means data stays
+safe if *either* primitive breaks — if ML-KEM (young) has a bug, X25519 still protects it; if
+a quantum computer breaks X25519, ML-KEM still protects it. PQ-only is deliberately **not**
+used: age offers no such mode, and it would discard the classical fallback. Because the Rust
+`age` crate is X25519-only, `ssync-crypto` shells out to the `age` CLI to get native hybrid;
+the in-process crate backend is kept disabled (feature `rust-age`) for when it gains ML-KEM.
 
 **Key management:** One **shared age identity distributed across the user's machines**
 (each machine holds the same age private key, distributed once via the user's existing
@@ -238,7 +237,7 @@ etc. is trivial (each is a "where do sessions live + is-append-only flag" declar
 test surface small. Multi-agent support is in the repo TODO. pi's format is already known
 (verified from source): per-session append-only JSONL at `~/.pi/agent/sessions/<encoded-
 cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in filename+header, append-only confirmed (so
-merge is safe for pi, though v1 still ships newest-wins). See PLAN section 1.
+merge is safe for pi, though v1 still ships newest-wins). See docs/pi-format-notes.md.
 
 ---
 
