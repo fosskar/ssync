@@ -41,6 +41,10 @@ enum Command {
     Status,
     /// List sessions that have diverged across machines.
     Conflicts,
+    /// Generate an iroh node key at PATH; print its node-id (for clan.vars).
+    KeygenNode { path: PathBuf },
+    /// Generate a shared namespace secret at PATH (for clan.vars).
+    KeygenNamespace { path: PathBuf },
 }
 
 #[tokio::main]
@@ -57,6 +61,15 @@ async fn main() -> Result<()> {
         Command::Join { ticket } => cmd_join(&config_path, &ticket),
         Command::Status => cmd_status(&config_path),
         Command::Conflicts => cmd_conflicts(&config_path),
+        Command::KeygenNode { path } => {
+            let bytes = ssync_net::generate_key_bytes();
+            write_secret_bytes(&path, &bytes)?;
+            println!("{}", ssync_net::node_id_of(&bytes));
+            Ok(())
+        }
+        Command::KeygenNamespace { path } => {
+            write_secret_bytes(&path, &ssync_net::generate_key_bytes())
+        }
     }
 }
 
@@ -104,31 +117,45 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     }
     let identity = load_identity(&config.age_identity_path)?;
 
-    let secret = load_or_create_secret_key(&config.data_dir.join("node.key")).await?;
+    let node_key_path = config
+        .node_key_path
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("node.key"));
+    let secret = load_or_create_secret_key(&node_key_path).await?;
     let mut node = Node::spawn(&config.data_dir, secret).await?;
 
-    // resolve the index namespace: reopen persisted, else join a staged ticket,
-    // else create a fresh one.
-    let ns_file = config.data_dir.join("namespace");
-    let remote_ticket = config.data_dir.join("remote-ticket");
-    if let Ok(text) = std::fs::read_to_string(&ns_file) {
-        let id: NamespaceId = text.trim().parse().context("parsing saved namespace")?;
-        node.open_namespace(id).await?;
-    } else if let Ok(text) = std::fs::read_to_string(&remote_ticket) {
-        let ticket: DocTicket = text.trim().parse().context("parsing staged ticket")?;
-        let id = node.join(ticket).await?;
-        std::fs::write(&ns_file, id.to_string())?;
-        std::fs::remove_file(&remote_ticket).ok();
-        println!("joined namespace {id}");
+    if let Some(ns_path) = &config.namespace_secret_path {
+        // shared-namespace mode (clan): one deterministic namespace on every peer
+        // plus direct peer node-ids — no ticket exchange.
+        let bytes = read_key_bytes(ns_path)?;
+        let id = node.open_shared_namespace(bytes).await?;
+        node.sync_with_peers(&config.peers).await?;
+        println!(
+            "ssync: shared namespace {id}, syncing with {} peer(s)",
+            config.peers.len()
+        );
     } else {
-        let id = node.create_namespace().await?;
-        std::fs::write(&ns_file, id.to_string())?;
-        println!("created namespace {id}");
+        // ticket-based pairing: reopen persisted, else join a staged ticket,
+        // else create a fresh namespace.
+        let ns_file = config.data_dir.join("namespace");
+        let remote_ticket = config.data_dir.join("remote-ticket");
+        if let Ok(text) = std::fs::read_to_string(&ns_file) {
+            let id: NamespaceId = text.trim().parse().context("parsing saved namespace")?;
+            node.open_namespace(id).await?;
+        } else if let Ok(text) = std::fs::read_to_string(&remote_ticket) {
+            let ticket: DocTicket = text.trim().parse().context("parsing staged ticket")?;
+            let id = node.join(ticket).await?;
+            std::fs::write(&ns_file, id.to_string())?;
+            std::fs::remove_file(&remote_ticket).ok();
+            println!("joined namespace {id}");
+        } else {
+            let id = node.create_namespace().await?;
+            std::fs::write(&ns_file, id.to_string())?;
+            println!("created namespace {id}");
+        }
+        let ticket = node.share().await?;
+        std::fs::write(config.data_dir.join("ticket"), ticket.to_string())?;
     }
-
-    // (re)publish this node's pairing ticket with fresh addresses.
-    let ticket = node.share().await?;
-    std::fs::write(config.data_dir.join("ticket"), ticket.to_string())?;
 
     if config.agent != "pi" {
         return Err(anyhow!(
@@ -207,6 +234,11 @@ fn load_identity(path: &Path) -> Result<AgeIdentity> {
 
 /// Write a secret string with `0600` permissions.
 fn write_secret(path: &Path, contents: &str) -> Result<()> {
+    write_secret_bytes(path, contents.as_bytes())
+}
+
+/// Write secret bytes with `0600` permissions.
+fn write_secret_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -214,4 +246,13 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+/// Read a 32-byte key/secret file.
+fn read_key_bytes(path: &Path) -> Result<[u8; 32]> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading key {}", path.display()))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("{} must be exactly 32 bytes", path.display()))
 }
