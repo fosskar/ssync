@@ -30,6 +30,24 @@ pub fn node_id_of(key_bytes: &[u8; 32]) -> String {
     SecretKey::from_bytes(key_bytes).public().to_string()
 }
 
+/// Parse peer node-id strings into addresses, tolerating surrounding whitespace
+/// (e.g. a trailing newline from a generated file) and skipping blank or
+/// malformed entries rather than failing the whole daemon.
+fn parse_peer_addrs(node_ids: &[String]) -> Vec<EndpointAddr> {
+    let mut addrs = Vec::new();
+    for s in node_ids {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.parse::<EndpointId>() {
+            Ok(id) => addrs.push(EndpointAddr::from(id)),
+            Err(e) => eprintln!("ssync: bad peer node-id {t:?}: {e}"),
+        }
+    }
+    addrs
+}
+
 /// Load the iroh secret key, generating and persisting one on first run so the
 /// node's public identity is stable across restarts.
 pub async fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
@@ -182,14 +200,7 @@ impl Node {
     /// Start syncing with the given peer node-ids. Addresses are resolved via
     /// iroh discovery, so only the node-ids are needed.
     pub async fn sync_with_peers(&self, node_ids: &[String]) -> Result<()> {
-        let mut addrs = Vec::new();
-        for s in node_ids {
-            match s.parse::<EndpointId>() {
-                Ok(id) => addrs.push(EndpointAddr::from(id)),
-                Err(e) => eprintln!("ssync: bad peer node-id {s:?}: {e}"),
-            }
-        }
-        self.sync_with(addrs).await
+        self.sync_with(parse_peer_addrs(node_ids)).await
     }
 
     /// Import `ticket`'s namespace, start syncing, make it active.
@@ -307,6 +318,27 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_peer_addrs_trims_and_skips_junk() {
+        let id1 = node_id_of(&generate_key_bytes());
+        let id2 = node_id_of(&generate_key_bytes());
+        let input = vec![
+            format!("{id1}\n"),          // trailing newline (the deploy bug)
+            format!("  {id2}  "),        // surrounding whitespace
+            String::new(),               // blank
+            "not-a-node-id".to_string(), // garbage
+        ];
+        let addrs = parse_peer_addrs(&input);
+        assert_eq!(
+            addrs.len(),
+            2,
+            "keep the two valid ids, skip blank + garbage"
+        );
+        let got: Vec<String> = addrs.iter().map(|a| a.id.to_string()).collect();
+        assert!(got.contains(&id1));
+        assert!(got.contains(&id2));
+    }
 
     #[tokio::test]
     async fn blob_round_trips_through_store() {
