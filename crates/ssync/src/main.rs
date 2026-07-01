@@ -88,9 +88,21 @@ fn cmd_init(config_path: &Path) -> Result<()> {
 
 async fn cmd_daemon(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
-    let identity = load_identity(&config.age_identity_path)?;
     std::fs::create_dir_all(&config.data_dir)?;
     std::fs::create_dir_all(&config.session_dir)?;
+
+    // Auto-generate the age identity on first run. It is shared across machines,
+    // so a second standalone machine must be given this same key (clan.vars does
+    // this automatically; standalone: copy it or pair once it can be transferred).
+    if !config.age_identity_path.exists() {
+        let id = AgeIdentity::generate()?;
+        write_secret(&config.age_identity_path, &id.to_secret_string())?;
+        eprintln!(
+            "ssync: generated age identity {}; other machines must use this same key",
+            config.age_identity_path.display()
+        );
+    }
+    let identity = load_identity(&config.age_identity_path)?;
 
     let secret = load_or_create_secret_key(&config.data_dir.join("node.key")).await?;
     let mut node = Node::spawn(&config.data_dir, secret).await?;
