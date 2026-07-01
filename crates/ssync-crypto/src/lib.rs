@@ -45,12 +45,15 @@ impl AgeIdentity {
         Ok(Self { secret, recipient })
     }
 
-    /// Build from an existing secret key string (`AGE-SECRET-KEY[-PQ]-1…`).
+    /// Build from an age identity: either a bare `AGE-SECRET-KEY[-PQ]-1…` line or
+    /// a full `age-keygen` file (comment lines are ignored).
     pub fn from_secret_string(s: &str) -> Result<Self> {
-        let secret = s.trim().to_string();
-        if !secret.starts_with("AGE-SECRET-KEY-") {
-            bail!("not an age secret key");
-        }
+        let secret = s
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("AGE-SECRET-KEY-"))
+            .ok_or_else(|| anyhow!("no age secret key found"))?
+            .to_string();
         let recipient = recipient_of(&secret)?;
         Ok(Self { secret, recipient })
     }
@@ -171,6 +174,18 @@ mod tests {
     fn secret_string_round_trips() {
         let id = AgeIdentity::generate().unwrap();
         let id2 = AgeIdentity::from_secret_string(&id.to_secret_string()).unwrap();
+        assert_eq!(id.recipient_string(), id2.recipient_string());
+    }
+
+    #[test]
+    fn parses_full_age_keygen_file() {
+        let id = AgeIdentity::generate().unwrap();
+        let file = format!(
+            "# created: 2026\n# public key: {}\n{}\n",
+            id.recipient_string(),
+            id.to_secret_string()
+        );
+        let id2 = AgeIdentity::from_secret_string(&file).unwrap();
         assert_eq!(id.recipient_string(), id2.recipient_string());
     }
 
