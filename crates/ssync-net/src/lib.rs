@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use futures_lite::{Stream, StreamExt};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
@@ -16,8 +16,19 @@ use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
 use iroh_docs::{AuthorId, DocTicket, NamespaceId};
+use iroh_docs::{Capability, NamespaceSecret};
 use iroh_gossip::net::Gossip;
 pub use {iroh, iroh_blobs, iroh_docs};
+
+/// A fresh random 32-byte key seed (usable as a node key or namespace secret).
+pub fn generate_key_bytes() -> [u8; 32] {
+    SecretKey::generate().to_bytes()
+}
+
+/// The iroh node-id (public key) for a 32-byte node key.
+pub fn node_id_of(key_bytes: &[u8; 32]) -> String {
+    SecretKey::from_bytes(key_bytes).public().to_string()
+}
 
 /// Load the iroh secret key, generating and persisting one on first run so the
 /// node's public identity is stable across restarts.
@@ -137,6 +148,48 @@ impl Node {
             .ok_or_else(|| anyhow::anyhow!("namespace {id} not found in store"))?;
         self.doc = Some(doc);
         Ok(())
+    }
+
+    /// Open the deterministic namespace derived from a shared 32-byte secret
+    /// (the same secret on every peer yields the same namespace — no ticket
+    /// exchange). Distributed by clan.vars.
+    pub async fn open_shared_namespace(&mut self, secret: [u8; 32]) -> Result<NamespaceId> {
+        let ns = NamespaceSecret::from_bytes(&secret);
+        let doc = self
+            .docs
+            .api()
+            .import_namespace(Capability::Write(ns))
+            .await
+            .context("importing shared namespace")?;
+        let id = doc.id();
+        self.doc = Some(doc);
+        Ok(id)
+    }
+
+    /// This node's dialable address (node-id plus known transport addresses).
+    pub fn endpoint_addr(&self) -> EndpointAddr {
+        self.endpoint.addr()
+    }
+
+    /// Start syncing the active namespace with the given peer addresses.
+    pub async fn sync_with(&self, addrs: Vec<EndpointAddr>) -> Result<()> {
+        if !addrs.is_empty() {
+            self.doc()?.start_sync(addrs).await?;
+        }
+        Ok(())
+    }
+
+    /// Start syncing with the given peer node-ids. Addresses are resolved via
+    /// iroh discovery, so only the node-ids are needed.
+    pub async fn sync_with_peers(&self, node_ids: &[String]) -> Result<()> {
+        let mut addrs = Vec::new();
+        for s in node_ids {
+            match s.parse::<EndpointId>() {
+                Ok(id) => addrs.push(EndpointAddr::from(id)),
+                Err(e) => eprintln!("ssync: bad peer node-id {s:?}: {e}"),
+            }
+        }
+        self.sync_with(addrs).await
     }
 
     /// Import `ticket`'s namespace, start syncing, make it active.
