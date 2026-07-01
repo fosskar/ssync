@@ -1,0 +1,16 @@
+[package]
+name = "ssync-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+iroh.workspace = true
+iroh-blobs.workspace = true
+iroh-docs.workspace = true
+iroh-gossip.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+futures-lite.workspace = true
