@@ -1,0 +1,18 @@
+[package]
+name = "ssync-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# Only used by the disabled in-process backend (feature `rust-age`). The default
+# backend shells out to the `age` CLI so it gets native post-quantum hybrid keys
+# (`age-keygen -pq`, ML-KEM-768 + X25519), which the Rust crate does not support.
+age = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+
+[features]
+# Re-enable the in-process Rust `age` crate backend once it gains ML-KEM support.
+rust-age = ["dep:age", "dep:secrecy"]
