@@ -17,7 +17,7 @@ use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
 use iroh_docs::{AuthorId, DocTicket, NamespaceId};
 use iroh_gossip::net::Gossip;
-pub use {iroh, iroh_docs};
+pub use {iroh, iroh_blobs, iroh_docs};
 
 /// Load the iroh secret key, generating and persisting one on first run so the
 /// node's public identity is stable across restarts.
@@ -185,6 +185,30 @@ impl Node {
         let query = Query::single_latest_per_key().key_exact(key);
         let entry = self.doc()?.get_one(query).await?;
         Ok(entry.map(|e| e.content_hash()))
+    }
+
+    /// Every author's current entry as `(key, timestamp, hash)` (multiple rows
+    /// per key when several machines wrote it). Used for content-based conflict
+    /// resolution.
+    pub async fn index_entries_full(&self) -> Result<Vec<(Vec<u8>, u64, Hash)>> {
+        let stream = self.doc()?.get_many(Query::all()).await?;
+        let mut stream = std::pin::pin!(stream);
+        let mut out = Vec::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            out.push((
+                entry.key().to_vec(),
+                entry.timestamp(),
+                entry.content_hash(),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Delete this node's entry for `key` (append-only tombstone that syncs).
+    pub async fn index_delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
+        self.doc()?.del(self.author, key.as_ref().to_vec()).await?;
+        Ok(())
     }
 
     /// Winning `(key, hash)` per key, newest wins (DECISIONS §8).
