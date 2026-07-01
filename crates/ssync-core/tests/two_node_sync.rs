@@ -84,6 +84,64 @@ async fn session_created_on_a_appears_on_b() {
 }
 
 #[tokio::test]
+async fn live_write_propagates_without_restart() {
+    let base = scratch("live");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let root_a = base.join("a/sessions");
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let node_a = Node::spawn(&base.join("a/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_a = Engine::new(
+        PiAdapter::new(&root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.create_namespace().await.unwrap();
+    let ticket = engine_a.share().await.unwrap();
+
+    let node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_b = Engine::new(
+        PiAdapter::new(&root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.join(ticket).await.unwrap();
+
+    // start both daemons and let them enter their loops
+    let sa = base.join("a/status.toml");
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    tokio::spawn(async move { engine_b.run(&sb).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // write a NEW session on A *after* startup (also a brand-new project dir)
+    let rel = "--proj--/2026-07-01T00-00-00-000Z_019e9999-eeee-71ac-be20-livewrite00001.jsonl";
+    let src = root_a.join(rel);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents = b"live write after start\n";
+    std::fs::write(&src, contents).unwrap();
+
+    let dest = root_b.join(rel);
+    let mut ok = false;
+    for _ in 0..60 {
+        if let Ok(got) = std::fs::read(&dest) {
+            if got == contents {
+                ok = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "live write after startup did not propagate to node B");
+}
+
+#[tokio::test]
 async fn divergent_writes_are_detected_as_conflict() {
     let base = scratch("conflict");
     let secret = AgeIdentity::generate().unwrap().to_secret_string();

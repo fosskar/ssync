@@ -202,12 +202,32 @@ impl<A: Adapter> Engine<A> {
         }
     }
 
-    /// Import + export once, then watch the session dir (import on change) and the
-    /// index (export on remote update), writing a status snapshot each pass.
+    /// Run the daemon: an initial import, then two concurrent debounced loops —
+    /// watch the session dir (import only changed files, with a periodic rescan
+    /// fallback) and react to index changes (export only changed sessions). The
+    /// loops share one task via `try_join!`, so a slow export never starves
+    /// imports, and both are incremental so the idle cost is ~zero.
     pub async fn run(&self, status_path: &Path) -> Result<()> {
         self.import_all().await?;
-        self.export_all().await?;
         self.write_status(status_path).await;
+        tokio::try_join!(
+            self.watch_import_loop(status_path),
+            self.export_loop(status_path),
+        )?;
+        Ok(())
+    }
+
+    async fn watch_import_loop(&self, status_path: &Path) -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, SystemTime};
+
+        // Files import_all already handled — don't re-read them.
+        let mut seen: HashMap<PathBuf, (SystemTime, u64)> = HashMap::new();
+        for path in session_files(self.adapter.session_root(), &self.adapter) {
+            if let Some(stamp) = file_stamp(&path) {
+                seen.insert(path, stamp);
+            }
+        }
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |res| {
@@ -217,15 +237,13 @@ impl<A: Adapter> Engine<A> {
             .watch(self.adapter.session_root(), RecursiveMode::Recursive)
             .with_context(|| format!("watching {}", self.adapter.session_root().display()))?;
 
-        let events = self.node.subscribe().await?;
-        let mut events = std::pin::pin!(events);
+        // Rescan periodically as a robust fallback for any missed fs event.
+        let mut rescan = tokio::time::interval(Duration::from_secs(15));
+        rescan.tick().await;
 
-        // Debounce filesystem events: pi appends to the live session file, so a
-        // single logical write emits many events. Collect changed paths and only
-        // import once they have been quiet for `DEBOUNCE`, so we never read a
-        // half-written file and don't import on every append.
-        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
-        let mut pending: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        // Debounce: pi appends to the live file, emitting many events per write.
+        const DEBOUNCE: Duration = Duration::from_millis(500);
+        let mut pending: HashSet<PathBuf> = HashSet::new();
         let mut deadline: Option<tokio::time::Instant> = None;
 
         loop {
@@ -250,31 +268,135 @@ impl<A: Adapter> Engine<A> {
                 }
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
-                    for path in pending.drain() {
-                        if path.is_file() {
-                            if let Err(e) = self.import_file(&path).await {
-                                eprintln!("ssync: import {}: {e:#}", path.display());
-                            }
-                        }
+                    let mut changed = false;
+                    for path in std::mem::take(&mut pending) {
+                        changed |= self.import_if_changed(&path, &mut seen).await;
                     }
-                    self.write_status(status_path).await;
-                }
-                Some(event) = events.next() => {
-                    if matches!(
-                        event,
-                        Ok(LiveEvent::InsertRemote { .. }) | Ok(LiveEvent::ContentReady { .. })
-                    ) {
-                        if let Err(e) = self.export_all().await {
-                            eprintln!("ssync: export: {e:#}");
-                        }
+                    if changed {
                         self.write_status(status_path).await;
                     }
                 }
-                else => break,
+                _ = rescan.tick() => {
+                    let mut changed = false;
+                    for path in session_files(self.adapter.session_root(), &self.adapter) {
+                        changed |= self.import_if_changed(&path, &mut seen).await;
+                    }
+                    if changed {
+                        self.write_status(status_path).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Import `path` only if its mtime/size changed since last seen (so a rescan
+    /// or a bounced write-back doesn't re-decrypt). Returns whether it imported.
+    async fn import_if_changed(
+        &self,
+        path: &Path,
+        seen: &mut std::collections::HashMap<PathBuf, (std::time::SystemTime, u64)>,
+    ) -> bool {
+        let Some(stamp) = file_stamp(path) else {
+            return false;
+        };
+        if seen.get(path) == Some(&stamp) {
+            return false;
+        }
+        match self.import_file(path).await {
+            Ok(_) => {
+                seen.insert(path.to_path_buf(), stamp);
+                true
+            }
+            Err(e) => {
+                eprintln!("ssync: import {}: {e:#}", path.display());
+                false
+            }
+        }
+    }
+
+    async fn export_loop(&self, status_path: &Path) -> Result<()> {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        let mut exported: HashMap<String, String> = HashMap::new();
+        if self.export_changed(&mut exported).await? {
+            self.write_status(status_path).await;
+        }
+
+        let events = self.node.subscribe().await?;
+        let mut events = std::pin::pin!(events);
+
+        const DEBOUNCE: Duration = Duration::from_millis(300);
+        let mut deadline: Option<tokio::time::Instant> = None;
+
+        loop {
+            let settle = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                event = events.next() => {
+                    match event {
+                        Some(Ok(LiveEvent::InsertRemote { .. }))
+                        | Some(Ok(LiveEvent::ContentReady { .. })) => {
+                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                _ = settle, if deadline.is_some() => {
+                    deadline = None;
+                    if self.export_changed(&mut exported).await? {
+                        self.write_status(status_path).await;
+                    }
+                }
             }
         }
         Ok(())
     }
+
+    /// Export only sessions whose winning blob hash differs from what was last
+    /// written, decrypting just those. Returns whether anything was written.
+    async fn export_changed(
+        &self,
+        exported: &mut std::collections::HashMap<String, String>,
+    ) -> Result<bool> {
+        let prefix = format!("{}/", self.adapter.agent());
+        let mut wrote = false;
+        for (key, hash) in self.node.index_latest().await? {
+            let key = String::from_utf8(key).context("index key not utf-8")?;
+            let hash_str = hash.to_string();
+            if exported.get(&key) == Some(&hash_str) {
+                continue;
+            }
+            let Some(relative) = key.strip_prefix(&prefix).map(str::to_string) else {
+                continue;
+            };
+            let ciphertext = match self.node.get_blob(hash).await {
+                Ok(ct) => ct,
+                // content not downloaded yet; retry on a later event.
+                Err(_) => continue,
+            };
+            let plaintext = self.identity.decrypt(&ciphertext)?;
+            let dest = self.adapter.session_root().join(&relative);
+            atomic_write(&dest, &plaintext).await?;
+            exported.insert(key, hash_str);
+            wrote = true;
+        }
+        Ok(wrote)
+    }
+}
+
+/// Metadata stamp (mtime, len) used to detect whether a file changed.
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    if !m.is_file() {
+        return None;
+    }
+    Some((m.modified().ok()?, m.len()))
 }
 
 /// Recursively collect session files under `root` accepted by `adapter`.
