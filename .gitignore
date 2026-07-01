@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Nix
+result
+result-*
+.direnv/
+
+# ssync local state (never commit keys or synced data)
+*.key
+age.key
+node.key
+/data/
+.ssync/
+
+# scratch / never commit
+.tmp/
+
+# editor / OS
+.DS_Store
+*.swp

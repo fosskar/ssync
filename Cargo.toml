@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ssync",
+    "crates/ssync-core",
+    "crates/ssync-crypto",
+    "crates/ssync-net",
+    "crates/ssync-adapters",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://codeberg.org/fosskar/ssync"
+
+[workspace.dependencies]
+anyhow = "1"
+age = "0.11"
+secrecy = "0.10"
+iroh = "1.0.1"
+iroh-blobs = { version = "0.103", features = ["fs-store"] }
+iroh-docs = { version = "0.101", features = ["fs-store"] }
+iroh-gossip = { version = "0.101", features = ["net"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+rand = "0.9"
+futures-lite = "2"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+ssync-core = { path = "crates/ssync-core" }
+ssync-crypto = { path = "crates/ssync-crypto" }
+ssync-net = { path = "crates/ssync-net" }
+ssync-adapters = { path = "crates/ssync-adapters" }
