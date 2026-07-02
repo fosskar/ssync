@@ -28,6 +28,19 @@ more. Delete redundant comments when you touch a file.
 
 - `.tmp/` — scratch/planning handed over by the user. Gitignored. Never track or push it.
 
+## Versioning / releases
+
+- Single source of truth: `[workspace.package] version` in the root `Cargo.toml`.
+  `nix/package.nix` reads it via `lib.importTOML`; never hardcode a version elsewhere.
+- Version format: semver `MAJOR.MINOR.PATCH` (e.g. `0.1.2`).
+- Pre-1.0 bump rules: breaking change or new feature → bump **MINOR**; bugfix or internal
+  change → bump **PATCH**. **MAJOR** stays 0 until the user declares 1.0.
+- When you finish a task that changes user-visible behavior, bump the version in the same
+  change set (once per task, not per commit). Pure refactors/docs/CI need no bump.
+- After editing the version, run a cargo command (e.g. `cargo check`) so `Cargo.lock`
+  picks up the new workspace version, and include the lockfile in the commit.
+- Releases are manual: user tags `v0.x.y` and pushes. No CI bumping, no release tooling.
+
 ## VCS
 
 - Colocated jj + git repo; **use jj**. Remote `origin` = `ssh://git@codeberg.org/fosskar/ssync.git`.

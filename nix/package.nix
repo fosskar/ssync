@@ -6,7 +6,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "ssync";
-  version = "0.0.1";
+  version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
   src = ../.;
   cargoLock.lockFile = ../Cargo.lock;
