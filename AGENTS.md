@@ -63,25 +63,29 @@ Follow TDD for new behavior in this repo:
 6. Prefer deterministic, in-process tests; reproduce any bug with a failing test first. For
    sync, use two in-memory iroh nodes in one test process rather than real networking.
 
-## Build / verify (no cargo on PATH — nix only)
+## Build / verify
 
-`cargo`/`rustc` are not on PATH; a C linker is also needed. Use:
+direnv (`.envrc` = `use flake`) auto-loads the devShell in this repo: the
+locked toolchain (cargo, rustc, clippy, rustfmt) plus `age` (needed by
+ssync-crypto's tests) are already on PATH — run `cargo …` directly:
 
 ```bash
-nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy nixpkgs#rustfmt nixpkgs#gcc -c bash -c '
-  cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets -- -D warnings
-  cargo test --workspace
-'
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Or via the flake devShell: `nix develop`. Package build: `nix build .#default`
-(→ `./result/bin/ssync`). Format nix files with `nix run nixpkgs#nixfmt -- <files>`.
+Without direnv (CI, bare shells), prefix with `nix develop -c`. Format with
+`nix fmt` (treefmt, nix/treefmt.nix: rustfmt, nixfmt, taplo, deadnix, statix)
+— not `cargo fmt` or ad-hoc nixfmt. A useful formatter/linter missing from
+treefmt? Add it to nix/treefmt.nix rather than running it ad hoc. Never
+`nix shell nixpkgs#cargo …`: that resolves nixpkgs from the registry, not
+flake.lock, so the toolchain drifts from the devShell.
+Package build: `nix build .#default` (→ `./result/bin/ssync`).
 
 ## Crates
 
 - `ssync` — binary: CLI + daemon wiring.
-- `ssync-core` — importer, exporter, index model, conflict logic.
+- `ssync-core` — sync engine (reconcile pass), index model, conflict logic.
 - `ssync-crypto` — age encrypt/decrypt, identity handling.
 - `ssync-net` — iroh endpoint/router/docs/blobs setup, peering.
 - `ssync-adapters` — `Adapter` trait + `PiAdapter`.
