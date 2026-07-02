@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use ssync_adapters::pi::PiAdapter;
 use ssync_core::{Config, Engine, StatusReport};
 use ssync_crypto::AgeIdentity;
 use ssync_net::iroh_docs::{DocTicket, NamespaceId};
-use ssync_net::{load_or_create_secret_key, Node};
+use ssync_net::{Node, load_or_create_secret_key};
 
 #[derive(Parser)]
 #[command(

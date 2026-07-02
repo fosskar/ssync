@@ -8,7 +8,7 @@
       enable = true;
       # match the crates' edition so treefmt's rustfmt sorts imports the same
       # way `cargo fmt` does (otherwise they fight over import order).
-      edition = "2021";
+      edition = "2024";
     };
   };
 

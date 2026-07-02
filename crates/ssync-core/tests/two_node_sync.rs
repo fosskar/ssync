@@ -10,8 +10,8 @@ use std::time::Duration;
 use ssync_adapters::pi::PiAdapter;
 use ssync_core::Engine;
 use ssync_crypto::AgeIdentity;
-use ssync_net::iroh::SecretKey;
 use ssync_net::Node;
+use ssync_net::iroh::SecretKey;
 
 fn scratch(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -72,11 +72,11 @@ async fn session_created_on_a_appears_on_b() {
     let mut ok = false;
     for _ in 0..60 {
         let _ = engine_b.export_all().await;
-        if let Ok(got) = std::fs::read(&dest) {
-            if got == contents {
-                ok = true;
-                break;
-            }
+        if let Ok(got) = std::fs::read(&dest)
+            && got == contents
+        {
+            ok = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -130,11 +130,11 @@ async fn live_write_propagates_without_restart() {
     let dest = root_b.join(rel);
     let mut ok = false;
     for _ in 0..60 {
-        if let Ok(got) = std::fs::read(&dest) {
-            if got == contents {
-                ok = true;
-                break;
-            }
+        if let Ok(got) = std::fs::read(&dest)
+            && got == contents
+        {
+            ok = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -196,11 +196,11 @@ async fn shared_namespace_auto_connects_without_ticket() {
     let dest = root_b.join(rel);
     let mut ok = false;
     for _ in 0..80 {
-        if let Ok(got) = std::fs::read(&dest) {
-            if got == contents {
-                ok = true;
-                break;
-            }
+        if let Ok(got) = std::fs::read(&dest)
+            && got == contents
+        {
+            ok = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

@@ -186,12 +186,13 @@ pub fn reconcile(
         }
 
         // Divergence is orthogonal to the presence decision above.
-        if let Some(e) = entry {
-            if e.head.hash.is_some() && e.distinct_live > 1 {
-                actions.push(Action::Merge {
-                    key: key.to_string(),
-                });
-            }
+        if let Some(e) = entry
+            && e.head.hash.is_some()
+            && e.distinct_live > 1
+        {
+            actions.push(Action::Merge {
+                key: key.to_string(),
+            });
         }
     }
     actions
