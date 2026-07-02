@@ -4,11 +4,11 @@ Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on eac
 
 ## Conflict handling
 
-- [ ] **Merge-based resolution for append-only formats.** Union timestamped lines from
-      divergent versions instead of newest-wins. Per-adapter, gated on `append_only = true`
-      _verified_ for that agent. **pi is already verified append-only**, so
-      pi merge is unblocked whenever you choose to implement it — union entry lines, keep the
-      single header, order by per-entry timestamp/id. (DECISIONS §8)
+- [x] **Merge-based resolution for append-only formats.** Done for pi: divergent
+      versions converge to a lossless line union — common prefix kept in order, each
+      fork's remaining lines appended, deduped across (not within) versions. No entry
+      parsing (store-as-is holds); ordering is prefix-based rather than per-entry
+      timestamp, so fork suffixes are concatenated, not interleaved. (DECISIONS §8)
 - [ ] **Advisory soft-lease.** Optional synced "machine X is actively editing session Y"
       flag to warn before simultaneous edits. Not load-bearing consensus. (DECISIONS §4/§8)
 

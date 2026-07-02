@@ -216,14 +216,15 @@ coordination now is solving a problem the user doesn't have. iroh-docs detects d
 rather than silently corrupting, and store-as-is means both versions survive. So the v1
 policy is safe: rare, detectable, recoverable.
 
-**Why not merge yet (deferred — see TODO):** Most agent transcripts are append-only
-timestamped JSONL, which means two divergent versions _could_ be losslessly merged by
-unioning their lines in timestamp order — strictly better than newest-wins. BUT this is
-only safe if the format is genuinely append-only; some agents _compact/rewrite_ their
-session files, where naive line-merge would corrupt. Since v1 targets **pi only**, the
-implementer must first determine pi's actual format. Merge is therefore **deferred to the
-repo TODO**, to be implemented per-adapter once each agent's format is confirmed
-append-only-safe.
+**Merge (implemented for pi):** Append-only transcripts can be losslessly merged by
+unioning their lines — strictly better than newest-wins. This is only safe if the format
+is genuinely append-only; some agents _compact/rewrite_ their session files, where naive
+line-merge would corrupt. pi was verified append-only (docs/pi-format-notes.md), so the
+engine merges divergent pi sessions: common prefix kept in chronological order, each
+fork's remaining lines appended, deduped across (not within) versions. The merge is
+pure line-set arithmetic — no entry parsing, store-as-is holds — and content-derived
+ordering makes every peer compute the identical result, so all nodes converge. A future
+non-append-only adapter falls back to detect + keep-both + newest-wins.
 
 ---
 
@@ -237,7 +238,8 @@ etc. is trivial (each is a "where do sessions live + is-append-only flag" declar
 test surface small. Multi-agent support is in the repo TODO. pi's format is already known
 (verified from source): per-session append-only JSONL at `~/.pi/agent/sessions/<encoded-
 cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in filename+header, append-only confirmed (so
-merge is safe for pi, though v1 still ships newest-wins). See docs/pi-format-notes.md.
+merge is safe for pi, and the engine merges divergent pi sessions losslessly — §8). See
+docs/pi-format-notes.md.
 
 ---
 
@@ -317,7 +319,7 @@ encrypt/decrypt (DECISIONS §7), so that combination was the real risk and it ho
 | Sync stack          | **iroh** (transport) + **iroh-docs** (CRDT index) + **iroh-blobs** (file transfer)           |
 | Infra the user runs | **None.** LAN via mDNS; internet via iroh's free public relay (ciphertext only)              |
 | Encryption          | **age, on by default**, PQ-hybrid if a mature plugin exists; shared identity across machines |
-| Conflicts (v1)      | No lease; detect + keep-both + newest-wins. **Merge deferred to TODO**                       |
+| Conflicts (v1)      | No lease; detect + keep-both; **lossless line-union merge** for pi (newest-wins fallback)    |
 | v1 agent            | **pi only**; interface trivially extensible (multi-agent in TODO)                            |
 | Boundary            | **Watch-and-import**, never sync-in-place                                                    |
 | Language            | **Rust**, single binary                                                                      |

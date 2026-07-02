@@ -531,25 +531,35 @@ impl<A: Adapter> Engine<A> {
 /// Shared set of paths the exporter removed, so the importer won't re-delete.
 type Deleted = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>;
 
-/// Merge append-only session versions by unioning their lines: longest version
-/// first (so a superset stays intact), then any unique lines from the others.
-/// Lossless — safe for pi, whose sessions only ever grow (compaction is an
-/// appended marker, never a rewrite; see docs/pi-format-notes.md).
+/// Merge append-only session versions: the common prefix (shared chronological
+/// history, duplicates intact) followed by each fork's remaining lines, deduped
+/// only across versions (a line both forks appended stays single; a duplicate
+/// within one version survives). Version order is content-derived, so every
+/// peer computes the identical merge. Lossless — safe for pi, whose sessions
+/// only ever grow (compaction is an appended marker, never a rewrite; see
+/// docs/pi-format-notes.md).
 fn merge_lines(versions: &[Vec<u8>]) -> Vec<u8> {
-    let mut order: Vec<&Vec<u8>> = versions.iter().collect();
-    order.sort_by_key(|b| std::cmp::Reverse(b.len()));
-    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-    let mut lines: Vec<&[u8]> = Vec::new();
-    for v in order {
-        for line in v.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            if seen.insert(line) {
-                lines.push(line);
-            }
-        }
+    let mut split: Vec<Vec<&[u8]>> = versions
+        .iter()
+        .map(|v| v.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect())
+        .collect();
+    split.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    let mut prefix = split.first().map_or(0, |v| v.len());
+    for v in &split[1..] {
+        prefix = (0..prefix.min(v.len()))
+            .take_while(|&i| v[i] == split[0][i])
+            .count();
     }
+
+    let mut lines: Vec<&[u8]> = split.first().map_or(Vec::new(), |v| v[..prefix].to_vec());
+    let mut emitted: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    for v in &split {
+        let suffix = &v[prefix..];
+        lines.extend(suffix.iter().filter(|l| !emitted.contains(*l)));
+        emitted.extend(suffix.iter().copied());
+    }
+
     let mut out = Vec::new();
     for line in &lines {
         out.extend_from_slice(line);
@@ -656,6 +666,41 @@ mod tests {
         assert!(cfg.peers.is_empty());
         assert_eq!(cfg.namespace_secret_path, None);
         assert_eq!(cfg.node_key_path, None);
+    }
+
+    #[test]
+    fn merge_preserves_duplicate_lines_within_a_version() {
+        // two identical entries (same bytes) in one version must both survive.
+        let a = b"h\nx\nx\na1\n".to_vec();
+        let b = b"h\nx\nx\nb1\n".to_vec();
+        let m = String::from_utf8(merge_lines(&[a, b])).unwrap();
+        assert_eq!(
+            m.lines().filter(|l| *l == "x").count(),
+            2,
+            "duplicate entry collapsed: {m:?}"
+        );
+    }
+
+    #[test]
+    fn merge_is_deterministic_regardless_of_input_order() {
+        let a = b"h\na1\n".to_vec();
+        let b = b"h\nb1\n".to_vec();
+        assert_eq!(
+            merge_lines(&[a.clone(), b.clone()]),
+            merge_lines(&[b, a]),
+            "peers feeding versions in different order must converge"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_common_history_in_order() {
+        // shared prefix must stay chronological, fork suffixes appended after.
+        let a = b"h\nc1\nc2\na1\n".to_vec();
+        let b = b"h\nc1\nc2\nb1\nb2\n".to_vec();
+        let m = String::from_utf8(merge_lines(&[a, b])).unwrap();
+        let lines: Vec<&str> = m.lines().collect();
+        assert_eq!(&lines[..3], &["h", "c1", "c2"], "prefix reordered: {m:?}");
+        assert_eq!(lines.len(), 6);
     }
 
     #[test]

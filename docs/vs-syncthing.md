@@ -18,7 +18,7 @@ correctly, and encrypting at rest with keys your peers cannot silently read.
 | --- | --- | --- |
 | Purpose | General folder sync | Agent **session-file** sync |
 | Awareness of content | Format-blind | Session-aware (identity = `(agent, project, session_id)`) |
-| Conflict handling | Generic `.sync-conflict-…` copies | Detect + keep-both + newest-wins; per-adapter append-only **merge** on the roadmap |
+| Conflict handling | Generic `.sync-conflict-…` copies | Detect + keep-both; lossless append-only **merge** (pi), newest-wins fallback |
 | Secret filtering | None | Adapter declares *where* sessions live; only those are synced |
 | Encryption at rest | Optional, and untrusted-only ("untrusted device" mode) | **age, on by default, always** |
 | Post-quantum | No | ML-KEM-768 + X25519 hybrid by default |
@@ -59,8 +59,8 @@ ssync instead:
   corrupted;
 - keeps both versions (they are content-addressed — nothing is lost);
 - applies newest-timestamp-wins as the active copy as a safety net;
-- and, per-adapter once a format is confirmed append-only-safe, can do a real
-  timestamp-ordered **merge** — strictly better than newest-wins. (See `DECISIONS.md` §8.)
+- and, per-adapter for formats confirmed append-only-safe (pi is), does a real lossless
+  line-union **merge** — strictly better than newest-wins. (See `DECISIONS.md` §8.)
 
 Syncthing can never do the merge, because it never looks inside the file.
 
