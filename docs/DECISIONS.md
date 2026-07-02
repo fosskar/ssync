@@ -223,7 +223,9 @@ line-merge would corrupt. pi was verified append-only (docs/pi-format-notes.md),
 engine merges divergent pi sessions: common prefix kept in chronological order, each
 fork's remaining lines appended, deduped across (not within) versions. The merge is
 pure line-set arithmetic — no entry parsing, store-as-is holds — and content-derived
-ordering makes every peer compute the identical result, so all nodes converge. A future
+ordering makes every peer compute the identical result, so all nodes converge. A merge
+is only computed once every version's blob is present locally (all-or-skip) — a union
+over a partially-downloaded version set would transiently drop a fork's lines. A future
 non-append-only adapter falls back to detect + keep-both + newest-wins.
 
 **Deletion (any participant):** the winning index entry per key is resolved *including*

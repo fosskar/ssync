@@ -244,44 +244,42 @@ impl Engine {
             let Some(rel) = self.relative_of(&key).map(str::to_string) else {
                 continue;
             };
-            if self.is_divergent(&key, winner, &rec.versions).await {
+            if self.is_diverged(&key, winner, &rec.versions).await == Some(true) {
                 out.push(rel);
             }
         }
         Ok(out)
     }
 
-    /// Whether `versions` (distinct live hashes) fail to collapse into `winner` —
-    /// i.e. the lossless union differs from the current winner. Cached by the
-    /// version-set fingerprint; only complete verdicts (all blobs present) cache.
-    async fn is_divergent(&self, key: &str, winner: Hash, versions: &[Hash]) -> bool {
+    /// The one divergence verdict: does the union of `versions` differ from
+    /// `winner`? `None` (uncached) while any blob is missing — a partial union
+    /// would be transiently lossy. Cached by version-set fingerprint.
+    async fn is_diverged(&self, key: &str, winner: Hash, versions: &[Hash]) -> Option<bool> {
         let mut fingerprint: Vec<String> = versions.iter().map(|h| h.to_string()).collect();
         fingerprint.sort();
         let fingerprint = fingerprint.join(",");
         if let Some((fp, verdict)) = self.divergence_cache.lock().unwrap().get(key)
             && *fp == fingerprint
         {
-            return *verdict;
+            return Some(*verdict);
         }
-        let Some(winner_pt) = self.get_plain(winner).await else {
-            return false;
-        };
-        let mut plaintexts = Vec::new();
-        for h in versions {
-            if let Some(p) = self.get_plain(*h).await {
-                plaintexts.push(p);
-            }
-        }
+        let winner_pt = self.get_plain(winner).await?;
+        let plaintexts = self.all_plaintexts(versions).await?;
         let divergent = merge_lines(&plaintexts) != winner_pt;
-        // only cache complete verdicts: a missing blob makes the union partial
-        // and would pin a wrong "not divergent" forever.
-        if plaintexts.len() == versions.len() {
-            self.divergence_cache
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), (fingerprint, divergent));
+        self.divergence_cache
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (fingerprint, divergent));
+        Some(divergent)
+    }
+
+    /// Decrypt every version blob, or `None` while any is still downloading.
+    async fn all_plaintexts(&self, versions: &[Hash]) -> Option<Vec<Vec<u8>>> {
+        let mut plaintexts = Vec::with_capacity(versions.len());
+        for h in versions {
+            plaintexts.push(self.get_plain(*h).await?);
         }
-        divergent
+        Some(plaintexts)
     }
 
     pub async fn status_report(&self) -> Result<StatusReport> {
@@ -299,15 +297,14 @@ impl Engine {
         })
     }
 
-    async fn get_plain(&self, hash: ssync_net::iroh_blobs::Hash) -> Option<Vec<u8>> {
+    async fn get_plain(&self, hash: Hash) -> Option<Vec<u8>> {
         let ciphertext = self.node.get_blob(hash).await.ok()?;
         self.identity.decrypt(&ciphertext).ok()
     }
 
-    /// Recompute the lossless union for one diverged key and publish it as the
-    /// new winner (under this node's author) only if it differs from the current
-    /// winner. Returns the relative path when it published, so the caller logs
-    /// the merge once.
+    /// Publish the lossless union for a diverged key; [`is_diverged`]
+    /// (Self::is_diverged) gates it, so a settled key costs one cache lookup.
+    /// Returns the relative path when it published.
     async fn merge_one(&self, key: &str) -> Result<Option<String>> {
         let Some(rel) = self.relative_of(key).map(str::to_string) else {
             return Ok(None);
@@ -322,19 +319,13 @@ impl Engine {
         if rec.versions.len() <= 1 {
             return Ok(None);
         }
-        let Some(winner_pt) = self.get_plain(winner).await else {
+        if self.is_diverged(key, winner, &rec.versions).await != Some(true) {
+            return Ok(None);
+        }
+        let Some(plaintexts) = self.all_plaintexts(&rec.versions).await else {
             return Ok(None);
         };
-        let mut plaintexts = Vec::new();
-        for h in &rec.versions {
-            if let Some(p) = self.get_plain(*h).await {
-                plaintexts.push(p);
-            }
-        }
         let merged = merge_lines(&plaintexts);
-        if merged == winner_pt {
-            return Ok(None);
-        }
         let ciphertext = self.identity.encrypt(&merged)?;
         let size = ciphertext.len() as u64;
         let hash = self.node.add_blob(ciphertext).await?;
@@ -883,5 +874,73 @@ mod tests {
         let ciphertext = engine.node.get_blob(hash).await.unwrap();
         assert_ne!(&ciphertext[..], &contents[..], "blob must not be plaintext");
         assert_eq!(engine.get_plain(hash).await.as_deref(), Some(&contents[..]));
+    }
+
+    #[tokio::test]
+    async fn divergence_waits_for_all_version_blobs() {
+        let base = std::env::temp_dir().join(format!("ssync-div-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        let engine = Engine::new(
+            PiAdapter::new("pi", base.join("sessions")),
+            AgeIdentity::generate().unwrap(),
+            node,
+        );
+        let v1 = engine.identity.encrypt(b"h\na\n").unwrap();
+        let h1 = engine.node.add_blob(v1).await.unwrap();
+        let missing = Hash::new(b"never-added");
+
+        assert_eq!(engine.is_diverged("pi/p/s", h1, &[h1, missing]).await, None);
+        assert!(
+            engine.divergence_cache.lock().unwrap().is_empty(),
+            "partial verdict must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn divergence_verdict_is_cached_by_version_set() {
+        let base = std::env::temp_dir().join(format!("ssync-div-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        let engine = Engine::new(
+            PiAdapter::new("pi", base.join("sessions")),
+            AgeIdentity::generate().unwrap(),
+            node,
+        );
+        let enc = |b: &[u8]| engine.identity.encrypt(b).unwrap();
+        let h1 = engine.node.add_blob(enc(b"h\na\n")).await.unwrap();
+        let h2 = engine.node.add_blob(enc(b"h\nb\n")).await.unwrap();
+
+        assert_eq!(engine.is_diverged("k", h2, &[h1, h2]).await, Some(true));
+        assert_eq!(
+            engine
+                .divergence_cache
+                .lock()
+                .unwrap()
+                .get("k")
+                .map(|(_, v)| *v),
+            Some(true)
+        );
+
+        // once the union is the winner, the same key settles
+        let union = merge_lines(&[b"h\na\n".to_vec(), b"h\nb\n".to_vec()]);
+        let hu = engine.node.add_blob(enc(&union)).await.unwrap();
+        assert_eq!(
+            engine.is_diverged("k", hu, &[h1, h2, hu]).await,
+            Some(false)
+        );
+        assert_eq!(
+            engine
+                .divergence_cache
+                .lock()
+                .unwrap()
+                .get("k")
+                .map(|(_, v)| *v),
+            Some(false)
+        );
     }
 }
