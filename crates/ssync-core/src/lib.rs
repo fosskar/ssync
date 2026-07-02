@@ -1,5 +1,6 @@
-//! config, importer, exporter, index model, conflict logic. Session bytes are
-//! stored opaque: read → age-encrypt → blob; the index maps identity → hash.
+//! config, sync engine, index model, conflict logic. Session bytes are stored
+//! opaque: read → age-encrypt → blob; the index maps identity → hash. All
+//! mutation flows through one path: snapshot → [`reconcile`] → execute.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,6 @@ use ssync_adapters::{Adapter, SessionIdentity};
 use ssync_crypto::AgeIdentity;
 use ssync_net::Node;
 use ssync_net::iroh_docs::engine::LiveEvent;
-use ssync_net::iroh_docs::{DocTicket, NamespaceId};
 
 use ssync_net::iroh_blobs::Hash;
 
@@ -143,6 +143,10 @@ pub struct Engine {
     adapters: Vec<Box<dyn Adapter>>,
     identity: AgeIdentity,
     node: Node,
+    /// What we last materialised per key; feeds [`reconcile`].
+    state: SyncState,
+    /// Merges already announced (log once, not per tick).
+    merged_logged: std::collections::HashSet<String>,
     /// Divergence verdict per key, keyed by the distinct-hash fingerprint of
     /// its author entries. Skips re-decrypting sessions whose version set has
     /// not changed — without it every status write decrypts every session that
@@ -164,6 +168,8 @@ impl Engine {
             adapters,
             identity,
             node,
+            state: SyncState::default(),
+            merged_logged: Default::default(),
             divergence_cache: Default::default(),
         }
     }
@@ -185,22 +191,6 @@ impl Engine {
             .find(|a| path.starts_with(a.session_root()))
     }
 
-    pub async fn create_namespace(&mut self) -> Result<NamespaceId> {
-        self.node.create_namespace().await
-    }
-
-    pub async fn open_namespace(&mut self, id: NamespaceId) -> Result<()> {
-        self.node.open_namespace(id).await
-    }
-
-    pub async fn join(&mut self, ticket: DocTicket) -> Result<NamespaceId> {
-        self.node.join(ticket).await
-    }
-
-    pub async fn share(&self) -> Result<DocTicket> {
-        self.node.share().await
-    }
-
     /// The iroh-docs index key for a session: `{agent}/{relative_path}`. The
     /// relative path is machine-independent and carries the write-back location,
     /// so the exporter can reconstruct where the file belongs on any peer.
@@ -208,45 +198,27 @@ impl Engine {
         format!("{}/{}", id.agent, id.relative_path.display())
     }
 
-    /// Read → age-encrypt → blob → upsert index entry.
-    ///
-    /// Loop prevention: age ciphertext is randomized, so dedup on *plaintext* —
-    /// skip if the file already matches the indexed version, otherwise the
-    /// exporter's own write-back bounces back as a false-conflict entry.
-    pub async fn import_file(&self, path: &Path) -> Result<SessionIdentity> {
-        let id = self.identify(path)?;
-        // Resurrection guard (for direct/one-shot callers; the daemon decides
-        // this in `reconcile`): a peer deleted this session after the file was
-        // last written (tombstone newer than mtime) — don't import it back.
-        if let Some(rec) = self.node.index_record(self.index_key(&id)).await?
-            && rec.winner.is_none()
-            && file_mtime_micros(path).is_some_and(|mtime| rec.winner_ts >= mtime)
-        {
-            return Ok(id);
-        }
-        self.import_action(path).await?;
-        Ok(id)
-    }
-
-    /// Read → dedup on plaintext → age-encrypt → blob → upsert index. Returns
-    /// the new blob hash, or `None` when the file already matched the indexed
-    /// version (loop-prevention: the exporter's own write-back is randomized
-    /// ciphertext, so dedup on plaintext or it bounces back as a false change).
-    async fn import_action(&self, path: &Path) -> Result<Option<Hash>> {
-        let id = self.identify(path)?;
+    /// Read → encrypt → blob → upsert index. Dedups on *plaintext* (age
+    /// ciphertext is randomized), or the exporter's own write-back echoes.
+    async fn import_action(
+        &self,
+        key: &str,
+        path: &Path,
+        winner: Option<Hash>,
+    ) -> Result<ImportOutcome> {
         let plaintext = tokio::fs::read(path)
             .await
             .with_context(|| format!("reading session file {}", path.display()))?;
-        if let Ok(Some(existing)) = self.read_session(&id).await
-            && existing == plaintext
+        if let Some(w) = winner
+            && self.get_plain(w).await.as_deref() == Some(&plaintext)
         {
-            return Ok(None);
+            return Ok(ImportOutcome::Unchanged(w));
         }
         let ciphertext = self.identity.encrypt(&plaintext)?;
         let size = ciphertext.len() as u64;
         let hash = self.node.add_blob(ciphertext).await?;
-        self.node.index_set(self.index_key(&id), hash, size).await?;
-        Ok(Some(hash))
+        self.node.index_set(key.to_string(), hash, size).await?;
+        Ok(ImportOutcome::Published(hash))
     }
 
     /// Identify a path via the adapter whose session root contains it.
@@ -256,61 +228,10 @@ impl Engine {
             .identify(path)
     }
 
-    pub async fn import_all(&self) -> Result<usize> {
-        let mut n = 0;
-        for path in self.all_session_files() {
-            match self.import_file(&path).await {
-                Err(e) => {
-                    eprintln!("ssync: import {}: {e:#}", path.display());
-                }
-                _ => {
-                    n += 1;
-                }
-            }
-        }
-        Ok(n)
-    }
-
-    pub async fn read_session(&self, id: &SessionIdentity) -> Result<Option<Vec<u8>>> {
-        let Some(rec) = self.node.index_record(self.index_key(id)).await? else {
-            return Ok(None);
-        };
-        let Some(hash) = rec.winner else {
-            return Ok(None);
-        };
-        let ciphertext = self.node.get_blob(hash).await?;
-        let plaintext = self.identity.decrypt(&ciphertext)?;
-        Ok(Some(plaintext))
-    }
-
-    /// Write every indexed session into the session root, decrypted, atomically.
-    pub async fn export_all(&self) -> Result<usize> {
-        let mut written = 0;
-        for rec in self.node.index_records().await? {
-            let Some(hash) = rec.winner else {
-                continue; // deleted
-            };
-            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            // keys of agents not configured on this node are left alone
-            let Some(dest) = self.dest_of(&key) else {
-                continue;
-            };
-            let ciphertext = match self.node.get_blob(hash).await {
-                Ok(ct) => ct,
-                // content may not have downloaded yet; skip, a later event retries.
-                Err(_) => continue,
-            };
-            let plaintext = self.identity.decrypt(&ciphertext)?;
-            atomic_write(&dest, &plaintext).await?;
-            written += 1;
-        }
-        Ok(written)
-    }
-
     /// Sessions still genuinely diverged — the newest version does not already
     /// contain every line of every author's version. Verdicts are cached by the
     /// version-set fingerprint so an unchanged set is never re-decrypted.
-    pub async fn conflict_paths(&self) -> Result<Vec<String>> {
+    async fn conflict_paths(&self) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for rec in self.node.index_records().await? {
             let Some(winner) = rec.winner else {
@@ -498,61 +419,44 @@ impl Engine {
         Ok(out)
     }
 
-    /// One reconcile pass: snapshot both sides, decide, execute, refresh status.
-    async fn tick(
-        &self,
-        state: &mut SyncState,
-        merged_logged: &mut std::collections::HashSet<String>,
-        status_path: &Path,
-    ) {
+    /// One pass: snapshot both sides, [`reconcile`], execute. The daemon loop
+    /// and tests drive this same path. Returns whether anything changed.
+    pub async fn tick_once(&mut self) -> bool {
         let local = self.local_snapshot();
         let index = match self.index_snapshot().await {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("ssync: index snapshot: {e:#}");
-                return;
+                return false;
             }
         };
         let mut changed = false;
-        for action in reconcile(state, &local, &index) {
-            changed |= self.execute(&action, state, merged_logged).await;
+        for action in reconcile(&self.state, &local, &index) {
+            changed |= self.execute(&action).await;
         }
-        // Prune carried state for keys gone from both the dir and the index, so
-        // it never outgrows what they justify.
+        // prune state for keys gone from both dir and index
         let live: std::collections::HashSet<&str> = local
             .iter()
             .map(|f| f.key.as_str())
             .chain(index.keys().map(String::as_str))
             .collect();
-        state.keys.retain(|k, _| live.contains(k.as_str()));
-        // Refresh unconditionally: the snapshot's mtime doubles as the daemon's
-        // liveness signal for `ssync status`. Announce conflicts only on change.
-        self.write_status(status_path, changed).await;
+        self.state.keys.retain(|k, _| live.contains(k.as_str()));
+        changed
     }
 
-    /// Perform one action and record what we did back into `state` (so a
-    /// self-write never echoes on the next pass). Returns whether it changed
-    /// anything, which drives conflict announcement.
-    async fn execute(
-        &self,
-        action: &Action,
-        state: &mut SyncState,
-        merged_logged: &mut std::collections::HashSet<String>,
-    ) -> bool {
+    /// Execute one action and settle it into the carried state, so a
+    /// self-write never echoes on the next pass.
+    async fn execute(&mut self, action: &Action) -> bool {
         match action {
             Action::Import {
                 key,
                 path,
                 stamp,
                 winner,
-            } => match self.import_action(path).await {
-                Ok(new_hash) => {
-                    let ks = state.keys.entry(key.clone()).or_default();
-                    ks.import_stamp = Some(*stamp);
-                    // settled content is the freshly written blob, else the
-                    // winner we deduped against.
-                    ks.export_hash = Some(new_hash.or(*winner));
-                    new_hash.is_some()
+            } => match self.import_action(key, path, *winner).await {
+                Ok(outcome) => {
+                    self.state.settle_import(key, *stamp, outcome.hash());
+                    matches!(outcome, ImportOutcome::Published(_))
                 }
                 Err(e) => {
                     eprintln!("ssync: import {}: {e:#}", path.display());
@@ -578,15 +482,12 @@ impl Engine {
                     eprintln!("ssync: write {}: {e:#}", dest.display());
                     return false;
                 }
-                let ks = state.keys.entry(key.clone()).or_default();
-                ks.export_hash = Some(Some(*hash));
-                ks.import_stamp = file_stamp_micros(&dest);
+                self.state
+                    .settle_write(key, *hash, file_stamp_micros(&dest));
                 true
             }
             Action::DeleteLocal { key } => {
-                let ks = state.keys.entry(key.clone()).or_default();
-                ks.export_hash = Some(None);
-                ks.import_stamp = None;
+                self.state.settle_delete(key);
                 let Some(dest) = self.dest_of(key) else {
                     return false;
                 };
@@ -596,9 +497,7 @@ impl Engine {
             }
             Action::Tombstone { key } => match self.node.index_delete(key).await {
                 Ok(()) => {
-                    let ks = state.keys.entry(key.clone()).or_default();
-                    ks.export_hash = Some(None);
-                    ks.import_stamp = None;
+                    self.state.settle_delete(key);
                     true
                 }
                 Err(e) => {
@@ -608,7 +507,7 @@ impl Engine {
             },
             Action::Merge { key } => match self.merge_one(key).await {
                 Ok(Some(rel)) => {
-                    if merged_logged.insert(key.clone()) {
+                    if self.merged_logged.insert(key.clone()) {
                         eprintln!(
                             "ssync: merged divergent session {rel} (lossless union, nothing lost)"
                         );
@@ -624,17 +523,17 @@ impl Engine {
         }
     }
 
-    /// Run the daemon: one reconcile loop fed by three triggers — filesystem
-    /// events, index events, and a periodic rescan (a robust fallback for any
-    /// missed fs/index event, and the liveness heartbeat). Every trigger funnels
-    /// into the same debounced [`tick`], so all decisions run through one pure
-    /// [`reconcile`] over a single owned [`SyncState`] — no cross-task shared
-    /// state, no `seen`/`exported`/`Deleted` bookkeeping.
-    pub async fn run(&self, status_path: &Path) -> Result<()> {
-        use std::time::Duration;
+    /// A [`tick_once`](Self::tick_once) pass plus the status refresh (the
+    /// snapshot's mtime is the liveness signal for `ssync status`).
+    async fn step(&mut self, status_path: &Path) {
+        let changed = self.tick_once().await;
+        self.write_status(status_path, changed).await;
+    }
 
-        let mut state = SyncState::default();
-        let mut merged_logged: std::collections::HashSet<String> = Default::default();
+    /// Run the daemon: filesystem events, index events, and a periodic rescan
+    /// (fallback for missed events) all funnel into the same debounced step.
+    pub async fn run(&mut self, status_path: &Path) -> Result<()> {
+        use std::time::Duration;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |res| {
@@ -649,8 +548,8 @@ impl Engine {
         let events = self.node.subscribe().await?;
         let mut events = std::pin::pin!(events);
 
-        // initial reconcile (replaces the old up-front import_all)
-        self.tick(&mut state, &mut merged_logged, status_path).await;
+        // initial reconcile
+        self.step(status_path).await;
 
         let mut rescan = tokio::time::interval(Duration::from_secs(15));
         rescan.tick().await;
@@ -687,12 +586,27 @@ impl Engine {
                 }
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
-                    self.tick(&mut state, &mut merged_logged, status_path).await;
+                    self.step(status_path).await;
                 }
                 _ = rescan.tick() => {
-                    self.tick(&mut state, &mut merged_logged, status_path).await;
+                    self.step(status_path).await;
                 }
             }
+        }
+    }
+}
+
+/// What the file now matches: a fresh blob, or the winner it deduped against.
+#[derive(Debug, Clone, Copy)]
+enum ImportOutcome {
+    Published(Hash),
+    Unchanged(Hash),
+}
+
+impl ImportOutcome {
+    fn hash(self) -> Hash {
+        match self {
+            Self::Published(h) | Self::Unchanged(h) => h,
         }
     }
 }
@@ -732,16 +646,6 @@ fn merge_lines(versions: &[Vec<u8>]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
-}
-
-/// File mtime as microseconds since the epoch (iroh-docs timestamp scale).
-fn file_mtime_micros(path: &Path) -> Option<u64> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_micros() as u64)
 }
 
 /// Metadata stamp `(mtime_micros, len)` used to detect whether a file changed;
@@ -945,7 +849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn imported_session_round_trips_decrypted() {
+    async fn tick_imports_encrypted_and_round_trips_decrypted() {
         let base = std::env::temp_dir().join(format!("ssync-core-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let sessions_root = base.join("sessions");
@@ -956,20 +860,28 @@ mod tests {
         let contents = b"{\"type\":\"session\",\"version\":3}\n{\"secret\":\"sk-live-abc\"}\n";
         std::fs::write(&session_path, contents).unwrap();
 
-        let node = Node::spawn(&base.join("data"), SecretKey::generate())
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
             .await
             .unwrap();
+        node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
             AgeIdentity::generate().unwrap(),
             node,
         );
-        engine.create_namespace().await.unwrap();
 
-        let id = engine.import_file(&session_path).await.unwrap();
-        assert_eq!(id.session_id, "019e539d-f6ab-71ac-be20-d3ae2b23ea4a");
+        assert!(engine.tick_once().await, "first tick must import");
+        assert!(!engine.tick_once().await, "second tick must be a no-op");
 
-        let got = engine.read_session(&id).await.unwrap();
-        assert_eq!(got.as_deref(), Some(&contents[..]));
+        let rec = engine
+            .node
+            .index_record(engine.index_key(&engine.identify(&session_path).unwrap()))
+            .await
+            .unwrap()
+            .expect("session indexed");
+        let hash = rec.winner.expect("live winner");
+        let ciphertext = engine.node.get_blob(hash).await.unwrap();
+        assert_ne!(&ciphertext[..], &contents[..], "blob must not be plaintext");
+        assert_eq!(engine.get_plain(hash).await.as_deref(), Some(&contents[..]));
     }
 }

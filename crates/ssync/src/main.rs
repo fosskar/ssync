@@ -167,7 +167,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         .iter()
         .map(|a| adapter_for(&a.agent, &a.session_dir))
         .collect::<Result<Vec<_>>>()?;
-    let engine = Engine::with_adapters(adapters, identity, node);
+    let mut engine = Engine::with_adapters(adapters, identity, node);
     for a in &config.agents {
         println!(
             "ssync daemon watching {} ({})",

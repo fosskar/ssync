@@ -71,6 +71,27 @@ impl SyncState {
     fn get(&self, key: &str) -> Option<&KeyState> {
         self.keys.get(key)
     }
+
+    /// The file at `stamp` now matches blob `hash` (published or deduped).
+    pub fn settle_import(&mut self, key: &str, stamp: Stamp, hash: Hash) {
+        let ks = self.keys.entry(key.to_string()).or_default();
+        ks.import_stamp = Some(stamp);
+        ks.export_hash = Some(Some(hash));
+    }
+
+    /// Blob `hash` was written back; `stamp` keeps it from re-importing.
+    pub fn settle_write(&mut self, key: &str, hash: Hash, stamp: Option<Stamp>) {
+        let ks = self.keys.entry(key.to_string()).or_default();
+        ks.export_hash = Some(Some(hash));
+        ks.import_stamp = stamp;
+    }
+
+    /// The key was deleted here (local remove or index tombstone).
+    pub fn settle_delete(&mut self, key: &str) {
+        let ks = self.keys.entry(key.to_string()).or_default();
+        ks.export_hash = Some(None);
+        ks.import_stamp = None;
+    }
 }
 
 /// A single side effect for the engine shell to execute.
@@ -443,6 +464,86 @@ mod tests {
         assert_eq!(
             a,
             vec![Action::Merge {
+                key: "pi/p/s".into()
+            }]
+        );
+    }
+
+    // settle_*: an unchanged snapshot must produce no actions (no echo),
+    // while a real peer update still acts.
+
+    #[test]
+    fn settled_import_does_not_echo() {
+        let h = hash(b"v1");
+        let mut st = SyncState::default();
+        st.settle_import("pi/p/s", (5, 10), h);
+        let a = reconcile(
+            &st,
+            &[local("pi/p/s", (5, 10))],
+            &index(&[("pi/p/s", live(h, 5, 1))]),
+        );
+        assert!(a.is_empty(), "self-import echoed: {a:?}");
+    }
+
+    #[test]
+    fn settled_write_does_not_reimport_own_writeback() {
+        let h = hash(b"remote");
+        let mut st = SyncState::default();
+        st.settle_write("pi/p/s", h, Some((9, 20)));
+        let a = reconcile(
+            &st,
+            &[local("pi/p/s", (9, 20))],
+            &index(&[("pi/p/s", live(h, 9, 1))]),
+        );
+        assert!(a.is_empty(), "own write-back echoed as import: {a:?}");
+    }
+
+    #[test]
+    fn settled_write_still_accepts_newer_peer_version() {
+        let h1 = hash(b"v1");
+        let h2 = hash(b"v2");
+        let mut st = SyncState::default();
+        st.settle_write("pi/p/s", h1, Some((9, 20)));
+        let a = reconcile(
+            &st,
+            &[local("pi/p/s", (9, 20))],
+            &index(&[("pi/p/s", live(h2, 12, 1))]),
+        );
+        assert_eq!(
+            a,
+            vec![Action::WriteFile {
+                key: "pi/p/s".into(),
+                hash: h2
+            }]
+        );
+    }
+
+    #[test]
+    fn settled_delete_with_tombstone_winner_is_a_noop() {
+        // a LIVE winner after settle_delete would be a peer recreate —
+        // rematerialising it is then correct.
+        let mut st = SyncState::default();
+        st.settle_delete("pi/p/s");
+        let a = reconcile(&st, &[], &index(&[("pi/p/s", tombstone(20))]));
+        assert!(a.is_empty(), "settled deletion echoed: {a:?}");
+    }
+
+    #[test]
+    fn settled_write_then_vanished_file_is_a_local_redelete() {
+        let h = hash(b"recreated");
+        let ho = hash(b"other");
+        let mut st = SyncState::default();
+        st.settle_delete("pi/p/s");
+        st.settle_write("pi/p/s", h, None);
+        st.settle_import("pi/p/o", (5, 10), ho);
+        let a = reconcile(
+            &st,
+            &[local("pi/p/o", (5, 10))],
+            &index(&[("pi/p/s", live(h, 30, 1)), ("pi/p/o", live(ho, 5, 1))]),
+        );
+        assert_eq!(
+            a,
+            vec![Action::Tombstone {
                 key: "pi/p/s".into()
             }]
         );
