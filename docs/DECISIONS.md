@@ -235,18 +235,27 @@ empty-dir wipe guard), at the cost that deleting the very last session does not 
 
 ---
 
-## 9. v1 agent scope: pi only
+## 9. Agent scope: pi + omp, more via plug-in adapters
 
-**Decision:** v1 ships exactly one adapter: **pi** (`badlogic/pi-mono` / the omp fork's
-upstream). The adapter interface is designed so adding Claude Code, omp, Codex, OpenCode,
-etc. is trivial (each is a "where do sessions live + is-append-only flag" declaration).
+**Decision:** ship the **pi** adapter (`badlogic/pi-mono`) and reuse it for **omp**
+(oh-my-pi), a pi fork with the same on-disk layout. A node syncs one or more agents side
+by side: config lists `[[agents]]` (name + session dir), the engine holds a
+`Vec<Box<dyn Adapter>>` sharing one namespace, partitioned by the `{agent}/` key prefix.
+Adding an agent is one `impl Adapter` plus one `adapter_for` match arm.
 
-**Why:** Start narrow, prove the whole pipeline end-to-end on one real agent, keep the
-test surface small. Multi-agent support is in the repo TODO. pi's format is already known
-(verified from source): per-session append-only JSONL at `~/.pi/agent/sessions/<encoded-
-cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in filename+header, append-only confirmed (so
-merge is safe for pi, and the engine merges divergent pi sessions losslessly — §8). See
+**Why:** each adapter is just a "where do sessions live + how to identify a file +
+is-append-only" declaration (DECISIONS §2), so agents that share pi's layout (pi, omp)
+reuse `PiAdapter`, and an agent with a different layout (Claude Code, Codex, …) drops in
+as its own boxed `impl Adapter` in the same engine — genuinely plug-in, no engine change.
+pi/omp format is known (verified from source): per-session append-only JSONL at
+`<root>/<encoded-cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in the filename, append-only
+confirmed (so merge is safe — §8). The cwd-encoding differs between pi and omp but identity
+never decodes it (the dir name is opaque). Remaining agents stay in the repo TODO. See
 docs/pi-format-notes.md.
+
+**Superseded:** an earlier draft scoped v1 to **pi only** to keep the pipeline and test
+surface small; omp was trivial to add (identical layout) and proved the multi-agent seam,
+so it landed too.
 
 ---
 
@@ -327,7 +336,7 @@ encrypt/decrypt (DECISIONS §7), so that combination was the real risk and it ho
 | Infra the user runs | **None.** LAN via mDNS; internet via iroh's free public relay (ciphertext only)              |
 | Encryption          | **age, on by default**, PQ-hybrid if a mature plugin exists; shared identity across machines |
 | Conflicts (v1)      | No lease; detect + keep-both; **lossless line-union merge** for pi (newest-wins fallback)    |
-| v1 agent            | **pi only**; interface trivially extensible (multi-agent in TODO)                            |
+| agents              | **pi + omp** (share pi layout); more via boxed plug-in `Adapter`s, one per agent             |
 | Boundary            | **Watch-and-import**, never sync-in-place                                                    |
 | Language            | **Rust**, single binary                                                                      |
 | Packaging           | plain binary → Nix flake (HM + NixOS modules) → optional clan wrapper                        |

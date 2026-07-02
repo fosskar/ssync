@@ -30,17 +30,27 @@
         options = {
           user = lib.mkOption {
             type = lib.types.str;
-            description = "User to run the daemon as; must own sessionDir.";
+            description = "User to run the daemon as; must own the agents' session dirs.";
           };
-          agent = lib.mkOption {
-            type = lib.types.str;
-            default = "pi";
-            description = "Agent whose sessions to sync (v1: pi).";
-          };
-          sessionDir = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
+          agents = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.listOf (
+                lib.types.submodule {
+                  options = {
+                    agent = lib.mkOption {
+                      type = lib.types.str;
+                      description = "Agent name (pi or omp).";
+                    };
+                    sessionDir = lib.mkOption {
+                      type = lib.types.str;
+                      description = "The agent's session directory to watch (absolute path).";
+                    };
+                  };
+                }
+              )
+            );
             default = null;
-            description = "Session directory to watch. Defaults to pi's location.";
+            description = "Agents to sync; null uses the NixOS module default (pi at the user's home).";
           };
         };
       };
@@ -116,7 +126,7 @@
 
             services.ssync = {
               enable = true;
-              inherit (settings) user agent;
+              inherit (settings) user;
               ageIdentityFile = gens.ssync-age.files.key.path;
               namespaceSecretFile = gens.ssync-namespace.files.secret.path;
               nodeKeyFile = gens.ssync-node.files.key.path;
@@ -134,8 +144,8 @@
                 )
               ) otherPeers;
             }
-            // lib.optionalAttrs (settings.sessionDir != null) {
-              inherit (settings) sessionDir;
+            // lib.optionalAttrs (settings.agents != null) {
+              inherit (settings) agents;
             };
           };
       };

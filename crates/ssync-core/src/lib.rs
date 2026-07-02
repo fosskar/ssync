@@ -18,12 +18,19 @@ use ssync_net::iroh_blobs::Hash;
 mod reconcile;
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 
+/// One agent to sync: its name and the session directory to watch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Agent name (`"pi"` or `"omp"`; see `ssync_adapters::adapter_for`).
+    pub agent: String,
+    pub session_dir: PathBuf,
+}
+
 /// On-disk daemon configuration (`$XDG_CONFIG_HOME/ssync/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Agent to sync (v1: `"pi"`).
-    pub agent: String,
-    pub session_dir: PathBuf,
+    /// Agents to sync side by side (`[[agents]]` tables).
+    pub agents: Vec<AgentConfig>,
     /// Shared age identity file (same key on every machine).
     pub age_identity_path: PathBuf,
     pub data_dir: PathBuf,
@@ -47,14 +54,33 @@ impl Config {
             .join("ssync/config.toml"))
     }
 
-    /// Built-in defaults (pi at `~/.pi/agent/sessions`, XDG data/config dirs).
+    /// Built-in defaults: every known agent whose session dir exists on this
+    /// machine (pi at `~/.pi/agent/sessions`, omp at `~/.omp/agent/sessions`),
+    /// falling back to pi alone on a fresh machine.
     pub fn defaults() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
         let config = dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?;
         let data = dirs::data_dir().ok_or_else(|| anyhow!("no data dir"))?;
+        let known = [
+            ("pi", home.join(".pi/agent/sessions")),
+            ("omp", home.join(".omp/agent/sessions")),
+        ];
+        let mut agents: Vec<AgentConfig> = known
+            .iter()
+            .filter(|(_, dir)| dir.is_dir())
+            .map(|(agent, dir)| AgentConfig {
+                agent: agent.to_string(),
+                session_dir: dir.clone(),
+            })
+            .collect();
+        if agents.is_empty() {
+            agents.push(AgentConfig {
+                agent: "pi".to_string(),
+                session_dir: home.join(".pi/agent/sessions"),
+            });
+        }
         Ok(Self {
-            agent: "pi".to_string(),
-            session_dir: home.join(".pi/agent/sessions"),
+            agents,
             age_identity_path: config.join("ssync/age.key"),
             data_dir: data.join("ssync"),
             namespace_secret_path: None,
@@ -87,9 +113,10 @@ pub struct StatusReport {
     pub conflicts: Vec<String>,
 }
 
-/// The sync engine for a single agent adapter on one node.
-pub struct Engine<A: Adapter> {
-    adapter: A,
+/// The sync engine for one node: one or more agent adapters (pi, omp, ...)
+/// sharing a single index namespace, partitioned by the `{agent}/` key prefix.
+pub struct Engine {
+    adapters: Vec<Box<dyn Adapter>>,
     identity: AgeIdentity,
     node: Node,
     /// Divergence verdict per key, keyed by the distinct-hash fingerprint of
@@ -99,14 +126,39 @@ pub struct Engine<A: Adapter> {
     divergence_cache: std::sync::Mutex<std::collections::HashMap<String, (String, bool)>>,
 }
 
-impl<A: Adapter> Engine<A> {
-    pub fn new(adapter: A, identity: AgeIdentity, node: Node) -> Self {
+impl Engine {
+    pub fn new(adapter: impl Adapter + 'static, identity: AgeIdentity, node: Node) -> Self {
+        Self::with_adapters(vec![Box::new(adapter)], identity, node)
+    }
+
+    pub fn with_adapters(
+        adapters: Vec<Box<dyn Adapter>>,
+        identity: AgeIdentity,
+        node: Node,
+    ) -> Self {
         Self {
-            adapter,
+            adapters,
             identity,
             node,
             divergence_cache: Default::default(),
         }
+    }
+
+    /// The adapter owning an index key (matching `{agent}/` prefix), if any —
+    /// peers may sync agents this node does not have configured.
+    fn adapter_of_key(&self, key: &str) -> Option<&dyn Adapter> {
+        self.adapters.iter().map(|a| a.as_ref()).find(|a| {
+            key.strip_prefix(a.agent())
+                .is_some_and(|r| r.starts_with('/'))
+        })
+    }
+
+    /// The adapter whose session root contains `path`.
+    fn adapter_of_path(&self, path: &Path) -> Option<&dyn Adapter> {
+        self.adapters
+            .iter()
+            .map(|a| a.as_ref())
+            .find(|a| path.starts_with(a.session_root()))
     }
 
     pub async fn create_namespace(&mut self) -> Result<NamespaceId> {
@@ -129,7 +181,7 @@ impl<A: Adapter> Engine<A> {
     /// relative path is machine-independent and carries the write-back location,
     /// so the exporter can reconstruct where the file belongs on any peer.
     fn index_key(&self, id: &SessionIdentity) -> String {
-        format!("{}/{}", self.adapter.agent(), id.relative_path.display())
+        format!("{}/{}", id.agent, id.relative_path.display())
     }
 
     /// Read → age-encrypt → blob → upsert index entry.
@@ -138,7 +190,7 @@ impl<A: Adapter> Engine<A> {
     /// skip if the file already matches the indexed version, otherwise the
     /// exporter's own write-back bounces back as a false-conflict entry.
     pub async fn import_file(&self, path: &Path) -> Result<SessionIdentity> {
-        let id = self.adapter.identify(path)?;
+        let id = self.identify(path)?;
         // Resurrection guard (for direct/one-shot callers; the daemon decides
         // this in `reconcile`): a peer deleted this session after the file was
         // last written (tombstone newer than mtime) — don't import it back.
@@ -157,7 +209,7 @@ impl<A: Adapter> Engine<A> {
     /// version (loop-prevention: the exporter's own write-back is randomized
     /// ciphertext, so dedup on plaintext or it bounces back as a false change).
     async fn import_action(&self, path: &Path) -> Result<Option<Hash>> {
-        let id = self.adapter.identify(path)?;
+        let id = self.identify(path)?;
         let plaintext = tokio::fs::read(path)
             .await
             .with_context(|| format!("reading session file {}", path.display()))?;
@@ -173,9 +225,16 @@ impl<A: Adapter> Engine<A> {
         Ok(Some(hash))
     }
 
+    /// Identify a path via the adapter whose session root contains it.
+    fn identify(&self, path: &Path) -> Result<SessionIdentity> {
+        self.adapter_of_path(path)
+            .ok_or_else(|| anyhow!("{} is under no configured session root", path.display()))?
+            .identify(path)
+    }
+
     pub async fn import_all(&self) -> Result<usize> {
         let mut n = 0;
-        for path in session_files(self.adapter.session_root(), &self.adapter) {
+        for path in self.all_session_files() {
             match self.import_file(&path).await {
                 Err(e) => {
                     eprintln!("ssync: import {}: {e:#}", path.display());
@@ -208,9 +267,10 @@ impl<A: Adapter> Engine<A> {
                 continue; // deleted
             };
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            let dest = self
-                .dest_of(&key)
-                .ok_or_else(|| anyhow!("index key {key} missing agent prefix"))?;
+            // keys of agents not configured on this node are left alone
+            let Some(dest) = self.dest_of(&key) else {
+                continue;
+            };
             let ciphertext = match self.node.get_blob(hash).await {
                 Ok(ct) => ct,
                 // content may not have downloaded yet; skip, a later event retries.
@@ -337,21 +397,27 @@ impl<A: Adapter> Engine<A> {
         Ok(Some(rel))
     }
 
-    /// The `{agent}/` index-key prefix.
-    fn prefix(&self) -> String {
-        format!("{}/", self.adapter.agent())
-    }
-
     /// Decode an index key back to its session-root-relative path (the inverse of
-    /// `index_key`): strip the `{agent}/` prefix.
+    /// `index_key`): strip the `{agent}/` prefix of a configured adapter.
     fn relative_of<'a>(&self, key: &'a str) -> Option<&'a str> {
-        key.strip_prefix(&self.prefix())
+        let adapter = self.adapter_of_key(key)?;
+        key.strip_prefix(adapter.agent())?.strip_prefix('/')
     }
 
-    /// The absolute session-dir path an index key maps to on this machine.
+    /// The absolute session-dir path an index key maps to on this machine, or
+    /// `None` when no configured adapter owns the key.
     fn dest_of(&self, key: &str) -> Option<PathBuf> {
-        self.relative_of(key)
-            .map(|rel| self.adapter.session_root().join(rel))
+        let adapter = self.adapter_of_key(key)?;
+        let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
+        Some(adapter.session_root().join(rel))
+    }
+
+    /// Session files under every configured adapter's root.
+    fn all_session_files(&self) -> Vec<PathBuf> {
+        self.adapters
+            .iter()
+            .flat_map(|a| session_files(a.session_root(), a.as_ref()))
+            .collect()
     }
 
     /// Write the status snapshot; `announce` additionally logs conflicts (off
@@ -369,14 +435,14 @@ impl<A: Adapter> Engine<A> {
         }
     }
 
-    /// Snapshot the session dir as `reconcile` input.
+    /// Snapshot every configured session dir as `reconcile` input.
     fn local_snapshot(&self) -> Vec<LocalFile> {
         let mut out = Vec::new();
-        for path in session_files(self.adapter.session_root(), &self.adapter) {
+        for path in self.all_session_files() {
             let Some(stamp) = file_stamp_micros(&path) else {
                 continue;
             };
-            let Ok(id) = self.adapter.identify(&path) else {
+            let Ok(id) = self.identify(&path) else {
                 continue;
             };
             out.push(LocalFile {
@@ -550,9 +616,11 @@ impl<A: Adapter> Engine<A> {
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
         })?;
-        watcher
-            .watch(self.adapter.session_root(), RecursiveMode::Recursive)
-            .with_context(|| format!("watching {}", self.adapter.session_root().display()))?;
+        for adapter in &self.adapters {
+            watcher
+                .watch(adapter.session_root(), RecursiveMode::Recursive)
+                .with_context(|| format!("watching {}", adapter.session_root().display()))?;
+        }
 
         let events = self.node.subscribe().await?;
         let mut events = std::pin::pin!(events);
@@ -577,7 +645,9 @@ impl<A: Adapter> Engine<A> {
             tokio::select! {
                 Some(res) = rx.recv() => {
                     if let Ok(event) = res
-                        && event.paths.iter().any(|p| self.adapter.is_session_file(p)) {
+                        && event.paths.iter().any(|p| {
+                            self.adapter_of_path(p).is_some_and(|a| a.is_session_file(p))
+                        }) {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                 }
@@ -668,7 +738,7 @@ fn file_stamp_micros(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Recursively collect session files under `root` accepted by `adapter`.
-fn session_files(root: &Path, adapter: &impl Adapter) -> Vec<PathBuf> {
+fn session_files(root: &Path, adapter: &dyn Adapter) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -718,15 +788,23 @@ mod tests {
         // mirrors the daemon config the nix modules render, including the
         // shared-namespace fields and a multi-element peers array.
         let toml_str = r#"
-            agent = "pi"
-            session_dir = "/home/x/.pi/agent/sessions"
             age_identity_path = "/run/secrets/age/key"
             data_dir = "/var/lib/ssync"
             namespace_secret_path = "/run/secrets/ns/secret"
             node_key_path = "/run/secrets/node/key"
             peers = [ "aaa", "bbb" ]
+
+            [[agents]]
+            agent = "pi"
+            session_dir = "/home/x/.pi/agent/sessions"
+
+            [[agents]]
+            agent = "omp"
+            session_dir = "/home/x/.omp/agent/sessions"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.agents.len(), 2);
+        assert_eq!(cfg.agents[1].agent, "omp");
         assert_eq!(cfg.peers, vec!["aaa".to_string(), "bbb".to_string()]);
         assert_eq!(
             cfg.namespace_secret_path.as_deref(),
@@ -741,16 +819,19 @@ mod tests {
         let cfg2: Config = toml::from_str(&rendered).unwrap();
         assert_eq!(cfg.peers, cfg2.peers);
         assert_eq!(cfg.namespace_secret_path, cfg2.namespace_secret_path);
+        assert_eq!(cfg.agents.len(), cfg2.agents.len());
     }
 
     #[test]
     fn config_defaults_when_shared_fields_absent() {
         // a pre-shared-namespace config (ticket flow) still parses.
         let toml_str = r#"
-            agent = "pi"
-            session_dir = "/s"
             age_identity_path = "/a"
             data_dir = "/d"
+
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.peers.is_empty());
@@ -832,7 +913,7 @@ mod tests {
             .await
             .unwrap();
         let mut engine = Engine::new(
-            PiAdapter::new(&sessions_root),
+            PiAdapter::new("pi", &sessions_root),
             AgeIdentity::generate().unwrap(),
             node,
         );

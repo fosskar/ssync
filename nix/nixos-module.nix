@@ -9,10 +9,9 @@
 }:
 let
   cfg = config.services.ssync;
+  # scalar keys must precede the [[agents]] tables (TOML).
   configFile = pkgs.writeText "ssync-config.toml" (
     ''
-      agent = "${cfg.agent}"
-      session_dir = "${cfg.sessionDir}"
       age_identity_path = "${cfg.ageIdentityFile}"
       data_dir = "${cfg.dataDir}"
     ''
@@ -25,6 +24,11 @@ let
     + lib.optionalString (cfg.peers != [ ]) ''
       peers = [ ${lib.concatMapStringsSep ", " (p: "\"${lib.removeSuffix "\n" p}\"") cfg.peers} ]
     ''
+    + lib.concatMapStrings (a: ''
+      [[agents]]
+      agent = "${a.agent}"
+      session_dir = "${a.sessionDir}"
+    '') cfg.agents
   );
 in
 {
@@ -40,23 +44,35 @@ in
     user = lib.mkOption {
       type = lib.types.str;
       description = ''
-        User to run the daemon as; must own {option}`sessionDir`. Not a cross-user
+        User to run the daemon as; must own the agents' session dirs. Not a cross-user
         bridge: for projects under `$HOME` the username is part of the session key,
         so use the *same* username on every machine (see docs/identity.md).
       '';
     };
 
-    agent = lib.mkOption {
-      type = lib.types.str;
-      default = "pi";
-      description = "Agent whose sessions to sync (v1: pi).";
-    };
-
-    sessionDir = lib.mkOption {
-      type = lib.types.str;
-      default = "${config.users.users.${cfg.user}.home}/.pi/agent/sessions";
-      defaultText = lib.literalExpression "\"\${user home}/.pi/agent/sessions\"";
-      description = "The agent's session directory to watch. Defaults to pi's location.";
+    agents = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            agent = lib.mkOption {
+              type = lib.types.str;
+              description = "Agent name (pi or omp).";
+            };
+            sessionDir = lib.mkOption {
+              type = lib.types.str;
+              description = "The agent's session directory to watch (absolute path).";
+            };
+          };
+        }
+      );
+      default = [
+        {
+          agent = "pi";
+          sessionDir = "${config.users.users.${cfg.user}.home}/.pi/agent/sessions";
+        }
+      ];
+      defaultText = lib.literalExpression ''[ { agent = "pi"; sessionDir = "''${user home}/.pi/agent/sessions"; } ]'';
+      description = "Agents to sync side by side; add an entry per agent (e.g. omp at ~/.omp/agent/sessions).";
     };
 
     ageIdentityFile = lib.mkOption {
@@ -101,11 +117,9 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # ensure the watched session dir exists so the sandbox's ReadWritePaths bind
+    # ensure the watched session dirs exist so the sandbox's ReadWritePaths bind
     # succeeds on first boot (owner cfg.user, 0700).
-    systemd.tmpfiles.rules = [
-      "d ${cfg.sessionDir} 0700 ${cfg.user} - - -"
-    ];
+    systemd.tmpfiles.rules = map (a: "d ${a.sessionDir} 0700 ${cfg.user} - - -") cfg.agents;
 
     systemd.services.ssync = {
       description = "ssync coding-agent session sync";
@@ -120,10 +134,10 @@ in
         RestartSec = 5;
 
         # --- hardening ---
-        # The daemon needs: RW to sessionDir (under $HOME) and its StateDirectory,
+        # The daemon needs: RW to the session dirs (under $HOME) and its StateDirectory,
         # read access to the secrets it is pointed at (/run/secrets, /nix/store),
         # and outbound QUIC/UDP plus netlink for iroh. Everything else is denied.
-        ReadWritePaths = [ cfg.sessionDir ];
+        ReadWritePaths = map (a: a.sessionDir) cfg.agents;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ProtectHome = "read-only";

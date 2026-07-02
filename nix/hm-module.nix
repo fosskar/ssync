@@ -11,12 +11,17 @@
 }:
 let
   cfg = config.services.ssync;
-  configFile = pkgs.writeText "ssync-config.toml" ''
-    agent = "${cfg.agent}"
-    session_dir = "${cfg.sessionDir}"
-    age_identity_path = "${cfg.ageIdentityFile}"
-    data_dir = "${cfg.dataDir}"
-  '';
+  configFile = pkgs.writeText "ssync-config.toml" (
+    ''
+      age_identity_path = "${cfg.ageIdentityFile}"
+      data_dir = "${cfg.dataDir}"
+    ''
+    + lib.concatMapStrings (a: ''
+      [[agents]]
+      agent = "${a.agent}"
+      session_dir = "${a.sessionDir}"
+    '') cfg.agents
+  );
 in
 {
   options.services.ssync = {
@@ -28,17 +33,29 @@ in
       description = "The ssync package to run.";
     };
 
-    agent = lib.mkOption {
-      type = lib.types.str;
-      default = "pi";
-      description = "Agent whose sessions to sync (v1: pi).";
-    };
-
-    sessionDir = lib.mkOption {
-      type = lib.types.str;
-      default = "${config.home.homeDirectory}/.pi/agent/sessions";
-      defaultText = lib.literalExpression ''"''${config.home.homeDirectory}/.pi/agent/sessions"'';
-      description = "The agent's session directory to watch (absolute path).";
+    agents = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            agent = lib.mkOption {
+              type = lib.types.str;
+              description = "Agent name (pi or omp).";
+            };
+            sessionDir = lib.mkOption {
+              type = lib.types.str;
+              description = "The agent's session directory to watch (absolute path).";
+            };
+          };
+        }
+      );
+      default = [
+        {
+          agent = "pi";
+          sessionDir = "${config.home.homeDirectory}/.pi/agent/sessions";
+        }
+      ];
+      defaultText = lib.literalExpression ''[ { agent = "pi"; sessionDir = "''${config.home.homeDirectory}/.pi/agent/sessions"; } ]'';
+      description = "Agents to sync side by side; add an entry per agent (e.g. omp at ~/.omp/agent/sessions).";
     };
 
     ageIdentityFile = lib.mkOption {

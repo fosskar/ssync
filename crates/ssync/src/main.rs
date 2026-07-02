@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use ssync_adapters::pi::PiAdapter;
+use ssync_adapters::adapter_for;
 use ssync_core::{Config, Engine, StatusReport};
 use ssync_crypto::AgeIdentity;
 use ssync_net::iroh_docs::{DocTicket, NamespaceId};
@@ -101,8 +101,13 @@ fn cmd_init(config_path: &Path) -> Result<()> {
 
 async fn cmd_daemon(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
+    if config.agents.is_empty() {
+        return Err(anyhow!("config has no [[agents]] entries"));
+    }
     std::fs::create_dir_all(&config.data_dir)?;
-    std::fs::create_dir_all(&config.session_dir)?;
+    for a in &config.agents {
+        std::fs::create_dir_all(&a.session_dir)?;
+    }
 
     // Auto-generate the age identity on first run. It is shared across machines,
     // so a second standalone machine must be given this same key (clan.vars does
@@ -157,15 +162,19 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         std::fs::write(config.data_dir.join("ticket"), ticket.to_string())?;
     }
 
-    if config.agent != "pi" {
-        return Err(anyhow!(
-            "unsupported agent {:?} (v1 supports pi)",
-            config.agent
-        ));
+    let adapters = config
+        .agents
+        .iter()
+        .map(|a| adapter_for(&a.agent, &a.session_dir))
+        .collect::<Result<Vec<_>>>()?;
+    let engine = Engine::with_adapters(adapters, identity, node);
+    for a in &config.agents {
+        println!(
+            "ssync daemon watching {} ({})",
+            a.session_dir.display(),
+            a.agent
+        );
     }
-    let adapter = PiAdapter::new(&config.session_dir);
-    let engine = Engine::new(adapter, identity, node);
-    println!("ssync daemon watching {}", config.session_dir.display());
     engine.run(&config.data_dir.join("status.toml")).await
 }
 

@@ -14,10 +14,12 @@ let
   ssync = self.packages.${system}.default;
 
   configToml = pkgs.writeText "config.toml" ''
-    agent = "pi"
-    session_dir = "/root/sessions"
     age_identity_path = "/root/age.key"
     data_dir = "/var/lib/ssync"
+
+    [[agents]]
+    agent = "pi"
+    session_dir = "/root/sessions"
   '';
 
   node =

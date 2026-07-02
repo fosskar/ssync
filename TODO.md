@@ -15,20 +15,20 @@ Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on eac
 ## Deletion
 
 - [x] **Deletion by any participant, not just the author.** Done: the winning entry per
-      key is now resolved *including* tombstones (`include_empty`), so the newest
+      key is now resolved _including_ tombstones (`include_empty`), so the newest
       tombstone from any author deletes the session everywhere. Resurrection is guarded
       by comparing the tombstone timestamp against the local file's mtime on import
       (a write after the deletion is a genuine recreate and imports normally).
-      Known limit: deleting the *last* session in the dir does not propagate (the
+      Known limit: deleting the _last_ session in the dir does not propagate (the
       empty-dir wipe guard intentionally suppresses it).
 
 ## More agents (each = one Adapter impl + append-only determination)
 
+- [x] pi (`~/.pi/agent/`)
+- [x] omp (`~/.omp/agent/`) — reuses `PiAdapter` (same on-disk layout as pi)
 - [ ] Claude Code (`~/.claude/projects/**`)
-- [ ] omp (`~/.omp/agent/`)
 - [ ] Codex
 - [ ] OpenCode
-- [ ] Gemini CLI
 
 ## Security
 

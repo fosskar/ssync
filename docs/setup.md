@@ -27,8 +27,13 @@ nix build git+https://codeberg.org/fosskar/ssync
 {
   imports = [ inputs.ssync.homeManagerModules.default ];
   services.ssync.enable = true;
-  # sessionDir defaults to ~/.pi/agent/sessions; the age key is auto-generated.
+  # agents defaults to pi at ~/.pi/agent/sessions; the age key is auto-generated.
   # For multi-machine, point ageIdentityFile at a key you share across machines.
+  # To also sync omp (oh-my-pi) sessions:
+  # services.ssync.agents = [
+  #   { agent = "pi";  sessionDir = "${config.home.homeDirectory}/.pi/agent/sessions"; }
+  #   { agent = "omp"; sessionDir = "${config.home.homeDirectory}/.omp/agent/sessions"; }
+  # ];
 }
 ```
 
@@ -40,7 +45,7 @@ nix build git+https://codeberg.org/fosskar/ssync
   services.ssync = {
     enable = true;
     user = "alice";
-    # sessionDir defaults to alice's ~/.pi/agent/sessions; age key auto-generated.
+    # agents defaults to pi at alice's ~/.pi/agent/sessions; age key auto-generated.
   };
 }
 ```
@@ -75,13 +80,22 @@ pairing below is only for the non-clan (standalone) modules.
 `ssync` reads `$XDG_CONFIG_HOME/ssync/config.toml` (override with `--config`):
 
 ```toml
-agent = "pi"
-session_dir = "/home/alice/.pi/agent/sessions"
 age_identity_path = "/home/alice/.config/ssync/age.key"
 data_dir = "/home/alice/.local/share/ssync"
+
+[[agents]]
+agent = "pi"
+session_dir = "/home/alice/.pi/agent/sessions"
+
+# optional: sync omp (oh-my-pi) sessions side by side
+[[agents]]
+agent = "omp"
+session_dir = "/home/alice/.omp/agent/sessions"
 ```
 
-The Nix modules generate this file for you from their options.
+The Nix modules generate this file for you from their options. `ssync init`
+writes a default config listing every known agent whose session directory
+exists on the machine (pi, omp).
 
 ## First machine
 

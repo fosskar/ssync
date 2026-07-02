@@ -1,7 +1,9 @@
-//! pi adapter. Identity is derived from the path/filename alone (no transcript
-//! parsing): session_id = uuid after the last `_` in the stem, project_id =
-//! `<encoded-cwd>` parent dir, relative_path = path under the session root.
-//! Format reference: docs/pi-format-notes.md.
+//! pi adapter — also used for pi forks that keep pi's on-disk layout (e.g. omp).
+//! Identity is derived from the path/filename alone (no transcript parsing):
+//! session_id = uuid after the last `_` in the stem, project_id = `<encoded-cwd>`
+//! parent dir, relative_path = path under the session root. The cwd-encoding
+//! scheme differs between pi and omp, but identity never decodes it — the dir
+//! name is opaque. Format reference: docs/pi-format-notes.md.
 
 use std::path::{Path, PathBuf};
 
@@ -9,13 +11,17 @@ use anyhow::{Context, anyhow};
 
 use crate::{Adapter, SessionIdentity};
 
+/// A pi-layout session store, labelled by the agent that owns it (`pi`, `omp`).
+#[derive(Debug)]
 pub struct PiAdapter {
+    agent: String,
     session_root: PathBuf,
 }
 
 impl PiAdapter {
-    pub fn new(session_root: impl Into<PathBuf>) -> Self {
+    pub fn new(agent: impl Into<String>, session_root: impl Into<PathBuf>) -> Self {
         Self {
+            agent: agent.into(),
             session_root: session_root.into(),
         }
     }
@@ -23,7 +29,7 @@ impl PiAdapter {
 
 impl Adapter for PiAdapter {
     fn agent(&self) -> &str {
-        "pi"
+        &self.agent
     }
 
     fn session_root(&self) -> &Path {
@@ -54,6 +60,7 @@ impl Adapter for PiAdapter {
             .to_string();
 
         Ok(SessionIdentity {
+            agent: self.agent.clone(),
             session_id,
             project_id,
             relative_path,
@@ -76,12 +83,13 @@ mod tests {
     #[test]
     fn identifies_pi_session_from_path() {
         let root = Path::new("/home/simon/.pi/agent/sessions");
-        let adapter = PiAdapter::new(root);
+        let adapter = PiAdapter::new("pi", root);
         let path = root
             .join("--home-simon-Projects-nixfiles--")
             .join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl");
 
         let id = adapter.identify(&path).unwrap();
+        assert_eq!(id.agent, "pi");
         assert_eq!(id.session_id, "019e539d-f6ab-71ac-be20-d3ae2b23ea4a");
         assert_eq!(id.project_id, "--home-simon-Projects-nixfiles--");
         assert_eq!(

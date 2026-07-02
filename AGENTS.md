@@ -98,5 +98,11 @@ pi stores sessions at `~/.pi/agent/sessions/<encoded-cwd>/<ts>_<sessionId>.jsonl
 append-only JSONL file per session, header on line 1 (`version:3`, `id` uuidv7, `cwd`). pi
 keys on the **absolute cwd**, so a synced project must live at the **same absolute path on
 every machine** — this is a v1 requirement, not a bug. Derive `PiAdapter` identity from the
-path/filename alone; do not parse the transcript. Full reference: `docs/pi-format-notes.md`
-(re-verify against the installed pi version before relying on it).
+path/filename alone; do not parse the transcript. Full reference:
+`docs/pi-format-notes.md` (re-verify against the installed pi version before relying on it).
+
+omp (oh-my-pi, a pi fork) uses the same layout at `~/.omp/agent/sessions`; only the
+cwd-encoding of the project dir name differs, and the adapter treats that as opaque. pi
+and omp both use `PiAdapter` via `ssync_adapters::adapter_for` (one arm mapping both names
+to it). The engine holds a `Vec<Box<dyn Adapter>>`, so a new agent is one `impl Adapter`
+plus one `adapter_for` arm: same layout → reuse `PiAdapter`; different layout → new impl.

@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ssync_adapters::Adapter;
 use ssync_adapters::pi::PiAdapter;
 use ssync_core::Engine;
 use ssync_crypto::AgeIdentity;
@@ -45,7 +46,7 @@ async fn session_created_on_a_appears_on_b() {
         .await
         .unwrap();
     let mut engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_a,
     );
@@ -61,7 +62,7 @@ async fn session_created_on_a_appears_on_b() {
         .await
         .unwrap();
     let mut engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_b,
     );
@@ -96,7 +97,7 @@ async fn live_write_propagates_without_restart() {
         .await
         .unwrap();
     let mut engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_a,
     );
@@ -107,7 +108,7 @@ async fn live_write_propagates_without_restart() {
         .await
         .unwrap();
     let mut engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_b,
     );
@@ -171,12 +172,12 @@ async fn shared_namespace_auto_connects_without_ticket() {
     node_b.sync_with(vec![addr_a]).await.unwrap();
 
     let engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&age).unwrap(),
         node_a,
     );
     let engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&age).unwrap(),
         node_b,
     );
@@ -228,7 +229,7 @@ async fn deletion_propagates_and_does_not_resurrect() {
         .await
         .unwrap();
     let mut engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_a,
     );
@@ -239,7 +240,7 @@ async fn deletion_propagates_and_does_not_resurrect() {
         .await
         .unwrap();
     let mut engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_b,
     );
@@ -305,7 +306,7 @@ async fn deletion_by_non_author_propagates_back() {
         .await
         .unwrap();
     let mut engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_a,
     );
@@ -316,7 +317,7 @@ async fn deletion_by_non_author_propagates_back() {
         .await
         .unwrap();
     let mut engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_b,
     );
@@ -374,7 +375,7 @@ async fn divergent_sessions_merge_and_converge() {
         .await
         .unwrap();
     let mut engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_a,
     );
@@ -385,7 +386,7 @@ async fn divergent_sessions_merge_and_converge() {
         .await
         .unwrap();
     let mut engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_b,
     );
@@ -432,7 +433,7 @@ async fn divergent_writes_are_detected_as_conflict() {
         .await
         .unwrap();
     let mut engine_a = Engine::new(
-        PiAdapter::new(&root_a),
+        PiAdapter::new("pi", &root_a),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_a,
     );
@@ -449,7 +450,7 @@ async fn divergent_writes_are_detected_as_conflict() {
         .await
         .unwrap();
     let mut engine_b = Engine::new(
-        PiAdapter::new(&root_b),
+        PiAdapter::new("pi", &root_b),
         AgeIdentity::from_secret_string(&secret).unwrap(),
         node_b,
     );
@@ -466,4 +467,74 @@ async fn divergent_writes_are_detected_as_conflict() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(ok, "divergent writes were not detected as a conflict");
+}
+
+#[tokio::test]
+async fn pi_and_omp_sessions_sync_side_by_side() {
+    let base = scratch("multiagent");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+
+    // node A: one pi session and one omp session in their own roots
+    let pi_root_a = base.join("a/pi-sessions");
+    let omp_root_a = base.join("a/omp-sessions");
+    let pi_rel = "--home-simon-Projects-demo--/2026-07-02T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+    let omp_rel =
+        "-Projects-demo/2026-07-02T08-01-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
+    let pi_src = pi_root_a.join(pi_rel);
+    let omp_src = omp_root_a.join(omp_rel);
+    std::fs::create_dir_all(pi_src.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(omp_src.parent().unwrap()).unwrap();
+    let pi_contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from pi\"}\n";
+    let omp_contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from omp\"}\n";
+    std::fs::write(&pi_src, pi_contents).unwrap();
+    std::fs::write(&omp_src, omp_contents).unwrap();
+
+    let node_a = Node::spawn(&base.join("a/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_a = Engine::with_adapters(
+        vec![
+            Box::new(PiAdapter::new("pi", &pi_root_a)) as Box<dyn Adapter>,
+            Box::new(PiAdapter::new("omp", &omp_root_a)),
+        ],
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.create_namespace().await.unwrap();
+    engine_a.import_all().await.unwrap();
+    let ticket = engine_a.share().await.unwrap();
+
+    // node B: both agents configured, empty roots
+    let pi_root_b = base.join("b/pi-sessions");
+    let omp_root_b = base.join("b/omp-sessions");
+    std::fs::create_dir_all(&pi_root_b).unwrap();
+    std::fs::create_dir_all(&omp_root_b).unwrap();
+    let node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_b = Engine::with_adapters(
+        vec![
+            Box::new(PiAdapter::new("pi", &pi_root_b)) as Box<dyn Adapter>,
+            Box::new(PiAdapter::new("omp", &omp_root_b)),
+        ],
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.join(ticket).await.unwrap();
+
+    // both sessions must land on B, each under its own agent's root
+    let pi_dest = pi_root_b.join(pi_rel);
+    let omp_dest = omp_root_b.join(omp_rel);
+    let mut ok = false;
+    for _ in 0..60 {
+        let _ = engine_b.export_all().await;
+        if std::fs::read(&pi_dest).is_ok_and(|got| got == pi_contents)
+            && std::fs::read(&omp_dest).is_ok_and(|got| got == omp_contents)
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "pi+omp sessions did not both sync to node B");
 }
