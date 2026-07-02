@@ -169,24 +169,46 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     engine.run(&config.data_dir.join("status.toml")).await
 }
 
-fn read_status(config: &Config) -> Result<StatusReport> {
-    let text = std::fs::read_to_string(config.data_dir.join("status.toml"))
-        .context("no status yet — start the daemon first")?;
-    Ok(toml::from_str(&text)?)
+/// Status snapshot plus its age (time since the daemon last wrote it).
+fn read_status(config: &Config) -> Result<(StatusReport, Option<std::time::Duration>)> {
+    let path = config.data_dir.join("status.toml");
+    let text = std::fs::read_to_string(&path).context("no status yet — start the daemon first")?;
+    let age = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    Ok((toml::from_str(&text)?, age))
+}
+
+/// Older than this, the snapshot is suspect: the daemon rewrites it on every
+/// change and its rescan ticks every 15s, so a live idle daemon stays fresher.
+fn warn_if_stale(age: Option<std::time::Duration>) {
+    match age {
+        Some(age) if age.as_secs() > 300 => eprintln!(
+            "warning: status is {}s old — is the daemon running?",
+            age.as_secs()
+        ),
+        _ => {}
+    }
 }
 
 fn cmd_status(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
-    let s = read_status(&config)?;
+    let (s, age) = read_status(&config)?;
     println!("namespace: {}", s.namespace.as_deref().unwrap_or("(none)"));
     println!("sessions:  {}", s.sessions);
     println!("conflicts: {}", s.conflicts.len());
+    if let Some(age) = age {
+        println!("updated:   {}s ago", age.as_secs());
+    }
+    warn_if_stale(age);
     Ok(())
 }
 
 fn cmd_conflicts(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
-    let s = read_status(&config)?;
+    let (s, age) = read_status(&config)?;
+    warn_if_stale(age);
     if s.conflicts.is_empty() {
         println!("no conflicts");
     } else {

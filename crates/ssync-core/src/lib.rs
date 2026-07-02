@@ -276,13 +276,17 @@ impl<A: Adapter> Engine<A> {
         Ok(merged_any)
     }
 
-    async fn write_status(&self, path: &Path) {
+    /// Write the status snapshot; `announce` additionally logs conflicts (off
+    /// for the periodic liveness refresh, which would repeat them every tick).
+    async fn write_status(&self, path: &Path, announce: bool) {
         if let Ok(report) = self.status_report().await {
             if let Ok(text) = toml::to_string_pretty(&report) {
                 let _ = tokio::fs::write(path, text).await;
             }
-            for c in &report.conflicts {
-                eprintln!("ssync: conflict on {c} (both versions kept; newest wins)");
+            if announce {
+                for c in &report.conflicts {
+                    eprintln!("ssync: conflict on {c} (both versions kept; newest wins)");
+                }
             }
         }
     }
@@ -294,7 +298,7 @@ impl<A: Adapter> Engine<A> {
     /// imports, and both are incremental so the idle cost is ~zero.
     pub async fn run(&self, status_path: &Path) -> Result<()> {
         self.import_all().await?;
-        self.write_status(status_path).await;
+        self.write_status(status_path, true).await;
         // Paths the exporter removed (peer deletion), so the import loop doesn't
         // mistake them for a local deletion and echo it back.
         let exporter_deleted: Deleted = Default::default();
@@ -365,7 +369,7 @@ impl<A: Adapter> Engine<A> {
                         changed |= self.import_if_changed(&path, &mut seen).await;
                     }
                     if changed {
-                        self.write_status(status_path).await;
+                        self.write_status(status_path, true).await;
                     }
                 }
                 _ = rescan.tick() => {
@@ -395,9 +399,9 @@ impl<A: Adapter> Engine<A> {
                             }
                         }
                     }
-                    if changed {
-                        self.write_status(status_path).await;
-                    }
+                    // refresh unconditionally: the snapshot's mtime doubles as
+                    // the daemon's liveness signal for `ssync status`.
+                    self.write_status(status_path, changed).await;
                 }
             }
         }
@@ -439,7 +443,7 @@ impl<A: Adapter> Engine<A> {
             .await
             .unwrap_or(false);
         if self.export_changed(&mut exported, exporter_deleted).await? || merged {
-            self.write_status(status_path).await;
+            self.write_status(status_path, true).await;
         }
 
         let events = self.node.subscribe().await?;
@@ -470,7 +474,7 @@ impl<A: Adapter> Engine<A> {
                     deadline = None;
                     let merged = self.resolve_divergences(&mut merged_logged).await.unwrap_or(false);
                     if self.export_changed(&mut exported, exporter_deleted).await? || merged {
-                        self.write_status(status_path).await;
+                        self.write_status(status_path, true).await;
                     }
                 }
             }
