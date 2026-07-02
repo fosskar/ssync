@@ -226,6 +226,13 @@ pure line-set arithmetic — no entry parsing, store-as-is holds — and content
 ordering makes every peer compute the identical result, so all nodes converge. A future
 non-append-only adapter falls back to detect + keep-both + newest-wins.
 
+**Deletion (any participant):** the winning index entry per key is resolved *including*
+tombstones, so the newest tombstone from any author deletes the session on every peer —
+not just the author's. Resurrection is guarded by comparing the tombstone timestamp
+against the local file's mtime on import; a write after the deletion is a genuine
+recreate. Safety valve: a transiently empty session dir never propagates deletions (the
+empty-dir wipe guard), at the cost that deleting the very last session does not sync.
+
 ---
 
 ## 9. v1 agent scope: pi only

@@ -14,13 +14,13 @@ Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on eac
 
 ## Deletion
 
-- [ ] **Deletion by any participant, not just the author.** Today deleting a session only
-      removes this node's own author entry (`index_delete` tombstones one author), so a
-      session deleted on a machine other than the one that created it survives (its author's
-      live entry remains and re-syncs). Make any participating machine able to delete a shared
-      session for everyone — e.g. delete/tombstone all author entries for the key, or a
-      separate per-key deletion marker that overrides live entries and is guarded against
-      resurrection.
+- [x] **Deletion by any participant, not just the author.** Done: the winning entry per
+      key is now resolved *including* tombstones (`include_empty`), so the newest
+      tombstone from any author deletes the session everywhere. Resurrection is guarded
+      by comparing the tombstone timestamp against the local file's mtime on import
+      (a write after the deletion is a genuine recreate and imports normally).
+      Known limit: deleting the *last* session in the dir does not propagate (the
+      empty-dir wipe guard intentionally suppresses it).
 
 ## More agents (each = one Adapter impl + append-only determination)
 

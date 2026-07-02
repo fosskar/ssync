@@ -282,6 +282,84 @@ async fn deletion_propagates_and_does_not_resurrect() {
 }
 
 #[tokio::test]
+async fn deletion_by_non_author_propagates_back() {
+    // a session created on A, deleted on B, must disappear on A (and stay gone)
+    // even though A authored the index entry (TODO "deletion by any participant").
+    let base = scratch("xdel");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019exdel0001eeee71acbe20xdele001.jsonl";
+
+    let root_a = base.join("a/sessions");
+    std::fs::create_dir_all(root_a.join("--proj--")).unwrap();
+    // second session so neither dir ever goes empty (deletion guard)
+    std::fs::write(
+        root_a.join("--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl"),
+        b"keep\n",
+    )
+    .unwrap();
+    std::fs::write(root_a.join(rel), b"header\nauthored on A\n").unwrap();
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let node_a = Node::spawn(&base.join("a/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_a = Engine::new(
+        PiAdapter::new(&root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.create_namespace().await.unwrap();
+    let ticket = engine_a.share().await.unwrap();
+
+    let node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    let mut engine_b = Engine::new(
+        PiAdapter::new(&root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.join(ticket).await.unwrap();
+
+    let sa = base.join("a/status.toml");
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    tokio::spawn(async move { engine_b.run(&sb).await });
+
+    // both sessions reach B (the keep session too, so B's dir never goes
+    // empty after the delete — the empty-dir guard would swallow the tombstone)
+    let on_b = root_b.join(rel);
+    let keep_on_b = root_b.join("--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl");
+    let mut appeared = false;
+    for _ in 0..40 {
+        if on_b.exists() && keep_on_b.exists() {
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(appeared, "sessions never reached B");
+
+    // delete on B (NOT the author) -> must disappear on A and stay gone
+    std::fs::remove_file(&on_b).unwrap();
+    let on_a = root_a.join(rel);
+    let mut gone = false;
+    for _ in 0..80 {
+        if !on_a.exists() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(gone, "deletion by non-author did not propagate back to A");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!on_a.exists(), "deleted session resurrected on A");
+    assert!(!on_b.exists(), "deleted session resurrected on B");
+}
+
+#[tokio::test]
 async fn divergent_sessions_merge_and_converge() {
     let base = scratch("merge");
     let secret = AgeIdentity::generate().unwrap().to_secret_string();

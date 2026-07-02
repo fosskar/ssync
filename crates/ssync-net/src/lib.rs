@@ -20,6 +20,11 @@ use iroh_docs::{Capability, NamespaceSecret};
 use iroh_gossip::net::Gossip;
 pub use {iroh, iroh_blobs, iroh_docs};
 
+/// Map iroh-docs' tombstone sentinel (`Hash::EMPTY` content) to `None`.
+fn live_hash(hash: Hash) -> Option<Hash> {
+    (hash != Hash::EMPTY).then_some(hash)
+}
+
 /// A fresh random 32-byte key seed (usable as a node key or namespace secret).
 pub fn generate_key_bytes() -> [u8; 32] {
     SecretKey::generate().to_bytes()
@@ -245,17 +250,26 @@ impl Node {
 
     /// Winning entry for `key` (newest across all authors). Not author-scoped, so
     /// a node sees a peer's version even if it never wrote the key (loop-prevention).
+    /// A winning tombstone reads as `None` — the session is deleted.
     pub async fn index_get(&self, key: impl AsRef<[u8]>) -> Result<Option<Hash>> {
-        let query = Query::single_latest_per_key().key_exact(key);
+        Ok(self.index_head(key).await?.and_then(|(_, hash)| hash))
+    }
+
+    /// Newest entry for `key` across all authors as `(timestamp_micros, hash)`;
+    /// `hash = None` means the winner is a deletion tombstone.
+    pub async fn index_head(&self, key: impl AsRef<[u8]>) -> Result<Option<(u64, Option<Hash>)>> {
+        let query = Query::single_latest_per_key()
+            .key_exact(key)
+            .include_empty();
         let entry = self.doc()?.get_one(query).await?;
-        Ok(entry.map(|e| e.content_hash()))
+        Ok(entry.map(|e| (e.timestamp(), live_hash(e.content_hash()))))
     }
 
     /// Every author's current entry as `(key, timestamp, hash)` (multiple rows
-    /// per key when several machines wrote it). Used for content-based conflict
-    /// resolution.
-    pub async fn index_entries_full(&self) -> Result<Vec<(Vec<u8>, u64, Hash)>> {
-        let stream = self.doc()?.get_many(Query::all()).await?;
+    /// per key when several machines wrote it); `hash = None` is a tombstone.
+    /// Used for content-based conflict resolution.
+    pub async fn index_entries_full(&self) -> Result<Vec<(Vec<u8>, u64, Option<Hash>)>> {
+        let stream = self.doc()?.get_many(Query::all().include_empty()).await?;
         let mut stream = std::pin::pin!(stream);
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
@@ -263,7 +277,7 @@ impl Node {
             out.push((
                 entry.key().to_vec(),
                 entry.timestamp(),
-                entry.content_hash(),
+                live_hash(entry.content_hash()),
             ));
         }
         Ok(out)
@@ -275,37 +289,20 @@ impl Node {
         Ok(())
     }
 
-    /// Winning `(key, hash)` per key, newest wins (DECISIONS §8).
-    pub async fn index_latest(&self) -> Result<Vec<(Vec<u8>, Hash)>> {
-        let stream = self.doc()?.get_many(Query::single_latest_per_key()).await?;
+    /// Winning `(key, hash)` per key, newest wins (DECISIONS §8). A winning
+    /// tombstone (`hash = None`) means the session is deleted, by any author.
+    pub async fn index_latest(&self) -> Result<Vec<(Vec<u8>, Option<Hash>)>> {
+        let stream = self
+            .doc()?
+            .get_many(Query::single_latest_per_key().include_empty())
+            .await?;
         let mut stream = std::pin::pin!(stream);
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry?;
-            out.push((entry.key().to_vec(), entry.content_hash()));
+            out.push((entry.key().to_vec(), live_hash(entry.content_hash())));
         }
         Ok(out)
-    }
-
-    /// Keys written independently by more than one author (machine) — a conflict.
-    /// Both versions are retained as blobs (DECISIONS §8).
-    pub async fn conflicts(&self) -> Result<Vec<Vec<u8>>> {
-        use std::collections::{BTreeMap, BTreeSet};
-        let stream = self.doc()?.get_many(Query::all()).await?;
-        let mut stream = std::pin::pin!(stream);
-        let mut by_key: BTreeMap<Vec<u8>, BTreeSet<String>> = BTreeMap::new();
-        while let Some(entry) = stream.next().await {
-            let entry = entry?;
-            by_key
-                .entry(entry.key().to_vec())
-                .or_default()
-                .insert(entry.author().to_string());
-        }
-        Ok(by_key
-            .into_iter()
-            .filter(|(_, authors)| authors.len() > 1)
-            .map(|(key, _)| key)
-            .collect())
     }
 
     pub async fn shutdown(self) -> Result<()> {

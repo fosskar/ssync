@@ -128,6 +128,15 @@ impl<A: Adapter> Engine<A> {
     /// exporter's own write-back bounces back as a false-conflict entry.
     pub async fn import_file(&self, path: &Path) -> Result<SessionIdentity> {
         let id = self.adapter.identify(path)?;
+        // Resurrection guard: a peer deleted this session after the file was last
+        // written (tombstone newer than mtime) — don't import it back; the
+        // exporter will remove the local file. A write after the deletion is a
+        // genuine recreate and imports normally.
+        if let Some((ts, None)) = self.node.index_head(self.index_key(&id)).await? {
+            if file_mtime_micros(path).is_some_and(|mtime| ts >= mtime) {
+                return Ok(id);
+            }
+        }
         let plaintext = tokio::fs::read(path)
             .await
             .with_context(|| format!("reading session file {}", path.display()))?;
@@ -169,6 +178,9 @@ impl<A: Adapter> Engine<A> {
         let prefix = format!("{}/", self.adapter.agent());
         let mut written = 0;
         for (key, hash) in self.node.index_latest().await? {
+            let Some(hash) = hash else {
+                continue; // deleted
+            };
             let key = String::from_utf8(key).context("index key not utf-8")?;
             let relative = key
                 .strip_prefix(&prefix)
@@ -198,9 +210,16 @@ impl<A: Adapter> Engine<A> {
     }
 
     pub async fn status_report(&self) -> Result<StatusReport> {
+        let live = self
+            .node
+            .index_latest()
+            .await?
+            .into_iter()
+            .filter(|(_, h)| h.is_some())
+            .count();
         Ok(StatusReport {
             namespace: self.node.namespace().map(|n| n.to_string()),
-            sessions: self.node.index_latest().await?.len(),
+            sessions: live,
             conflicts: self.conflict_paths().await?,
         })
     }
@@ -217,14 +236,23 @@ impl<A: Adapter> Engine<A> {
     async fn divergent(&self) -> Result<Vec<(String, Vec<u8>)>> {
         use std::collections::{BTreeMap, HashSet};
         let prefix = format!("{}/", self.adapter.agent());
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, ssync_net::iroh_blobs::Hash)>> =
+        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Option<ssync_net::iroh_blobs::Hash>)>> =
             BTreeMap::new();
         for (key, ts, hash) in self.node.index_entries_full().await? {
             by_key.entry(key).or_default().push((ts, hash));
         }
         let mut out = Vec::new();
         for (key, mut versions) in by_key {
-            let distinct: HashSet<String> = versions.iter().map(|(_, h)| h.to_string()).collect();
+            versions.sort_by_key(|(ts, _)| *ts);
+            // a winning tombstone means the session is deleted — never merge it
+            // back to life from stale live entries.
+            let Some((_, Some(winner))) = versions.last().copied() else {
+                continue;
+            };
+            let distinct: HashSet<String> = versions
+                .iter()
+                .filter_map(|(_, h)| h.map(|h| h.to_string()))
+                .collect();
             if distinct.len() <= 1 {
                 continue;
             }
@@ -232,16 +260,14 @@ impl<A: Adapter> Engine<A> {
             let Some(rel) = key.strip_prefix(&prefix).map(str::to_string) else {
                 continue;
             };
-            versions.sort_by_key(|(ts, _)| *ts);
-            let (_, winner) = *versions.last().unwrap();
             let Some(winner_pt) = self.get_plain(winner).await else {
                 continue;
             };
             let mut plaintexts = Vec::new();
             let mut seen = HashSet::new();
-            for (_, h) in &versions {
+            for h in versions.iter().filter_map(|(_, h)| *h) {
                 if seen.insert(h.to_string()) {
-                    if let Some(p) = self.get_plain(*h).await {
+                    if let Some(p) = self.get_plain(h).await {
                         plaintexts.push(p);
                     }
                 }
@@ -365,9 +391,17 @@ impl<A: Adapter> Engine<A> {
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
                     let mut changed = false;
+                    let mut gone = Vec::new();
                     for path in std::mem::take(&mut pending) {
-                        changed |= self.import_if_changed(&path, &mut seen).await;
+                        if path.exists() {
+                            changed |= self.import_if_changed(&path, &mut seen).await;
+                        } else {
+                            // deleted before it was ever imported/rescanned — the
+                            // rescan's seen-diff would never notice it.
+                            gone.push(path);
+                        }
                     }
+                    changed |= self.propagate_deletions(gone, &mut seen, exporter_deleted).await;
                     if changed {
                         self.write_status(status_path, true).await;
                     }
@@ -378,33 +412,47 @@ impl<A: Adapter> Engine<A> {
                     for path in &files {
                         changed |= self.import_if_changed(path, &mut seen).await;
                     }
-                    // Propagate user deletions. Guard: never delete everything at
-                    // once (a transiently empty/unmounted dir must not wipe peers).
-                    if !files.is_empty() {
-                        let present: HashSet<PathBuf> = files.into_iter().collect();
-                        let gone: Vec<PathBuf> =
-                            seen.keys().filter(|p| !present.contains(*p)).cloned().collect();
-                        for path in gone {
-                            seen.remove(&path);
-                            if exporter_deleted.lock().unwrap().remove(&path) {
-                                continue; // our own exporter removed it
-                            }
-                            if let Ok(id) = self.adapter.identify(&path) {
-                                match self.node.index_delete(self.index_key(&id)).await {
-                                    Ok(()) => changed = true,
-                                    Err(e) => {
-                                        eprintln!("ssync: delete {}: {e:#}", path.display())
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let present: HashSet<PathBuf> = files.into_iter().collect();
+                    let gone: Vec<PathBuf> =
+                        seen.keys().filter(|p| !present.contains(*p)).cloned().collect();
+                    changed |= self.propagate_deletions(gone, &mut seen, exporter_deleted).await;
                     // refresh unconditionally: the snapshot's mtime doubles as
                     // the daemon's liveness signal for `ssync status`.
                     self.write_status(status_path, changed).await;
                 }
             }
         }
+    }
+
+    /// Tombstone locally-deleted sessions so peers remove them too. Guard: never
+    /// delete everything at once (a transiently empty/unmounted dir must not wipe
+    /// peers). Skips paths our own exporter removed (peer deletions).
+    async fn propagate_deletions(
+        &self,
+        gone: Vec<PathBuf>,
+        seen: &mut std::collections::HashMap<PathBuf, (std::time::SystemTime, u64)>,
+        exporter_deleted: &Deleted,
+    ) -> bool {
+        if gone.is_empty() {
+            return false;
+        }
+        if session_files(self.adapter.session_root(), &self.adapter).is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for path in gone {
+            seen.remove(&path);
+            if exporter_deleted.lock().unwrap().remove(&path) {
+                continue; // our own exporter removed it
+            }
+            if let Ok(id) = self.adapter.identify(&path) {
+                match self.node.index_delete(self.index_key(&id)).await {
+                    Ok(()) => changed = true,
+                    Err(e) => eprintln!("ssync: delete {}: {e:#}", path.display()),
+                }
+            }
+        }
+        changed
     }
 
     /// Import `path` only if its mtime/size changed since last seen (so a rescan
@@ -495,6 +543,21 @@ impl<A: Adapter> Engine<A> {
         for (key, hash) in self.node.index_latest().await? {
             let key = String::from_utf8(key).context("index key not utf-8")?;
             current.insert(key.clone());
+            // deleted (winning tombstone, any author): remove the local file.
+            let Some(hash) = hash else {
+                if exported.get(&key).map(String::as_str) != Some(DELETED) {
+                    if let Some(relative) = key.strip_prefix(&prefix) {
+                        let dest = self.adapter.session_root().join(relative);
+                        if dest.exists() {
+                            exporter_deleted.lock().unwrap().insert(dest.clone());
+                            let _ = tokio::fs::remove_file(&dest).await;
+                            wrote = true;
+                        }
+                    }
+                    exported.insert(key, DELETED.to_string());
+                }
+                continue;
+            };
             let hash_str = hash.to_string();
             if exported.get(&key) == Some(&hash_str) {
                 continue;
@@ -535,6 +598,9 @@ impl<A: Adapter> Engine<A> {
 /// Shared set of paths the exporter removed, so the importer won't re-delete.
 type Deleted = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>;
 
+/// Sentinel in the exporter's per-key state for a session it removed locally.
+const DELETED: &str = "deleted";
+
 /// Merge append-only session versions: the common prefix (shared chronological
 /// history, duplicates intact) followed by each fork's remaining lines, deduped
 /// only across versions (a line both forks appended stays single; a duplicate
@@ -570,6 +636,16 @@ fn merge_lines(versions: &[Vec<u8>]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+/// File mtime as microseconds since the epoch (iroh-docs timestamp scale).
+fn file_mtime_micros(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_micros() as u64)
 }
 
 /// Metadata stamp (mtime, len) used to detect whether a file changed.
