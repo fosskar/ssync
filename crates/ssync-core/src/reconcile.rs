@@ -11,8 +11,9 @@
 //! state we recorded when we made it.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use ssync_net::iroh_blobs::Hash;
 
 /// `(mtime_micros, len)` — cheap change detector for a file, on the iroh-docs
@@ -94,6 +95,84 @@ impl SyncState {
         let ks = self.keys.entry(key.to_string()).or_default();
         ks.export_hash = Some(None);
         ks.import_stamp = None;
+    }
+
+    /// Write the carried state atomically (temp + rename), so a restart
+    /// resumes instead of re-verifying every session. Small: one row per key.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let dto = StateFile {
+            keys: self
+                .keys
+                .iter()
+                .map(|(k, s)| (k.clone(), KeyStateDto::from(s)))
+                .collect(),
+        };
+        let text = toml::to_string(&dto)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load persisted state; absent or unreadable file ⇒ fresh state (the
+    /// engine then re-verifies, which is always safe — just slower).
+    pub fn load(path: &Path) -> Self {
+        let keys = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<StateFile>(&text).ok())
+            .map(|dto| {
+                dto.keys
+                    .into_iter()
+                    .filter_map(|(k, s)| Some((k, s.try_into().ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { keys }
+    }
+}
+
+/// On-disk form of [`SyncState`] (`data_dir/state.toml`).
+#[derive(Serialize, Deserialize)]
+struct StateFile {
+    keys: HashMap<String, KeyStateDto>,
+}
+
+/// [`KeyState`] with the hash as hex; `export = "deleted"` is a tombstone.
+#[derive(Serialize, Deserialize)]
+struct KeyStateDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import_stamp: Option<Stamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export: Option<String>,
+}
+
+const DELETED: &str = "deleted";
+
+impl From<&KeyState> for KeyStateDto {
+    fn from(s: &KeyState) -> Self {
+        Self {
+            import_stamp: s.import_stamp,
+            export: s.export_hash.map(|h| match h {
+                Some(h) => h.to_string(),
+                None => DELETED.to_string(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<KeyStateDto> for KeyState {
+    type Error = anyhow::Error;
+
+    fn try_from(dto: KeyStateDto) -> anyhow::Result<Self> {
+        let export_hash = match dto.export.as_deref() {
+            None => None,
+            Some(DELETED) => Some(None),
+            Some(hex) => Some(Some(hex.parse()?)),
+        };
+        Ok(Self {
+            import_stamp: dto.import_stamp,
+            export_hash,
+        })
     }
 }
 
@@ -491,6 +570,42 @@ mod tests {
         };
         let a = reconcile(&st, &[local("x/p/s", (5, 10))], &index(&[("x/p/s", entry)]));
         assert!(a.is_empty(), "non-append-only key was merged: {a:?}");
+    }
+
+    #[test]
+    fn state_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("ssync-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.toml");
+
+        let h = hash(b"blob");
+        let mut st = SyncState::default();
+        st.settle_import("pi/p/imported", (5, 10), h);
+        st.settle_delete("pi/p/deleted");
+        st.keys.insert("pi/p/untouched".into(), KeyState::default());
+
+        st.save(&path).unwrap();
+        let loaded = SyncState::load(&path);
+
+        assert_eq!(
+            loaded.keys.get("pi/p/imported").unwrap().import_stamp,
+            Some((5, 10))
+        );
+        assert_eq!(
+            loaded.keys.get("pi/p/imported").unwrap().export_hash,
+            Some(Some(h))
+        );
+        assert_eq!(
+            loaded.keys.get("pi/p/deleted").unwrap().export_hash,
+            Some(None)
+        );
+        assert_eq!(loaded.keys.get("pi/p/untouched").unwrap().export_hash, None);
+
+        // a corrupt/absent file must never kill the daemon: fresh state
+        std::fs::write(&path, "not toml [").unwrap();
+        assert!(SyncState::load(&path).keys.is_empty());
+        assert!(SyncState::load(&dir.join("missing.toml")).keys.is_empty());
     }
 
     // settle_*: an unchanged snapshot must produce no actions (no echo),

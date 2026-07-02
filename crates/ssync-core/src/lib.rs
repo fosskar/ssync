@@ -145,6 +145,8 @@ pub struct Engine {
     node: Node,
     /// What we last materialised per key; feeds [`reconcile`].
     state: SyncState,
+    /// Where the carried state persists across restarts; `None` = memory-only.
+    state_path: Option<PathBuf>,
     /// Merges already announced (log once, not per tick).
     merged_logged: std::collections::HashSet<String>,
     /// Divergence verdict per key, keyed by the distinct-hash fingerprint of
@@ -169,9 +171,25 @@ impl Engine {
             identity,
             node,
             state: SyncState::default(),
+            state_path: None,
             merged_logged: Default::default(),
             divergence_cache: Default::default(),
         }
+    }
+
+    /// Load carried state from `path` and keep it persisted there after every
+    /// pass. Restart then resumes where the last run settled — unchanged files
+    /// import as no-ops without decryption, and a file deleted while the
+    /// daemon was down reads as "we materialised it, now it is gone" ⇒
+    /// tombstone instead of re-import.
+    pub fn persist_state(&mut self, path: &Path) {
+        self.state = SyncState::load(path);
+        self.state_path = Some(path.to_path_buf());
+    }
+
+    /// Shut down the underlying node (flushes the blob store).
+    pub async fn shutdown(self) -> Result<()> {
+        self.node.shutdown().await
     }
 
     /// The adapter owning an index key (matching `{agent}/` prefix), if any —
@@ -420,6 +438,11 @@ impl Engine {
             .chain(index.keys().map(String::as_str))
             .collect();
         self.state.keys.retain(|k, _| live.contains(k.as_str()));
+        if let Some(path) = &self.state_path
+            && let Err(e) = self.state.save(path)
+        {
+            eprintln!("ssync: persist state {}: {e:#}", path.display());
+        }
         changed
     }
 
@@ -567,7 +590,6 @@ impl Engine {
                         None => events_ended = true,
                     }
                 }
-
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
                     self.step(status_path).await;

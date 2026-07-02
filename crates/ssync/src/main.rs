@@ -168,6 +168,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         .map(|a| adapter_for(&a.agent, &a.session_dir))
         .collect::<Result<Vec<_>>>()?;
     let mut engine = Engine::with_adapters(adapters, identity, node);
+    engine.persist_state(&config.data_dir.join("state.toml"));
     for a in &config.agents {
         println!(
             "ssync daemon watching {} ({})",

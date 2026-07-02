@@ -287,6 +287,45 @@ async fn deletion_by_non_author_propagates_back() {
 }
 
 #[tokio::test]
+async fn deletion_while_daemon_down_is_not_reimported() {
+    // engine 1 imports two sessions and persists its state; one file is
+    // deleted "while the daemon is down"; engine 2 (same state file, same
+    // node dir) must tombstone the deleted session instead of re-importing it.
+    let base = scratch("down-del");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let root = base.join("sessions");
+    let state_path = base.join("state.toml");
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019edown0001eeee71acbe20downdel01.jsonl";
+    let keep = "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl";
+    std::fs::create_dir_all(root.join("--proj--")).unwrap();
+    std::fs::write(root.join(rel), b"header\ndelete me\n").unwrap();
+    std::fs::write(root.join(keep), b"keep\n").unwrap();
+
+    let ns = {
+        let mut node = spawn_node(&base.join("data")).await;
+        let ns = node.create_namespace().await.unwrap();
+        let mut engine = pi_engine(&root, &secret, node);
+        engine.persist_state(&state_path);
+        engine.tick_once().await;
+        engine.shutdown().await.unwrap();
+        ns
+    };
+
+    // daemon down: the session file disappears
+    std::fs::remove_file(root.join(rel)).unwrap();
+
+    let mut node = spawn_node(&base.join("data")).await;
+    node.open_namespace(ns).await.unwrap();
+    let mut engine = pi_engine(&root, &secret, node);
+    engine.persist_state(&state_path);
+    engine.tick_once().await;
+
+    // the key must now be a tombstone (deleted), not a live re-import
+    let report = engine.status_report().await.unwrap();
+    assert_eq!(report.sessions, 1, "deleted session was re-imported");
+}
+
+#[tokio::test]
 async fn divergent_sessions_merge_and_converge() {
     let base = scratch("merge");
     let secret = AgeIdentity::generate().unwrap().to_secret_string();

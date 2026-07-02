@@ -244,6 +244,10 @@ not just the author's. Resurrection is guarded by comparing the tombstone timest
 against the local file's mtime on import; a write after the deletion is a genuine
 recreate. Safety valve: a transiently empty session dir never propagates deletions (the
 empty-dir wipe guard), at the cost that deleting the very last session does not sync.
+The engine's carried per-key state persists across restarts (`data_dir/state.toml`),
+so a session deleted *while the daemon is down* still reads as "materialised here,
+now gone" on the next start and is tombstoned rather than re-imported — and an
+unchanged session dir makes restart a no-op instead of a full re-verification.
 
 ---
 
