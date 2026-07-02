@@ -10,8 +10,8 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
-use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
+use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
@@ -23,6 +23,18 @@ pub use {iroh, iroh_blobs, iroh_docs};
 /// Map iroh-docs' tombstone sentinel (`Hash::EMPTY` content) to `None`.
 fn live_hash(hash: Hash) -> Option<Hash> {
     (hash != Hash::EMPTY).then_some(hash)
+}
+
+/// The full synced state of one index key, computed once behind the seam: the
+/// winner (newest across all authors) plus every distinct live version. A
+/// winning tombstone reads as `winner = None`; `versions` holds the
+/// non-tombstone content hashes (len > 1 means the key has genuinely diverged).
+#[derive(Debug, Clone)]
+pub struct IndexRecord {
+    pub key: Vec<u8>,
+    pub winner_ts: u64,
+    pub winner: Option<Hash>,
+    pub versions: Vec<Hash>,
 }
 
 /// A fresh random 32-byte key seed (usable as a node key or namespace secret).
@@ -224,7 +236,7 @@ impl Node {
     }
 
     /// Live event stream for the active namespace; drives the exporter.
-    pub async fn subscribe(&self) -> Result<impl Stream<Item = Result<LiveEvent>>> {
+    pub async fn subscribe(&self) -> Result<impl Stream<Item = Result<LiveEvent>> + use<>> {
         self.doc()?.subscribe().await
     }
 
@@ -248,50 +260,64 @@ impl Node {
         Ok(())
     }
 
-    /// Winning entry for `key` (newest across all authors). Not author-scoped, so
-    /// a node sees a peer's version even if it never wrote the key (loop-prevention).
-    /// A winning tombstone reads as `None` — the session is deleted.
-    pub async fn index_get(&self, key: impl AsRef<[u8]>) -> Result<Option<Hash>> {
-        Ok(self.index_head(key).await?.and_then(|(_, hash)| hash))
-    }
-
-    /// Newest entry for `key` across all authors as `(timestamp_micros, hash)`;
-    /// `hash = None` means the winner is a deletion tombstone.
-    pub async fn index_head(&self, key: impl AsRef<[u8]>) -> Result<Option<(u64, Option<Hash>)>> {
-        let query = Query::single_latest_per_key()
-            .key_exact(key)
-            .include_empty();
-        let entry = self.doc()?.get_one(query).await?;
-        Ok(entry.map(|e| (e.timestamp(), live_hash(e.content_hash()))))
-    }
-
-    /// Every author's current entry as `(key, timestamp, hash)` (multiple rows
-    /// per key when several machines wrote it); `hash = None` is a tombstone.
-    /// Used for content-based conflict resolution.
-    pub async fn index_entries_full(&self) -> Result<Vec<(Vec<u8>, u64, Option<Hash>)>> {
-        let stream = self.doc()?.get_many(Query::all().include_empty()).await?;
-        let mut stream = std::pin::pin!(stream);
-        let mut out = Vec::new();
-        while let Some(entry) = stream.next().await {
-            let entry = entry?;
-            out.push((
-                entry.key().to_vec(),
-                entry.timestamp(),
-                live_hash(entry.content_hash()),
-            ));
-        }
-        Ok(out)
-    }
-
     /// Delete this node's entry for `key` (append-only tombstone that syncs).
     pub async fn index_delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
         self.doc()?.del(self.author, key.as_ref().to_vec()).await?;
         Ok(())
     }
 
-    /// Winning `(key, hash)` per key, newest wins (DECISIONS §8). A winning
-    /// tombstone (`hash = None`) means the session is deleted, by any author.
-    pub async fn index_latest(&self) -> Result<Vec<(Vec<u8>, Option<Hash>)>> {
+    /// Collect every author's live hashes per key (for divergence/merge). Keyed
+    /// by the raw index key; only non-tombstone content is recorded.
+    async fn live_versions(
+        &self,
+        query: impl Into<Query>,
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Hash>>> {
+        let stream = self.doc()?.get_many(query).await?;
+        let mut stream = std::pin::pin!(stream);
+        let mut out: std::collections::HashMap<Vec<u8>, Vec<Hash>> =
+            std::collections::HashMap::new();
+        while let Some(entry) = stream.next().await {
+            let entry = entry?;
+            if let Some(h) = live_hash(entry.content_hash()) {
+                let versions = out.entry(entry.key().to_vec()).or_default();
+                if !versions.contains(&h) {
+                    versions.push(h);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The full synced state of one key: the winner (newest across all authors)
+    /// plus every distinct live version. `None` when the key was never written.
+    pub async fn index_record(&self, key: impl AsRef<[u8]>) -> Result<Option<IndexRecord>> {
+        let key = key.as_ref();
+        let winner = self
+            .doc()?
+            .get_one(
+                Query::single_latest_per_key()
+                    .key_exact(key)
+                    .include_empty(),
+            )
+            .await?;
+        let Some(winner) = winner else {
+            return Ok(None);
+        };
+        let mut versions = self
+            .live_versions(Query::all().key_exact(key).include_empty())
+            .await?;
+        Ok(Some(IndexRecord {
+            key: key.to_vec(),
+            winner_ts: winner.timestamp(),
+            winner: live_hash(winner.content_hash()),
+            versions: versions.remove(key).unwrap_or_default(),
+        }))
+    }
+
+    /// One [`IndexRecord`] per key. Winner selection and version grouping happen
+    /// here, once, so callers never re-derive them from raw entries (DECISIONS §8).
+    pub async fn index_records(&self) -> Result<Vec<IndexRecord>> {
+        let mut versions = self.live_versions(Query::all().include_empty()).await?;
         let stream = self
             .doc()?
             .get_many(Query::single_latest_per_key().include_empty())
@@ -300,7 +326,14 @@ impl Node {
         let mut out = Vec::new();
         while let Some(entry) = stream.next().await {
             let entry = entry?;
-            out.push((entry.key().to_vec(), live_hash(entry.content_hash())));
+            let key = entry.key().to_vec();
+            let versions = versions.remove(&key).unwrap_or_default();
+            out.push(IndexRecord {
+                key,
+                winner_ts: entry.timestamp(),
+                winner: live_hash(entry.content_hash()),
+                versions,
+            });
         }
         Ok(out)
     }
@@ -362,9 +395,14 @@ mod tests {
             .await
             .unwrap();
 
-        let got = node.index_get("pi/proj/session-1").await.unwrap();
-        assert_eq!(got, Some(hash));
-        assert_eq!(node.index_get("missing").await.unwrap(), None);
+        let rec = node
+            .index_record("pi/proj/session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.winner, Some(hash));
+        assert_eq!(rec.versions, vec![hash]);
+        assert!(node.index_record("missing").await.unwrap().is_none());
 
         node.shutdown().await.unwrap();
     }

@@ -3,20 +3,20 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_lite::StreamExt;
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use ssync_adapters::{Adapter, SessionIdentity};
 use ssync_crypto::AgeIdentity;
+use ssync_net::Node;
 use ssync_net::iroh_docs::engine::LiveEvent;
 use ssync_net::iroh_docs::{DocTicket, NamespaceId};
-use ssync_net::Node;
 
 use ssync_net::iroh_blobs::Hash;
 
 mod reconcile;
-use reconcile::{reconcile, Action, IndexEntry, IndexHead, LocalFile, SyncState};
+use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 
 /// On-disk daemon configuration (`$XDG_CONFIG_HOME/ssync/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,10 +142,11 @@ impl<A: Adapter> Engine<A> {
         // Resurrection guard (for direct/one-shot callers; the daemon decides
         // this in `reconcile`): a peer deleted this session after the file was
         // last written (tombstone newer than mtime) — don't import it back.
-        if let Some((ts, None)) = self.node.index_head(self.index_key(&id)).await? {
-            if file_mtime_micros(path).is_some_and(|mtime| ts >= mtime) {
-                return Ok(id);
-            }
+        if let Some(rec) = self.node.index_record(self.index_key(&id)).await?
+            && rec.winner.is_none()
+            && file_mtime_micros(path).is_some_and(|mtime| rec.winner_ts >= mtime)
+        {
+            return Ok(id);
         }
         self.import_action(path).await?;
         Ok(id)
@@ -160,10 +161,10 @@ impl<A: Adapter> Engine<A> {
         let plaintext = tokio::fs::read(path)
             .await
             .with_context(|| format!("reading session file {}", path.display()))?;
-        if let Ok(Some(existing)) = self.read_session(&id).await {
-            if existing == plaintext {
-                return Ok(None);
-            }
+        if let Ok(Some(existing)) = self.read_session(&id).await
+            && existing == plaintext
+        {
+            return Ok(None);
         }
         let ciphertext = self.identity.encrypt(&plaintext)?;
         let size = ciphertext.len() as u64;
@@ -175,17 +176,23 @@ impl<A: Adapter> Engine<A> {
     pub async fn import_all(&self) -> Result<usize> {
         let mut n = 0;
         for path in session_files(self.adapter.session_root(), &self.adapter) {
-            if let Err(e) = self.import_file(&path).await {
-                eprintln!("ssync: import {}: {e:#}", path.display());
-            } else {
-                n += 1;
+            match self.import_file(&path).await {
+                Err(e) => {
+                    eprintln!("ssync: import {}: {e:#}", path.display());
+                }
+                _ => {
+                    n += 1;
+                }
             }
         }
         Ok(n)
     }
 
     pub async fn read_session(&self, id: &SessionIdentity) -> Result<Option<Vec<u8>>> {
-        let Some(hash) = self.node.index_get(self.index_key(id)).await? else {
+        let Some(rec) = self.node.index_record(self.index_key(id)).await? else {
+            return Ok(None);
+        };
+        let Some(hash) = rec.winner else {
             return Ok(None);
         };
         let ciphertext = self.node.get_blob(hash).await?;
@@ -195,15 +202,14 @@ impl<A: Adapter> Engine<A> {
 
     /// Write every indexed session into the session root, decrypted, atomically.
     pub async fn export_all(&self) -> Result<usize> {
-        let prefix = format!("{}/", self.adapter.agent());
         let mut written = 0;
-        for (key, hash) in self.node.index_latest().await? {
-            let Some(hash) = hash else {
+        for rec in self.node.index_records().await? {
+            let Some(hash) = rec.winner else {
                 continue; // deleted
             };
-            let key = String::from_utf8(key).context("index key not utf-8")?;
-            let relative = key
-                .strip_prefix(&prefix)
+            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            let dest = self
+                .dest_of(&key)
                 .ok_or_else(|| anyhow!("index key {key} missing agent prefix"))?;
             let ciphertext = match self.node.get_blob(hash).await {
                 Ok(ct) => ct,
@@ -211,7 +217,6 @@ impl<A: Adapter> Engine<A> {
                 Err(_) => continue,
             };
             let plaintext = self.identity.decrypt(&ciphertext)?;
-            let dest = self.adapter.session_root().join(relative);
             atomic_write(&dest, &plaintext).await?;
             written += 1;
         }
@@ -219,23 +224,68 @@ impl<A: Adapter> Engine<A> {
     }
 
     /// Sessions still genuinely diverged — the newest version does not already
-    /// contain every line of every author's version.
+    /// contain every line of every author's version. Verdicts are cached by the
+    /// version-set fingerprint so an unchanged set is never re-decrypted.
     pub async fn conflict_paths(&self) -> Result<Vec<String>> {
-        Ok(self
-            .divergent()
-            .await?
-            .into_iter()
-            .map(|(rel, _)| rel)
-            .collect())
+        let mut out = Vec::new();
+        for rec in self.node.index_records().await? {
+            let Some(winner) = rec.winner else {
+                continue; // deleted — never resurrect from stale live entries
+            };
+            if rec.versions.len() <= 1 {
+                continue;
+            }
+            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            let Some(rel) = self.relative_of(&key).map(str::to_string) else {
+                continue;
+            };
+            if self.is_divergent(&key, winner, &rec.versions).await {
+                out.push(rel);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `versions` (distinct live hashes) fail to collapse into `winner` —
+    /// i.e. the lossless union differs from the current winner. Cached by the
+    /// version-set fingerprint; only complete verdicts (all blobs present) cache.
+    async fn is_divergent(&self, key: &str, winner: Hash, versions: &[Hash]) -> bool {
+        let mut fingerprint: Vec<String> = versions.iter().map(|h| h.to_string()).collect();
+        fingerprint.sort();
+        let fingerprint = fingerprint.join(",");
+        if let Some((fp, verdict)) = self.divergence_cache.lock().unwrap().get(key)
+            && *fp == fingerprint
+        {
+            return *verdict;
+        }
+        let Some(winner_pt) = self.get_plain(winner).await else {
+            return false;
+        };
+        let mut plaintexts = Vec::new();
+        for h in versions {
+            if let Some(p) = self.get_plain(*h).await {
+                plaintexts.push(p);
+            }
+        }
+        let divergent = merge_lines(&plaintexts) != winner_pt;
+        // only cache complete verdicts: a missing blob makes the union partial
+        // and would pin a wrong "not divergent" forever.
+        if plaintexts.len() == versions.len() {
+            self.divergence_cache
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (fingerprint, divergent));
+        }
+        divergent
     }
 
     pub async fn status_report(&self) -> Result<StatusReport> {
         let live = self
             .node
-            .index_latest()
+            .index_records()
             .await?
             .into_iter()
-            .filter(|(_, h)| h.is_some())
+            .filter(|r| r.winner.is_some())
             .count();
         Ok(StatusReport {
             namespace: self.node.namespace().map(|n| n.to_string()),
@@ -249,112 +299,31 @@ impl<A: Adapter> Engine<A> {
         self.identity.decrypt(&ciphertext).ok()
     }
 
-    /// Sessions where several authors' versions exist and the newest does not
-    /// contain the union of all lines. Since pi is append-only, the union is the
-    /// correct lossless resolution. Returns `(relative_path, merged_plaintext)`.
-    /// A stale duplicate (one version a subset of the newest) is not divergent.
-    async fn divergent(&self) -> Result<Vec<(String, Vec<u8>)>> {
-        use std::collections::{BTreeMap, HashSet};
-        let prefix = format!("{}/", self.adapter.agent());
-        let mut by_key: BTreeMap<Vec<u8>, Vec<(u64, Option<ssync_net::iroh_blobs::Hash>)>> =
-            BTreeMap::new();
-        for (key, ts, hash) in self.node.index_entries_full().await? {
-            by_key.entry(key).or_default().push((ts, hash));
-        }
-        let mut out = Vec::new();
-        for (key, mut versions) in by_key {
-            versions.sort_by_key(|(ts, _)| *ts);
-            // a winning tombstone means the session is deleted — never merge it
-            // back to life from stale live entries.
-            let Some((_, Some(winner))) = versions.last().copied() else {
-                continue;
-            };
-            let distinct: HashSet<String> = versions
-                .iter()
-                .filter_map(|(_, h)| h.map(|h| h.to_string()))
-                .collect();
-            if distinct.len() <= 1 {
-                continue;
-            }
-            let key = String::from_utf8(key).context("index key not utf-8")?;
-            let Some(rel) = key.strip_prefix(&prefix).map(str::to_string) else {
-                continue;
-            };
-            // fingerprint the version set; an unchanged set needs no re-decrypt.
-            let mut fingerprint: Vec<String> = distinct.iter().cloned().collect();
-            fingerprint.sort();
-            let fingerprint = fingerprint.join(",");
-            let cached = self
-                .divergence_cache
-                .lock()
-                .unwrap()
-                .get(&key)
-                .filter(|(fp, _)| *fp == fingerprint)
-                .map(|(_, verdict)| *verdict);
-            if cached == Some(false) {
-                continue;
-            }
-            let Some(winner_pt) = self.get_plain(winner).await else {
-                continue;
-            };
-            let mut plaintexts = Vec::new();
-            let mut seen = HashSet::new();
-            for h in versions.iter().filter_map(|(_, h)| *h) {
-                if seen.insert(h.to_string()) {
-                    if let Some(p) = self.get_plain(h).await {
-                        plaintexts.push(p);
-                    }
-                }
-            }
-            let merged = merge_lines(&plaintexts);
-            let divergent = merged != winner_pt;
-            // only cache complete verdicts: with a blob still undownloaded the
-            // union is partial and would pin a wrong "not divergent" forever.
-            if plaintexts.len() == distinct.len() {
-                self.divergence_cache
-                    .lock()
-                    .unwrap()
-                    .insert(key, (fingerprint, divergent));
-            }
-            if divergent {
-                out.push((rel, merged));
-            }
-        }
-        Ok(out)
-    }
-
     /// Recompute the lossless union for one diverged key and publish it as the
     /// new winner (under this node's author) only if it differs from the current
     /// winner. Returns the relative path when it published, so the caller logs
     /// the merge once.
     async fn merge_one(&self, key: &str) -> Result<Option<String>> {
-        use std::collections::HashSet;
-        let Some(rel) = key.strip_prefix(&self.prefix()).map(str::to_string) else {
+        let Some(rel) = self.relative_of(key).map(str::to_string) else {
             return Ok(None);
         };
-        let mut versions: Vec<(u64, Option<Hash>)> = self
-            .node
-            .index_entries_full()
-            .await?
-            .into_iter()
-            .filter(|(k, _, _)| k.as_slice() == key.as_bytes())
-            .map(|(_, ts, h)| (ts, h))
-            .collect();
-        versions.sort_by_key(|(ts, _)| *ts);
+        let Some(rec) = self.node.index_record(key).await? else {
+            return Ok(None);
+        };
         // a winning tombstone means the session is deleted — never merge it back.
-        let Some((_, Some(winner))) = versions.last().copied() else {
+        let Some(winner) = rec.winner else {
             return Ok(None);
         };
+        if rec.versions.len() <= 1 {
+            return Ok(None);
+        }
         let Some(winner_pt) = self.get_plain(winner).await else {
             return Ok(None);
         };
-        let mut seen = HashSet::new();
         let mut plaintexts = Vec::new();
-        for h in versions.iter().filter_map(|(_, h)| *h) {
-            if seen.insert(h.to_string()) {
-                if let Some(p) = self.get_plain(h).await {
-                    plaintexts.push(p);
-                }
+        for h in &rec.versions {
+            if let Some(p) = self.get_plain(*h).await {
+                plaintexts.push(p);
             }
         }
         let merged = merge_lines(&plaintexts);
@@ -371,6 +340,18 @@ impl<A: Adapter> Engine<A> {
     /// The `{agent}/` index-key prefix.
     fn prefix(&self) -> String {
         format!("{}/", self.adapter.agent())
+    }
+
+    /// Decode an index key back to its session-root-relative path (the inverse of
+    /// `index_key`): strip the `{agent}/` prefix.
+    fn relative_of<'a>(&self, key: &'a str) -> Option<&'a str> {
+        key.strip_prefix(&self.prefix())
+    }
+
+    /// The absolute session-dir path an index key maps to on this machine.
+    fn dest_of(&self, key: &str) -> Option<PathBuf> {
+        self.relative_of(key)
+            .map(|rel| self.adapter.session_root().join(rel))
     }
 
     /// Write the status snapshot; `announce` additionally logs conflicts (off
@@ -410,29 +391,17 @@ impl<A: Adapter> Engine<A> {
     /// Snapshot the synced index as `reconcile` input: winning entry plus the
     /// count of distinct live hashes (divergence) per key.
     async fn index_snapshot(&self) -> Result<std::collections::HashMap<String, IndexEntry>> {
-        use std::collections::{HashMap, HashSet};
-        let mut ts_by_key: HashMap<String, u64> = HashMap::new();
-        let mut distinct: HashMap<String, HashSet<String>> = HashMap::new();
-        for (key, ts, hash) in self.node.index_entries_full().await? {
-            let key = String::from_utf8(key).context("index key not utf-8")?;
-            ts_by_key
-                .entry(key.clone())
-                .and_modify(|t| *t = (*t).max(ts))
-                .or_insert(ts);
-            if let Some(h) = hash {
-                distinct.entry(key).or_default().insert(h.to_string());
-            }
-        }
-        let mut out = HashMap::new();
-        for (key, hash) in self.node.index_latest().await? {
-            let key = String::from_utf8(key).context("index key not utf-8")?;
-            let timestamp = ts_by_key.get(&key).copied().unwrap_or(0);
-            let distinct_live = distinct.get(&key).map(HashSet::len).unwrap_or(0);
+        let mut out = std::collections::HashMap::new();
+        for rec in self.node.index_records().await? {
+            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
             out.insert(
                 key,
                 IndexEntry {
-                    head: IndexHead { timestamp, hash },
-                    distinct_live,
+                    head: IndexHead {
+                        timestamp: rec.winner_ts,
+                        hash: rec.winner,
+                    },
+                    distinct_live: rec.versions.len(),
                 },
             );
         }
@@ -458,6 +427,14 @@ impl<A: Adapter> Engine<A> {
         for action in reconcile(state, &local, &index) {
             changed |= self.execute(&action, state, merged_logged).await;
         }
+        // Prune carried state for keys gone from both the dir and the index, so
+        // it never outgrows what they justify.
+        let live: std::collections::HashSet<&str> = local
+            .iter()
+            .map(|f| f.key.as_str())
+            .chain(index.keys().map(String::as_str))
+            .collect();
+        state.keys.retain(|k, _| live.contains(k.as_str()));
         // Refresh unconditionally: the snapshot's mtime doubles as the daemon's
         // liveness signal for `ssync status`. Announce conflicts only on change.
         self.write_status(status_path, changed).await;
@@ -493,7 +470,7 @@ impl<A: Adapter> Engine<A> {
                 }
             },
             Action::WriteFile { key, hash } => {
-                let Some(relative) = key.strip_prefix(&self.prefix()).map(str::to_string) else {
+                let Some(dest) = self.dest_of(key) else {
                     return false;
                 };
                 // content may not have downloaded yet; skip, a later tick retries.
@@ -507,7 +484,6 @@ impl<A: Adapter> Engine<A> {
                         return false;
                     }
                 };
-                let dest = self.adapter.session_root().join(&relative);
                 if let Err(e) = atomic_write(&dest, &plaintext).await {
                     eprintln!("ssync: write {}: {e:#}", dest.display());
                     return false;
@@ -521,10 +497,9 @@ impl<A: Adapter> Engine<A> {
                 let ks = state.keys.entry(key.clone()).or_default();
                 ks.export_hash = Some(None);
                 ks.import_stamp = None;
-                let Some(relative) = key.strip_prefix(&self.prefix()) else {
+                let Some(dest) = self.dest_of(key) else {
                     return false;
                 };
-                let dest = self.adapter.session_root().join(relative);
                 let existed = dest.exists();
                 let _ = tokio::fs::remove_file(&dest).await;
                 existed
@@ -601,11 +576,10 @@ impl<A: Adapter> Engine<A> {
             };
             tokio::select! {
                 Some(res) = rx.recv() => {
-                    if let Ok(event) = res {
-                        if event.paths.iter().any(|p| self.adapter.is_session_file(p)) {
+                    if let Ok(event) = res
+                        && event.paths.iter().any(|p| self.adapter.is_session_file(p)) {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
-                    }
                 }
                 ev = events.next() => {
                     match ev {
