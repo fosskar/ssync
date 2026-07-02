@@ -92,7 +92,31 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        Self::parse(&text).with_context(|| format!("parsing config {}", path.display()))
+    }
+
+    /// Parse config TOML, expanding a leading `~/` in every path so one config
+    /// file works across machines with different home directories.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(text)?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
+        let expand = |p: &mut PathBuf| {
+            if let Ok(rest) = p.strip_prefix("~") {
+                *p = home.join(rest);
+            }
+        };
+        for a in &mut cfg.agents {
+            expand(&mut a.session_dir);
+        }
+        expand(&mut cfg.age_identity_path);
+        expand(&mut cfg.data_dir);
+        if let Some(p) = &mut cfg.namespace_secret_path {
+            expand(p);
+        }
+        if let Some(p) = &mut cfg.node_key_path {
+            expand(p);
+        }
+        Ok(cfg)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -820,6 +844,29 @@ mod tests {
         assert_eq!(cfg.peers, cfg2.peers);
         assert_eq!(cfg.namespace_secret_path, cfg2.namespace_secret_path);
         assert_eq!(cfg.agents.len(), cfg2.agents.len());
+    }
+
+    #[test]
+    fn config_expands_leading_tilde_in_paths() {
+        let toml_str = r#"
+            age_identity_path = "~/.config/ssync/age.key"
+            data_dir = "~/.local/share/ssync"
+            namespace_secret_path = "/run/secrets/ns"
+
+            [[agents]]
+            agent = "pi"
+            session_dir = "~/.pi/agent/sessions"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(cfg.agents[0].session_dir, home.join(".pi/agent/sessions"));
+        assert_eq!(cfg.age_identity_path, home.join(".config/ssync/age.key"));
+        assert_eq!(cfg.data_dir, home.join(".local/share/ssync"));
+        // absolute paths stay untouched
+        assert_eq!(
+            cfg.namespace_secret_path.as_deref(),
+            Some(Path::new("/run/secrets/ns"))
+        );
     }
 
     #[test]

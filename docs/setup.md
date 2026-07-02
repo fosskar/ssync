@@ -80,17 +80,19 @@ pairing below is only for the non-clan (standalone) modules.
 `ssync` reads `$XDG_CONFIG_HOME/ssync/config.toml` (override with `--config`):
 
 ```toml
-age_identity_path = "/home/alice/.config/ssync/age.key"
-data_dir = "/home/alice/.local/share/ssync"
+# a leading ~/ expands to the local home directory, so one config file
+# works across machines with different usernames.
+age_identity_path = "~/.config/ssync/age.key"
+data_dir = "~/.local/share/ssync"
 
 [[agents]]
 agent = "pi"
-session_dir = "/home/alice/.pi/agent/sessions"
+session_dir = "~/.pi/agent/sessions"
 
 # optional: sync omp (oh-my-pi) sessions side by side
 [[agents]]
 agent = "omp"
-session_dir = "/home/alice/.omp/agent/sessions"
+session_dir = "~/.omp/agent/sessions"
 ```
 
 The Nix modules generate this file for you from their options. `ssync init`
