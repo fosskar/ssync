@@ -536,6 +536,7 @@ impl Engine {
 
         let events = self.node.subscribe().await?;
         let mut events = std::pin::pin!(events);
+        let mut events_ended = false;
 
         // initial reconcile
         self.step(status_path).await;
@@ -563,16 +564,20 @@ impl Engine {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                 }
-                ev = events.next() => {
+                ev = events.next(), if !events_ended => {
                     match ev {
                         Some(Ok(LiveEvent::InsertRemote { .. }))
                         | Some(Ok(LiveEvent::ContentReady { .. })) => {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                         Some(_) => {}
-                        None => {} // index stream ended; rescan still drives ticks
+                        // ended stream: disarm this select arm, or it is ready
+                        // (None) on every loop iteration and spins the CPU at
+                        // 100%; the rescan interval still drives ticks.
+                        None => events_ended = true,
                     }
                 }
+
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
                     self.step(status_path).await;
