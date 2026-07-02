@@ -226,7 +226,8 @@ pure line-set arithmetic — no entry parsing, store-as-is holds — and content
 ordering makes every peer compute the identical result, so all nodes converge. A merge
 is only computed once every version's blob is present locally (all-or-skip) — a union
 over a partially-downloaded version set would transiently drop a fork's lines. A future
-non-append-only adapter falls back to detect + keep-both + newest-wins.
+non-append-only adapter falls back to detect + keep-both + newest-wins (the
+`Adapter::append_only` flag gates the merge action in `reconcile`).
 
 **Deletion (any participant):** the winning index entry per key is resolved *including*
 tombstones, so the newest tombstone from any author deletes the session on every peer —

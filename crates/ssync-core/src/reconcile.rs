@@ -48,6 +48,9 @@ pub struct IndexHead {
 pub struct IndexEntry {
     pub head: IndexHead,
     pub distinct_live: usize,
+    /// `Adapter::append_only` — line-merging a compacting format would
+    /// corrupt it, so divergence falls back to newest-wins (DECISIONS §8).
+    pub merge_allowed: bool,
 }
 
 /// What the engine last materialised for a key. Carried between passes so
@@ -210,6 +213,7 @@ pub fn reconcile(
         if let Some(e) = entry
             && e.head.hash.is_some()
             && e.distinct_live > 1
+            && e.merge_allowed
         {
             actions.push(Action::Merge {
                 key: key.to_string(),
@@ -242,6 +246,7 @@ mod tests {
                 hash: Some(hash),
             },
             distinct_live,
+            merge_allowed: true,
         }
     }
 
@@ -252,6 +257,7 @@ mod tests {
                 hash: None,
             },
             distinct_live: 0,
+            merge_allowed: true,
         }
     }
 
@@ -467,6 +473,24 @@ mod tests {
                 key: "pi/p/s".into()
             }]
         );
+    }
+
+    #[test]
+    fn divergence_without_merge_allowed_emits_no_merge() {
+        let h = hash(b"winner");
+        let st = state(&[(
+            "x/p/s",
+            KeyState {
+                import_stamp: Some((5, 10)),
+                export_hash: Some(Some(h)),
+            },
+        )]);
+        let entry = IndexEntry {
+            merge_allowed: false,
+            ..live(h, 5, 2)
+        };
+        let a = reconcile(&st, &[local("x/p/s", (5, 10))], &index(&[("x/p/s", entry)]));
+        assert!(a.is_empty(), "non-append-only key was merged: {a:?}");
     }
 
     // settle_*: an unchanged snapshot must produce no actions (no echo),

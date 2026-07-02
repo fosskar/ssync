@@ -396,6 +396,7 @@ impl Engine {
         let mut out = std::collections::HashMap::new();
         for rec in self.node.index_records().await? {
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            let merge_allowed = self.adapter_of_key(&key).is_some_and(|a| a.append_only());
             out.insert(
                 key,
                 IndexEntry {
@@ -404,6 +405,7 @@ impl Engine {
                         hash: rec.winner,
                     },
                     distinct_live: rec.versions.len(),
+                    merge_allowed,
                 },
             );
         }
