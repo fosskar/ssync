@@ -226,29 +226,6 @@ impl Engine {
             .identify(path)
     }
 
-    /// Sessions still genuinely diverged — the newest version does not already
-    /// contain every line of every author's version. Verdicts are cached by the
-    /// version-set fingerprint so an unchanged set is never re-decrypted.
-    async fn conflict_paths(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for rec in self.node.index_records().await? {
-            let Some(winner) = rec.winner else {
-                continue; // deleted — never resurrect from stale live entries
-            };
-            if rec.versions.len() <= 1 {
-                continue;
-            }
-            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            let Some(rel) = self.relative_of(&key).map(str::to_string) else {
-                continue;
-            };
-            if self.is_diverged(&key, winner, &rec.versions).await == Some(true) {
-                out.push(rel);
-            }
-        }
-        Ok(out)
-    }
-
     /// The one divergence verdict: does the union of `versions` differ from
     /// `winner`? `None` (uncached) while any blob is missing — a partial union
     /// would be transiently lossy. Cached by version-set fingerprint.
@@ -280,18 +257,31 @@ impl Engine {
         Some(plaintexts)
     }
 
+    /// One index scan: live session count plus the still-diverged sessions
+    /// (union of all authors' lines differs from the winner; cached verdicts).
     pub async fn status_report(&self) -> Result<StatusReport> {
-        let live = self
-            .node
-            .index_records()
-            .await?
-            .into_iter()
-            .filter(|r| r.winner.is_some())
-            .count();
+        let mut sessions = 0;
+        let mut conflicts = Vec::new();
+        for rec in self.node.index_records().await? {
+            let Some(winner) = rec.winner else {
+                continue; // deleted — never resurrect from stale live entries
+            };
+            sessions += 1;
+            if rec.versions.len() <= 1 {
+                continue;
+            }
+            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            let Some(rel) = self.relative_of(&key).map(str::to_string) else {
+                continue;
+            };
+            if self.is_diverged(&key, winner, &rec.versions).await == Some(true) {
+                conflicts.push(rel);
+            }
+        }
         Ok(StatusReport {
             namespace: self.node.namespace().map(|n| n.to_string()),
-            sessions: live,
-            conflicts: self.conflict_paths().await?,
+            sessions,
+            conflicts,
         })
     }
 
