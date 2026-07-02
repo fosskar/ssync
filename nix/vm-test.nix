@@ -23,7 +23,7 @@ let
   '';
 
   node =
-    { ... }:
+    _:
     {
       environment.systemPackages = [ ssync ];
       environment.etc."ssync/config.toml".source = configToml;

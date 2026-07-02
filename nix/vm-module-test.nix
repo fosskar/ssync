@@ -3,7 +3,6 @@
 {
   pkgs,
   self,
-  system,
 }:
 pkgs.testers.runNixOSTest {
   name = "ssync-nixos-module";

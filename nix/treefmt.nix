@@ -1,4 +1,4 @@
-{ ... }:
+_:
 {
   projectRootFile = "flake.nix";
 
@@ -10,6 +10,11 @@
       # way `cargo fmt` does (otherwise they fight over import order).
       edition = "2024";
     };
+    # TOML (Cargo.toml, config examples)
+    taplo.enable = true;
+    # nix linters: dead code and anti-patterns
+    deadnix.enable = true;
+    statix.enable = true;
   };
 
   settings.global.excludes = [

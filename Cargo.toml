@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ssync",
-    "crates/ssync-core",
-    "crates/ssync-crypto",
-    "crates/ssync-net",
-    "crates/ssync-adapters",
+  "crates/ssync",
+  "crates/ssync-core",
+  "crates/ssync-crypto",
+  "crates/ssync-net",
+  "crates/ssync-adapters",
 ]
 
 [workspace.package]

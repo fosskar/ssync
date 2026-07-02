@@ -15,5 +15,5 @@
   vm-sync = import ./vm-test.nix { inherit pkgs self system; };
 
   # the NixOS module brings the daemon up as a service.
-  vm-module = import ./vm-module-test.nix { inherit pkgs self system; };
+  vm-module = import ./vm-module-test.nix { inherit pkgs self; };
 }
