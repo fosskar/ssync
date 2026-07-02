@@ -9,7 +9,9 @@ design rationale.
 Comment sparingly. Explain *why*, not *what* — never restate what the code plainly
 does. No comment should be longer than the code it describes. Prefer a good name
 over a comment. Keep doc comments to one line unless a non-obvious caveat needs
-more. Delete redundant comments when you touch a file.
+more. Delete redundant comments when you touch a file. If a diff adds more comment
+lines than code lines, cut comments until it doesn't — one compressed sentence per
+item, no multi-clause doc paragraphs, no comments narrating test steps.
 
 ## Hard rules
 
