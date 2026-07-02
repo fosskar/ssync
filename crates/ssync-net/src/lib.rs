@@ -8,11 +8,13 @@ use futures_lite::{Stream, StreamExt};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::fs::{FsStore, options::Options as FsStoreOptions};
+use iroh_blobs::store::{GcConfig, ProtectCb};
 use iroh_blobs::{BlobsProtocol, Hash};
 use iroh_docs::api::Doc;
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::engine::LiveEvent;
+use iroh_docs::engine::ProtectCallbackHandler;
 use iroh_docs::protocol::Docs;
 use iroh_docs::store::Query;
 use iroh_docs::{AuthorId, DocTicket, NamespaceId};
@@ -97,9 +99,23 @@ pub struct Node {
     _router: Router,
 }
 
+/// Default blob GC interval. Blobs referenced by any author's current index
+/// entry are protected (via iroh-docs' protect callback); superseded ciphertext
+/// is swept. Content-addressed, so nothing referenced is ever lost.
+const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl Node {
     /// No index namespace is active until one is created, opened or joined.
     pub async fn spawn(data_dir: &Path, secret_key: SecretKey) -> Result<Self> {
+        Self::spawn_with_gc(data_dir, secret_key, GC_INTERVAL).await
+    }
+
+    /// [`spawn`](Self::spawn) with a custom blob-GC interval (tests).
+    pub async fn spawn_with_gc(
+        data_dir: &Path,
+        secret_key: SecretKey,
+        gc_interval: std::time::Duration,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(data_dir)
             .await
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
@@ -110,9 +126,27 @@ impl Node {
             .await
             .context("binding iroh endpoint")?;
 
-        let blobs = FsStore::load(data_dir.join("blobs"))
+        // GC: iroh-docs feeds the protect callback every hash referenced by a
+        // current doc entry (any author, any replica); everything else sweeps.
+        let (protect_handler, protect_cb): (ProtectCallbackHandler, ProtectCb) =
+            ProtectCallbackHandler::new();
+        let blobs_dir = data_dir.join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir)
+            .await
+            .context("creating blobs dir")?;
+        let mut store_opts = FsStoreOptions::new(&blobs_dir);
+        store_opts.gc = Some(GcConfig {
+            interval: gc_interval,
+            add_protected: Some(protect_cb),
+        });
+        let blobs = FsStore::load_with_opts(blobs_dir.join("blobs.db"), store_opts)
             .await
             .context("opening blob store")?;
+
+        // Pre-GC versions of ssync tagged every published blob permanently,
+        // pinning superseded ciphertext forever. The index entries are the
+        // real references now; drop the legacy tags so old blobs can sweep.
+        blobs.tags().delete_all().await.context("clearing tags")?;
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
@@ -121,6 +155,7 @@ impl Node {
             .await
             .context("creating docs dir")?;
         let docs = Docs::persistent(docs_dir)
+            .protect_handler(protect_handler)
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())
             .await
             .context("spawning docs")?;
@@ -240,24 +275,29 @@ impl Node {
         self.doc()?.subscribe().await
     }
 
+    /// Store `data` as a blob and set it as this author's entry for `key` —
+    /// the only write path. The blob is held by a temp tag until the index
+    /// entry exists (its reference is what protects the blob from GC), so the
+    /// blob is never sweepable in between.
+    pub async fn publish(&self, key: impl Into<bytes::Bytes>, data: Vec<u8>) -> Result<Hash> {
+        let size = data.len() as u64;
+        let tag = self.blobs.blobs().add_bytes(data).temp_tag().await?;
+        let hash = tag.hash();
+        self.doc()?.set_hash(self.author, key, hash, size).await?;
+        drop(tag); // entry written; the doc reference now protects the blob
+        Ok(hash)
+    }
+
+    /// Store a blob without an index reference (tests). Unreferenced blobs are
+    /// swept by the next GC run.
     pub async fn add_blob(&self, data: Vec<u8>) -> Result<Hash> {
-        let tag = self.blobs.blobs().add_bytes(data).await?;
-        Ok(tag.hash)
+        let tag = self.blobs.blobs().add_bytes(data).temp_tag().await?;
+        Ok(tag.hash())
     }
 
     pub async fn get_blob(&self, hash: Hash) -> Result<Vec<u8>> {
         let bytes = self.blobs.blobs().get_bytes(hash).await?;
         Ok(bytes.to_vec())
-    }
-
-    pub async fn index_set(
-        &self,
-        key: impl Into<bytes::Bytes>,
-        hash: Hash,
-        size: u64,
-    ) -> Result<()> {
-        self.doc()?.set_hash(self.author, key, hash, size).await?;
-        Ok(())
     }
 
     /// Delete this node's entry for `key` (append-only tombstone that syncs).
@@ -389,9 +429,8 @@ mod tests {
         let mut node = Node::spawn(&dir, SecretKey::generate()).await.unwrap();
         node.create_namespace().await.unwrap();
 
-        let data = b"ciphertext".to_vec();
-        let hash = node.add_blob(data.clone()).await.unwrap();
-        node.index_set("pi/proj/session-1", hash, data.len() as u64)
+        let hash = node
+            .publish("pi/proj/session-1", b"ciphertext".to_vec())
             .await
             .unwrap();
 
@@ -406,6 +445,52 @@ mod tests {
 
         node.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn gc_sweeps_superseded_blob_and_keeps_live_one() {
+        let dir = tempdir("gc");
+        let mut node = Node::spawn_with_gc(&dir, SecretKey::generate(), GC_TEST_INTERVAL)
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+
+        let old = node.publish("pi/p/s", b"version-1".to_vec()).await.unwrap();
+        let new = node.publish("pi/p/s", b"version-2".to_vec()).await.unwrap();
+        assert_ne!(old, new);
+
+        // superseded blob becomes unreferenced (same author, same key) and is
+        // swept; the live winner must survive every run.
+        let mut swept = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if node.get_blob(old).await.is_err() {
+                swept = true;
+                break;
+            }
+        }
+        assert!(swept, "superseded blob was never garbage-collected");
+        assert_eq!(node.get_blob(new).await.unwrap(), b"version-2".to_vec());
+
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_never_sweeps_indexed_blob() {
+        let dir = tempdir("gc-keep");
+        let mut node = Node::spawn_with_gc(&dir, SecretKey::generate(), GC_TEST_INTERVAL)
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+
+        let hash = node.publish("pi/p/s", b"keep-me".to_vec()).await.unwrap();
+        // wait through several GC runs
+        tokio::time::sleep(GC_TEST_INTERVAL * 4).await;
+        assert_eq!(node.get_blob(hash).await.unwrap(), b"keep-me".to_vec());
+
+        node.shutdown().await.unwrap();
+    }
+
+    const GC_TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
     fn tempdir(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("ssync-net-{tag}-{}", std::process::id()));

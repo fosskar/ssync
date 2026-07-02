@@ -215,9 +215,7 @@ impl Engine {
             return Ok(ImportOutcome::Unchanged(w));
         }
         let ciphertext = self.identity.encrypt(&plaintext)?;
-        let size = ciphertext.len() as u64;
-        let hash = self.node.add_blob(ciphertext).await?;
-        self.node.index_set(key.to_string(), hash, size).await?;
+        let hash = self.node.publish(key.to_string(), ciphertext).await?;
         Ok(ImportOutcome::Published(hash))
     }
 
@@ -327,9 +325,7 @@ impl Engine {
         };
         let merged = merge_lines(&plaintexts);
         let ciphertext = self.identity.encrypt(&merged)?;
-        let size = ciphertext.len() as u64;
-        let hash = self.node.add_blob(ciphertext).await?;
-        self.node.index_set(key.to_string(), hash, size).await?;
+        self.node.publish(key.to_string(), ciphertext).await?;
         Ok(Some(rel))
     }
 

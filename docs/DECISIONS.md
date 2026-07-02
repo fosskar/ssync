@@ -229,6 +229,15 @@ over a partially-downloaded version set would transiently drop a fork's lines. A
 non-append-only adapter falls back to detect + keep-both + newest-wins (the
 `Adapter::append_only` flag gates the merge action in `reconcile`).
 
+**Blob GC:** every blob referenced by any author's *current* index entry (any
+replica) is protected — iroh-docs feeds those hashes to iroh-blobs' GC protect
+callback — and everything else is swept periodically. Only superseded content
+sweeps: an author re-publishing a key unreferences their previous ciphertext,
+and a merged fork's lines live on in the union before its entry is replaced.
+Keep-both is untouched: divergent versions are each an author's current entry.
+Without GC the store grew without bound (randomized age ciphertext defeats
+content-addressed dedup, and every appended-to session re-publishes in full).
+
 **Deletion (any participant):** the winning index entry per key is resolved *including*
 tombstones, so the newest tombstone from any author deletes the session on every peer —
 not just the author's. Resurrection is guarded by comparing the tombstone timestamp
