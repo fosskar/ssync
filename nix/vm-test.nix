@@ -22,14 +22,12 @@ let
     session_dir = "/root/sessions"
   '';
 
-  node =
-    _:
-    {
-      environment.systemPackages = [ ssync ];
-      environment.etc."ssync/config.toml".source = configToml;
-      # allow direct iroh connections over the test LAN
-      networking.firewall.enable = false;
-    };
+  node = _: {
+    environment.systemPackages = [ ssync ];
+    environment.etc."ssync/config.toml".source = configToml;
+    # allow direct iroh connections over the test LAN
+    networking.firewall.enable = false;
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "ssync-two-node-sync";
