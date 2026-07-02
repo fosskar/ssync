@@ -87,6 +87,11 @@ pub struct Engine<A: Adapter> {
     adapter: A,
     identity: AgeIdentity,
     node: Node,
+    /// Divergence verdict per key, keyed by the distinct-hash fingerprint of
+    /// its author entries. Skips re-decrypting sessions whose version set has
+    /// not changed — without it every status write decrypts every session that
+    /// still carries a stale second author entry.
+    divergence_cache: std::sync::Mutex<std::collections::HashMap<String, (String, bool)>>,
 }
 
 impl<A: Adapter> Engine<A> {
@@ -95,6 +100,7 @@ impl<A: Adapter> Engine<A> {
             adapter,
             identity,
             node,
+            divergence_cache: Default::default(),
         }
     }
 
@@ -260,6 +266,20 @@ impl<A: Adapter> Engine<A> {
             let Some(rel) = key.strip_prefix(&prefix).map(str::to_string) else {
                 continue;
             };
+            // fingerprint the version set; an unchanged set needs no re-decrypt.
+            let mut fingerprint: Vec<String> = distinct.iter().cloned().collect();
+            fingerprint.sort();
+            let fingerprint = fingerprint.join(",");
+            let cached = self
+                .divergence_cache
+                .lock()
+                .unwrap()
+                .get(&key)
+                .filter(|(fp, _)| *fp == fingerprint)
+                .map(|(_, verdict)| *verdict);
+            if cached == Some(false) {
+                continue;
+            }
             let Some(winner_pt) = self.get_plain(winner).await else {
                 continue;
             };
@@ -273,7 +293,16 @@ impl<A: Adapter> Engine<A> {
                 }
             }
             let merged = merge_lines(&plaintexts);
-            if merged != winner_pt {
+            let divergent = merged != winner_pt;
+            // only cache complete verdicts: with a blob still undownloaded the
+            // union is partial and would pin a wrong "not divergent" forever.
+            if plaintexts.len() == distinct.len() {
+                self.divergence_cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, (fingerprint, divergent));
+            }
+            if divergent {
                 out.push((rel, merged));
             }
         }
