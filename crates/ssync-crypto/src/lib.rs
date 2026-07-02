@@ -4,7 +4,7 @@
 //! disabled, in [`rust_age`] (feature `rust-age`) for when it gains ML-KEM.
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -122,20 +122,41 @@ fn run(cmd: &mut Command, input: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// `0600` temp file holding a secret key, removed on drop (age wants `-i FILE`).
+/// Lives in `$XDG_RUNTIME_DIR` when available (tmpfs, user-private `0700`) so
+/// the key never touches persistent storage; created with `create_new` +
+/// `mode(0o600)` atomically, so there is no permission window and a
+/// pre-existing path (symlink planted by another user) is never followed.
 struct SecretFile {
     path: PathBuf,
 }
 
 impl SecretFile {
     fn new(contents: &str) -> Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("ssync-age-{}-{}", std::process::id(), nonce()));
-        let mut f =
-            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(contents.as_bytes())?;
-        f.write_all(b"\n")?;
-        Ok(Self { path })
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let mut last_err = None;
+        for _ in 0..16 {
+            let path = dir.join(format!("ssync-age-{}-{}", std::process::id(), nonce()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(contents.as_bytes())?;
+                    f.write_all(b"\n")?;
+                    return Ok(Self { path });
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(
+            anyhow::Error::new(last_err.expect("attempted at least once"))
+                .context(format!("creating secret file in {}", dir.display())),
+        )
     }
 }
 
