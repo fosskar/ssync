@@ -547,8 +547,25 @@ impl Engine {
                 .with_context(|| format!("watching {}", adapter.session_root().display()))?;
         }
 
+        // Drain doc events on a dedicated task, immediately and unconditionally:
+        // iroh-docs awaits subscriber sends on bounded channels inside its
+        // actor, so an unread subscription wedges the whole store once enough
+        // events queue up (a large initial import is enough). Only a relevance
+        // signal crosses to the select loop, over an unbounded channel.
         let events = self.node.subscribe().await?;
-        let mut events = std::pin::pin!(events);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut events = std::pin::pin!(events);
+            while let Some(ev) = events.next().await {
+                if matches!(
+                    ev,
+                    Ok(LiveEvent::InsertRemote { .. }) | Ok(LiveEvent::ContentReady { .. })
+                ) && etx.send(()).is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut events_ended = false;
 
         // initial reconcile
@@ -577,13 +594,9 @@ impl Engine {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                 }
-                ev = events.next(), if !events_ended => {
+                ev = erx.recv(), if !events_ended => {
                     match ev {
-                        Some(Ok(LiveEvent::InsertRemote { .. }))
-                        | Some(Ok(LiveEvent::ContentReady { .. })) => {
-                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
-                        }
-                        Some(_) => {}
+                        Some(()) => deadline = Some(tokio::time::Instant::now() + DEBOUNCE),
                         // ended stream: disarm this select arm, or it is ready
                         // (None) on every loop iteration and spins the CPU at
                         // 100%; the rescan interval still drives ticks.
