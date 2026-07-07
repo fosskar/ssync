@@ -41,6 +41,9 @@
 
       formatter = forEachSystem (system: treefmtEval.${system}.config.build.wrapper);
 
+      # nixbot scheduled effects (flake input updates via nixfiles' updater)
+      effects = import ./nix/effects.nix { pkgs = pkgsForEach.x86_64-linux; };
+
       checks = forEachSystem (
         system:
         import ./nix/checks.nix {
