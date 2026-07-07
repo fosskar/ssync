@@ -70,8 +70,20 @@ Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on eac
       `ssync peer add/list/remove` over a config `peers` list. Pick one and align
       docs.
 - [ ] **Surface config knobs** that are currently hardcoded: `discovery`
-      (default vs lan-only), `relay` override, `[conflict] strategy`. Today it is
-      n0 defaults + newest-wins only.
+      (default vs lan-only), `relay` override, `[conflict] strategy`, and the
+      peer re-sync interval (60s). Today it is n0 defaults + newest-wins only.
+
+## Upstream
+
+- [ ] **Drop the explicit `fetch_blob` workaround** once iroh-docs retries missed
+      content downloads itself (open upstream PR: n0-computer/iroh-docs#88). The
+      engine's on-write peer fetch stays correct either way, but becomes dead weight.
+- [ ] **Report the subscriber-channel deadlock upstream.** iroh-docs awaits
+      subscriber sends on bounded channels inside its actor; a subscriber that
+      stops reading while awaiting a docs RPC wedges the whole store (repro:
+      ssync's `event_flood` test before the drain-task fix). Related closed
+      issue: n0-computer/iroh-docs#81 (removed `blocking_send` but kept the
+      awaited bounded send).
 
 ## Discovery
 
