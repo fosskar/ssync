@@ -476,3 +476,50 @@ async fn pi_and_omp_sessions_sync_side_by_side() {
     }
     assert!(ok, "pi+omp sessions did not both sync to node B");
 }
+
+#[tokio::test]
+async fn missed_content_download_is_fetched_on_write() {
+    let base = scratch("fetch");
+    let ns_secret = ssync_net::generate_key_bytes();
+    let age = AgeIdentity::generate().unwrap().to_secret_string();
+
+    let root_a = base.join("a/sessions");
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019efeeed0001eee71acbe20fetch0001.jsonl";
+    let src = root_a.join(rel);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents = b"content the live engine failed to download\n";
+    std::fs::write(&src, contents).unwrap();
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_a.open_shared_namespace(ns_secret).await.unwrap();
+    node_b.open_shared_namespace(ns_secret).await.unwrap();
+    // B syncs index entries but never auto-downloads content — the prod
+    // failure mode (a missed live download is never retried by iroh-docs).
+    node_b.disable_auto_download().await.unwrap();
+    let addr_a = node_a.endpoint_addr();
+    let addr_b = node_b.endpoint_addr();
+    node_a.sync_with(vec![addr_b]).await.unwrap();
+    node_b.sync_with(vec![addr_a]).await.unwrap();
+
+    let mut engine_a = pi_engine(&root_a, &age, node_a);
+    engine_a.tick_once().await;
+    let mut engine_b = pi_engine(&root_b, &age, node_b);
+
+    // the file can only materialize via the explicit peer fetch
+    let dest = root_b.join(rel);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if let Ok(got) = std::fs::read(&dest)
+            && got == contents
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "missed content was never fetched from the peer");
+}

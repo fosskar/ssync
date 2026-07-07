@@ -469,9 +469,24 @@ impl Engine {
                 let Some(dest) = self.dest_of(key) else {
                     return false;
                 };
-                // content may not have downloaded yet; skip, a later tick retries.
-                let Ok(ciphertext) = self.node.get_blob(*hash).await else {
-                    return false;
+                // the live engine can miss a content download and never retries
+                // (iroh-docs#88): fetch from peers explicitly, bounded; else a
+                // later tick retries.
+                let ciphertext = match self.node.get_blob(*hash).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        let fetch = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            self.node.fetch_blob(*hash),
+                        );
+                        if !matches!(fetch.await, Ok(Ok(()))) {
+                            return false;
+                        }
+                        let Ok(c) = self.node.get_blob(*hash).await else {
+                            return false;
+                        };
+                        c
+                    }
                 };
                 let plaintext = match self.identity.decrypt(&ciphertext) {
                     Ok(p) => p,

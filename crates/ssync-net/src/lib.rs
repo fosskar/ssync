@@ -8,6 +8,7 @@ use futures_lite::{Stream, StreamExt};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh_blobs::api::downloader::Shuffled;
 use iroh_blobs::store::fs::{FsStore, options::Options as FsStoreOptions};
 use iroh_blobs::store::{GcConfig, ProtectCb};
 use iroh_blobs::{BlobsProtocol, Hash};
@@ -16,7 +17,7 @@ use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::engine::LiveEvent;
 use iroh_docs::engine::ProtectCallbackHandler;
 use iroh_docs::protocol::Docs;
-use iroh_docs::store::Query;
+use iroh_docs::store::{DownloadPolicy, Query};
 use iroh_docs::{AuthorId, DocTicket, NamespaceId};
 use iroh_docs::{Capability, NamespaceSecret};
 use iroh_gossip::net::Gossip;
@@ -96,6 +97,7 @@ pub struct Node {
     docs: Docs,
     author: AuthorId,
     doc: Option<Doc>,
+    peers: Vec<EndpointId>,
     _router: Router,
 }
 
@@ -178,6 +180,7 @@ impl Node {
             docs,
             author,
             doc: None,
+            peers: Vec::new(),
             _router: router,
         })
     }
@@ -241,9 +244,11 @@ impl Node {
         self.endpoint.addr()
     }
 
-    /// Start syncing the active namespace with the given peer addresses.
-    pub async fn sync_with(&self, addrs: Vec<EndpointAddr>) -> Result<()> {
+    /// Start syncing the active namespace with the given peer addresses; the
+    /// peers are remembered as content providers for [`fetch_blob`](Self::fetch_blob).
+    pub async fn sync_with(&mut self, addrs: Vec<EndpointAddr>) -> Result<()> {
         if !addrs.is_empty() {
+            self.peers.extend(addrs.iter().map(|a| a.id));
             self.doc()?.start_sync(addrs).await?;
         }
         Ok(())
@@ -251,16 +256,37 @@ impl Node {
 
     /// Start syncing with the given peer node-ids. Addresses are resolved via
     /// iroh discovery, so only the node-ids are needed.
-    pub async fn sync_with_peers(&self, node_ids: &[String]) -> Result<()> {
+    pub async fn sync_with_peers(&mut self, node_ids: &[String]) -> Result<()> {
         self.sync_with(parse_peer_addrs(node_ids)).await
     }
 
     /// Import `ticket`'s namespace, start syncing, make it active.
     pub async fn join(&mut self, ticket: DocTicket) -> Result<NamespaceId> {
+        self.peers.extend(ticket.nodes.iter().map(|a| a.id));
         let (doc, _events) = self.docs.api().import_and_subscribe(ticket).await?;
         let id = doc.id();
         self.doc = Some(doc);
         Ok(id)
+    }
+
+    /// Download a blob from the known peers. The docs live engine can miss a
+    /// content download and never retries; reconcile calls this on demand.
+    pub async fn fetch_blob(&self, hash: Hash) -> Result<()> {
+        anyhow::ensure!(!self.peers.is_empty(), "no peers to fetch {hash} from");
+        self.blobs
+            .downloader(&self.endpoint)
+            .download(hash, Shuffled::new(self.peers.clone()))
+            .await?;
+        Ok(())
+    }
+
+    /// Sync index entries without auto-downloading content (tests: models a
+    /// missed live content download).
+    pub async fn disable_auto_download(&self) -> Result<()> {
+        self.doc()?
+            .set_download_policy(DownloadPolicy::NothingExcept(vec![]))
+            .await?;
+        Ok(())
     }
 
     /// Write-capable ticket to the active namespace, with direct addresses.
