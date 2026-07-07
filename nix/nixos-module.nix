@@ -70,9 +70,13 @@ in
           agent = "pi";
           sessionDir = "${config.users.users.${cfg.user}.home}/.pi/agent/sessions";
         }
+        {
+          agent = "omp";
+          sessionDir = "${config.users.users.${cfg.user}.home}/.omp/agent/sessions";
+        }
       ];
-      defaultText = lib.literalExpression ''[ { agent = "pi"; sessionDir = "''${user home}/.pi/agent/sessions"; } ]'';
-      description = "Agents to sync side by side; add an entry per agent (e.g. omp at ~/.omp/agent/sessions).";
+      defaultText = lib.literalExpression "pi and omp at the user's home";
+      description = "Agents to sync side by side; the default covers every supported agent.";
     };
 
     ageIdentityFile = lib.mkOption {

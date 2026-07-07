@@ -32,26 +32,6 @@
             type = lib.types.str;
             description = "User to run the daemon as; must own the agents' session dirs.";
           };
-          agents = lib.mkOption {
-            type = lib.types.nullOr (
-              lib.types.listOf (
-                lib.types.submodule {
-                  options = {
-                    agent = lib.mkOption {
-                      type = lib.types.str;
-                      description = "Agent name (pi or omp).";
-                    };
-                    sessionDir = lib.mkOption {
-                      type = lib.types.str;
-                      description = "The agent's session directory to watch (absolute path).";
-                    };
-                  };
-                }
-              )
-            );
-            default = null;
-            description = "Agents to sync; null uses the NixOS module default (pi at the user's home).";
-          };
         };
       };
 
@@ -143,9 +123,6 @@
                   }
                 )
               ) otherPeers;
-            }
-            // lib.optionalAttrs (settings.agents != null) {
-              inherit (settings) agents;
             };
           };
       };
