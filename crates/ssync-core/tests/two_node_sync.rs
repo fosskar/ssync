@@ -523,3 +523,54 @@ async fn missed_content_download_is_fetched_on_write() {
     }
     assert!(ok, "missed content was never fetched from the peer");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_recovers_when_peer_comes_up_late() {
+    let base = scratch("resync");
+    let ns_secret = ssync_net::generate_key_bytes();
+    let age = AgeIdentity::generate().unwrap().to_secret_string();
+
+    let root_a = base.join("a/sessions");
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019eresync001eee71acbe20resync001.jsonl";
+    let src = root_a.join(rel);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents = b"written while the peer was unavailable\n";
+    std::fs::write(&src, contents).unwrap();
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_a.open_shared_namespace(ns_secret).await.unwrap();
+    let addr_b = node_b.endpoint_addr();
+    // B's namespace is not open yet: A's startup sync goes nowhere, like
+    // dialing a peer that is down. B never learns about A on its own.
+    node_a.sync_with(vec![addr_b]).await.unwrap();
+
+    let mut engine_a = pi_engine(&root_a, &age, node_a);
+    engine_a.set_resync_interval(Duration::from_secs(2));
+    let sa = base.join("a/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // B comes up late, like a restarted peer: it opens the namespace and
+    // starts syncing, but its own dial goes nowhere (bogus peer id — in prod
+    // the dial-back can be lost the same way). Only A's periodic re-sync can
+    // establish the link.
+    node_b.open_shared_namespace(ns_secret).await.unwrap();
+    let bogus = ssync_net::iroh::SecretKey::generate().public();
+    node_b
+        .sync_with(vec![ssync_net::iroh::EndpointAddr::from(bogus)])
+        .await
+        .unwrap();
+    let mut engine_b = pi_engine(&root_b, &age, node_b);
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_b.run(&sb).await });
+
+    let dest = root_b.join(rel);
+    let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;
+    assert!(
+        ok,
+        "session never reached the late peer (no periodic re-sync)"
+    );
+}

@@ -254,6 +254,21 @@ impl Node {
         Ok(())
     }
 
+    /// Re-initiate sync with the known peers. Live links can die silently
+    /// when a peer restarts (one-way sync until reconnect); the daemon calls
+    /// this periodically. iroh-docs dedupes already-running syncs.
+    pub async fn resync(&self) -> Result<()> {
+        if self.peers.is_empty() {
+            return Ok(());
+        }
+        let addrs = self
+            .peers
+            .iter()
+            .map(|id| EndpointAddr::from(*id))
+            .collect();
+        self.doc()?.start_sync(addrs).await
+    }
+
     /// Start syncing with the given peer node-ids. Addresses are resolved via
     /// iroh discovery, so only the node-ids are needed.
     pub async fn sync_with_peers(&mut self, node_ids: &[String]) -> Result<()> {

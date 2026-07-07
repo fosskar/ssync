@@ -154,6 +154,8 @@ pub struct Engine {
     /// not changed — without it every status write decrypts every session that
     /// still carries a stale second author entry.
     divergence_cache: std::sync::Mutex<std::collections::HashMap<String, (String, bool)>>,
+    /// How often the daemon re-initiates sync with the known peers.
+    resync_interval: std::time::Duration,
 }
 
 impl Engine {
@@ -174,6 +176,7 @@ impl Engine {
             state_path: None,
             merged_logged: Default::default(),
             divergence_cache: Default::default(),
+            resync_interval: std::time::Duration::from_secs(60),
         }
     }
 
@@ -185,6 +188,11 @@ impl Engine {
     pub fn persist_state(&mut self, path: &Path) {
         self.state = SyncState::load(path);
         self.state_path = Some(path.to_path_buf());
+    }
+
+    /// Override the peer re-sync cadence (tests).
+    pub fn set_resync_interval(&mut self, interval: std::time::Duration) {
+        self.resync_interval = interval;
     }
 
     /// Shut down the underlying node (flushes the blob store).
@@ -588,6 +596,10 @@ impl Engine {
 
         let mut rescan = tokio::time::interval(Duration::from_secs(15));
         rescan.tick().await;
+        // Live links can die silently when a peer restarts (one-way sync until
+        // reconnect); re-initiating sync is a cheap no-op when already in sync.
+        let mut resync = tokio::time::interval(self.resync_interval);
+        resync.tick().await;
 
         // Debounce: pi appends to the live file, emitting many events per write.
         const DEBOUNCE: Duration = Duration::from_millis(400);
@@ -624,6 +636,11 @@ impl Engine {
                 }
                 _ = rescan.tick() => {
                     self.step(status_path).await;
+                }
+                _ = resync.tick() => {
+                    if let Err(e) = self.node.resync().await {
+                        eprintln!("ssync: resync: {e:#}");
+                    }
                 }
             }
         }
