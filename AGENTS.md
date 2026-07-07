@@ -45,7 +45,7 @@ item, no multi-clause doc paragraphs, no comments narrating test steps.
 
 ## VCS
 
-- Colocated jj + git repo; **use jj**. Remote `origin` = `ssh://git@codeberg.org/fosskar/ssync.git`.
+- Colocated jj + git repo; **use jj**. Remote `origin` = `ssh://git@github.com/fosskar/ssync.git`.
 - **Do not commit or push unless the user explicitly says so.** Stage work in the working
   copy and wait for the go-ahead.
 - Commit messages: linux-kernel style, no trailers, repo terminology.

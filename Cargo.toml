@@ -12,7 +12,7 @@ members = [
 version = "0.2.1"
 edition = "2024"
 license = "MIT"
-repository = "https://codeberg.org/fosskar/ssync"
+repository = "https://github.com/fosskar/ssync"
 
 [workspace.dependencies]
 anyhow = "1"

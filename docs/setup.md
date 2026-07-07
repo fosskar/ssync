@@ -17,7 +17,7 @@ leaderless: every machine runs the same daemon as an equal peer.
 ### Plain binary (Nix)
 
 ```bash
-nix build git+https://codeberg.org/fosskar/ssync
+nix build github:fosskar/ssync
 ./result/bin/ssync --help
 ```
 

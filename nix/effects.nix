@@ -36,7 +36,7 @@ _args: {
           git config --global safe.directory '*'
 
           git clone --depth 1 --progress \
-            "https://oauth2:$token@codeberg.org/fosskar/ssync.git" repo
+            "https://oauth2:$token@github.com/fosskar/ssync.git" repo
           cd repo
 
           nix run "git+https://codeberg.org/fosskar/nixfiles?shallow=1#updater-flake-inputs"
