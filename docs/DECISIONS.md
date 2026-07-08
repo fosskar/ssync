@@ -194,11 +194,16 @@ used: age offers no such mode, and it would discard the classical fallback. Beca
 `age` crate is X25519-only, `ssync-crypto` shells out to the `age` CLI to get native hybrid;
 the in-process crate backend is kept disabled (feature `rust-age`) for when it gains ML-KEM.
 
-**Key management:** One **shared age identity distributed across the user's machines**
-(each machine holds the same age private key, distributed once via the user's existing
-secret-management, e.g. sops-nix). This is the simplest correct choice: every machine can
-decrypt what any other machine encrypted. (Per-machine keypairs with multi-recipient
-encryption are a possible future refinement, not v1.)
+**Key management:** **Per-machine age keypairs with multi-recipient encryption.** Each
+machine holds its own private key and encrypts to every peer's recipient (its own is
+always included), configured via the `recipients` list; the clan service generates and
+distributes recipients automatically. This enables per-device revocation: remove a
+machine's recipient and regenerate, and the remaining daemons re-publish every locally
+materialized session under the new recipient set on their next import pass (decrypt of
+the old winner fails, so the plaintext dedup misses and re-encrypts). Revocation is
+forward-only — blobs already fetched by a revoked machine stay readable to it.
+The original v1 mode — one **shared age identity** on every machine (`recipients = []`) —
+remains supported and is still the simplest choice for low-threat setups.
 
 ---
 

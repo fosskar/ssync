@@ -19,7 +19,7 @@ What ssync protects, what it exposes, and the assumptions it makes.
   relay cannot read your data.
 - **To a holder of a pairing ticket:** write access to the synced *index*
   (see `pairing.md`). It does **not** grant the ability to decrypt sessions; that
-  needs the shared age identity, distributed separately.
+  needs an age identity in the recipient set, provisioned separately.
 - **Index metadata:** the index maps `{agent}/{relative_path}` to a blob hash.
   The relative path (which encodes the project's absolute directory and the
   session id) is visible to anyone in your namespace — i.e. your own machines.
@@ -27,21 +27,25 @@ What ssync protects, what it exposes, and the assumptions it makes.
 ## Trust assumptions
 
 - **Your machines are trusted.** ssync is designed for one user's own set of
-  machines. Every machine in a namespace holds the shared age key and can decrypt
-  every synced session. There is no per-device revocation in v1 (per-machine
-  keypairs with multi-recipient encryption is a deferred refinement — see
-  `../TODO.md`).
-- **The shared age key is the crown jewel.** Anyone with it can decrypt all synced
-  sessions. Provision it over a trusted channel, store it `0600` (the daemon
-  refuses to run on a group/world-readable key), and manage it with your existing
-  secret tooling (e.g. sops-nix).
+  machines. Every machine in the recipient set can decrypt every synced session —
+  multi-recipient encryption is about *revocation*, not compartmentalization.
+  With per-machine keypairs (the recommended mode), removing a machine's
+  recipient and regenerating makes the remaining daemons re-publish everything
+  under the new recipient set; the removed machine cannot read anything published
+  after that. Revocation is forward-only: blobs it already fetched stay readable.
+- **Age keys are the crown jewels.** Any key in the recipient set decrypts all
+  synced sessions. Store keys `0600` (the daemon refuses to run on a
+  group/world-readable key). In shared mode, provision the one key over a
+  trusted channel and manage it with your existing secret tooling (e.g.
+  sops-nix); in per-machine mode keys never leave their machine.
 - **Pairing tickets are secrets.** A ticket grants write access to your index.
   Share it only with your own machines over a channel you trust.
 
 ## Non-goals
 
-- ssync does not defend against a compromised machine that already holds the age
-  key — such a machine can read everything by design.
+- ssync does not defend against a compromised machine whose key is still in the
+  recipient set — such a machine can read everything by design (revoke it, then
+  the damage stops at what it already saw).
 - ssync does not hide the *existence* or *size* of sessions from peers in your
   namespace, nor the relative paths. It hides their contents.
 

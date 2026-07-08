@@ -39,12 +39,14 @@ hole-punching.
 
 ## Quick start
 
-ssync needs one **shared age key** on all your machines, and each synced project
-must live at the **same absolute path** everywhere (see `docs/identity.md`).
+ssync encrypts with age keys: either one **shared key** on all your machines, or a
+**key per machine** with each peer's recipient listed in `recipients` (enables
+per-device revocation). Each synced project must live at the **same absolute path**
+everywhere (see `docs/identity.md`).
 
 **With [clan](https://clan.lol):** just list the peer machines — the clan service generates
-and distributes the shared age key, a shared namespace secret and each machine's node-id, so
-peers auto-connect with no `ticket`/`join`. See `docs/setup.md`.
+a per-machine age key (peers encrypt to each other's recipients), a shared namespace secret
+and each machine's node-id, so peers auto-connect with no `ticket`/`join`. See `docs/setup.md`.
 
 **Standalone** (plain binary / NixOS / home-manager), pair once with a ticket:
 
@@ -54,7 +56,7 @@ ssync init          # writes config.toml, generates the age key
 ssync daemon        # creates a namespace and starts syncing
 ssync ticket        # prints this machine's pairing ticket
 
-# second machine (after copying the same age key over)
+# second machine (same age key copied over, or its recipient added to `recipients`)
 ssync init
 ssync join '<ticket-from-first-machine>'
 ssync daemon        # joins the namespace and syncs
