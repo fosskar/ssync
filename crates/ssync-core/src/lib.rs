@@ -44,6 +44,10 @@ pub struct Config {
     /// Peer node-ids to sync with (clan fills this from the other machines).
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Peer machines' age recipients (multi-recipient encryption; own recipient
+    /// is always included). Empty = shared-identity mode.
+    #[serde(default)]
+    pub recipients: Vec<String>,
 }
 
 impl Config {
@@ -86,6 +90,7 @@ impl Config {
             namespace_secret_path: None,
             node_key_path: None,
             peers: Vec::new(),
+            recipients: Vec::new(),
         })
     }
 
@@ -822,6 +827,33 @@ mod tests {
             cfg.namespace_secret_path.as_deref(),
             Some(Path::new("/run/secrets/ns"))
         );
+    }
+
+    #[test]
+    fn config_parses_recipients_and_defaults_empty() {
+        let toml_str = r#"
+            age_identity_path = "/a"
+            data_dir = "/d"
+            recipients = ["age1pq1peerb", "age1pq1peerc"]
+
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        assert_eq!(cfg.recipients, ["age1pq1peerb", "age1pq1peerc"]);
+        let without = Config::parse(
+            r#"
+            age_identity_path = "/a"
+            data_dir = "/d"
+
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#,
+        )
+        .unwrap();
+        assert!(without.recipients.is_empty());
     }
 
     #[test]

@@ -88,6 +88,72 @@ async fn session_created_on_a_appears_on_b() {
 }
 
 #[tokio::test]
+async fn per_machine_identities_sync_both_directions() {
+    let base = scratch("permachine");
+    let id_a = AgeIdentity::generate().unwrap();
+    let id_b = AgeIdentity::generate().unwrap();
+
+    // --- node A: own key, B listed as recipient, has a session ---
+    let root_a = base.join("a/sessions");
+    let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
+    let src = root_a.join(rel_a);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents_a = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from A\"}\n";
+    std::fs::write(&src, contents_a).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut ident_a = AgeIdentity::from_secret_string(&id_a.to_secret_string()).unwrap();
+    ident_a.add_recipients([id_b.recipient_string()]);
+    let mut engine_a = Engine::new(PiAdapter::new("pi", &root_a), ident_a, node_a);
+    engine_a.tick_once().await;
+
+    // --- node B: own key, A listed as recipient ---
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket).await.unwrap();
+    let mut ident_b = AgeIdentity::from_secret_string(&id_b.to_secret_string()).unwrap();
+    ident_b.add_recipients([id_a.recipient_string()]);
+    let mut engine_b = Engine::new(PiAdapter::new("pi", &root_b), ident_b, node_b);
+
+    // A → B: B decrypts A's blob with its own key.
+    let dest_a = root_b.join(rel_a);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if let Ok(got) = std::fs::read(&dest_a)
+            && got == contents_a
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "A's session did not reach B under per-machine keys");
+
+    // B → A: symmetric direction.
+    let rel_b = "--home-simon-Projects-demo--/2026-05-23T07-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4c.jsonl";
+    let contents_b = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from B\"}\n";
+    std::fs::write(root_b.join(rel_b), contents_b).unwrap();
+    let dest_b = root_a.join(rel_b);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        engine_a.tick_once().await;
+        if let Ok(got) = std::fs::read(&dest_b)
+            && got == contents_b
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "B's session did not reach A under per-machine keys");
+}
+
+#[tokio::test]
 async fn live_write_propagates_without_restart() {
     let base = scratch("live");
     let secret = AgeIdentity::generate().unwrap().to_secret_string();
