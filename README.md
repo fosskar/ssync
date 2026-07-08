@@ -68,7 +68,15 @@ Full instructions: `docs/setup.md`. Pairing details: `docs/pairing.md`.
 ```bash
 ssync status        # namespace, session count, conflicts
 ssync conflicts     # sessions that diverged across machines
+ssync cleanup --keep 3m           # list sessions older than 3 months (dry run)
+ssync cleanup --keep 3m --apply   # delete them; propagates to all peers
 ```
+
+`cleanup` selects by session *creation* time (from the filename; mtime is
+meaningless — the engine rewrites files on sync), optionally per agent
+(`--agent pi`), by date (`--before 2026-06-08`), or sessions never given a
+title (`--unnamed`). It refuses to delete an agent's last session, since that
+deletion would not propagate (the empty-dir safety guard).
 
 ## Security
 
