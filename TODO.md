@@ -32,8 +32,9 @@ Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on eac
 
 ## Security
 
-- [ ] **Per-machine age keypairs** with multi-recipient encryption (replaces shared
-      identity), enabling per-device revocation. (DECISIONS §7)
+- [x] **Per-machine age keypairs** with multi-recipient encryption (replaces shared
+      identity as the recommended mode; shared identity still supported via
+      `recipients = []`), enabling per-device revocation. (DECISIONS §7)
 - [x] **Post-quantum hybrid encryption** by default (ML-KEM-768 + X25519 via
       `age-keygen -pq`). Done by shelling out to the `age` CLI.
 - [ ] Switch `ssync-crypto` back to the **in-process Rust `age` crate** (drop the

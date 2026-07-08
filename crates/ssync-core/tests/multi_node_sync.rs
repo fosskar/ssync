@@ -1,9 +1,10 @@
-//! M2 gate: a session created on node A appears, decrypted and byte-identical, in
-//! node B's session directory after B joins A's index namespace — no manual copy.
+//! M2 gate: a session created on one node appears, decrypted and byte-identical,
+//! in the other nodes' session directories after they join the index namespace —
+//! no manual copy.
 //!
-//! Two in-process iroh nodes, one shared age identity (as on a single user's own
-//! machines). All mutation goes through `tick_once`/`run` — the production path.
-//! Uses poll loops because sync is asynchronous over the network.
+//! Two (or three, for the multi-recipient mesh) in-process iroh nodes, shared or
+//! per-machine age identities. All mutation goes through `tick_once`/`run` — the
+//! production path. Uses poll loops because sync is asynchronous over the network.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -85,6 +86,146 @@ async fn session_created_on_a_appears_on_b() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(ok, "session did not sync to node B within timeout");
+}
+
+#[tokio::test]
+async fn per_machine_identities_sync_both_directions() {
+    let base = scratch("permachine");
+    let id_a = AgeIdentity::generate().unwrap();
+    let id_b = AgeIdentity::generate().unwrap();
+
+    // --- node A: own key, B listed as recipient, has a session ---
+    let root_a = base.join("a/sessions");
+    let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
+    let src = root_a.join(rel_a);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents_a = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from A\"}\n";
+    std::fs::write(&src, contents_a).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut ident_a = AgeIdentity::from_secret_string(&id_a.to_secret_string()).unwrap();
+    ident_a.add_recipients([id_b.recipient_string()]);
+    let mut engine_a = Engine::new(PiAdapter::new("pi", &root_a), ident_a, node_a);
+    engine_a.tick_once().await;
+
+    // --- node B: own key, A listed as recipient ---
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket).await.unwrap();
+    let mut ident_b = AgeIdentity::from_secret_string(&id_b.to_secret_string()).unwrap();
+    ident_b.add_recipients([id_a.recipient_string()]);
+    let mut engine_b = Engine::new(PiAdapter::new("pi", &root_b), ident_b, node_b);
+
+    // A → B: B decrypts A's blob with its own key.
+    let dest_a = root_b.join(rel_a);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if let Ok(got) = std::fs::read(&dest_a)
+            && got == contents_a
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "A's session did not reach B under per-machine keys");
+
+    // B → A: symmetric direction.
+    let rel_b = "--home-simon-Projects-demo--/2026-05-23T07-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4c.jsonl";
+    let contents_b = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from B\"}\n";
+    std::fs::write(root_b.join(rel_b), contents_b).unwrap();
+    let dest_b = root_a.join(rel_b);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        engine_a.tick_once().await;
+        if let Ok(got) = std::fs::read(&dest_b)
+            && got == contents_b
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "B's session did not reach A under per-machine keys");
+}
+
+#[tokio::test]
+async fn per_machine_identities_reach_a_third_machine() {
+    // recipients are not pairwise: a blob authored on A may reach C via B, so
+    // every machine must encrypt to *all* peers. three nodes, full recipient
+    // mesh, one shared namespace — a session from A must land on B and C, and
+    // one from C must land on A and B.
+    let base = scratch("threenode");
+    let ids: Vec<AgeIdentity> = (0..3).map(|_| AgeIdentity::generate().unwrap()).collect();
+    let recipients: Vec<String> = ids.iter().map(|i| i.recipient_string()).collect();
+    let ident = |n: usize| {
+        let mut id = AgeIdentity::from_secret_string(&ids[n].to_secret_string()).unwrap();
+        id.add_recipients(recipients.clone());
+        id
+    };
+
+    let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4d.jsonl";
+    let contents_a = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from A\"}\n";
+    let root_a = base.join("a/sessions");
+    let src = root_a.join(rel_a);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, contents_a).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket_b = node_a.share().await.unwrap();
+    let ticket_c = node_a.share().await.unwrap();
+    let mut engine_a = Engine::new(PiAdapter::new("pi", &root_a), ident(0), node_a);
+    engine_a.tick_once().await;
+
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket_b).await.unwrap();
+    let mut engine_b = Engine::new(PiAdapter::new("pi", &root_b), ident(1), node_b);
+
+    let root_c = base.join("c/sessions");
+    std::fs::create_dir_all(&root_c).unwrap();
+    let mut node_c = spawn_node(&base.join("c/data")).await;
+    node_c.join(ticket_c).await.unwrap();
+    let mut engine_c = Engine::new(PiAdapter::new("pi", &root_c), ident(2), node_c);
+
+    // A → B and A → C: both peers decrypt A's blob with their own keys.
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        engine_c.tick_once().await;
+        let on = |root: &Path| std::fs::read(root.join(rel_a)).is_ok_and(|got| got == contents_a);
+        if on(&root_b) && on(&root_c) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "A's session did not reach both B and C");
+
+    // C → A and C → B: the reverse direction from a joined (non-author) node.
+    let rel_c = "--home-simon-Projects-demo--/2026-05-23T07-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4e.jsonl";
+    let contents_c = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from C\"}\n";
+    std::fs::write(root_c.join(rel_c), contents_c).unwrap();
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        engine_b.tick_once().await;
+        engine_c.tick_once().await;
+        let on = |root: &Path| std::fs::read(root.join(rel_c)).is_ok_and(|got| got == contents_c);
+        if on(&root_a) && on(&root_b) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "C's session did not reach both A and B");
 }
 
 #[tokio::test]

@@ -94,7 +94,8 @@ fn cmd_init(config_path: &Path) -> Result<()> {
             config.age_identity_path.display()
         );
         println!("age recipient: {}", id.recipient_string());
-        println!("copy this age key to your other machines (same key everywhere).");
+        println!("either copy this age key to your other machines (same key everywhere),");
+        println!("or keep one key per machine and list the peers' recipients in `recipients`.");
     }
     Ok(())
 }
@@ -109,18 +110,28 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         std::fs::create_dir_all(&a.session_dir)?;
     }
 
-    // Auto-generate the age identity on first run. It is shared across machines,
-    // so a second standalone machine must be given this same key (clan.vars does
-    // this automatically; standalone: copy it or pair once it can be transferred).
+    // Auto-generate the age identity on first run. In per-machine mode
+    // (config lists the other machines' `recipients`) each machine keeps its
+    // own key; otherwise the key is shared and a second standalone machine
+    // must be given this same key (clan.vars handles either mode).
     if !config.age_identity_path.exists() {
         let id = AgeIdentity::generate()?;
         write_secret(&config.age_identity_path, &id.to_secret_string())?;
-        eprintln!(
-            "ssync: generated age identity {}; other machines must use this same key",
-            config.age_identity_path.display()
-        );
+        if config.recipients.is_empty() {
+            eprintln!(
+                "ssync: generated age identity {}; other machines must use this same key",
+                config.age_identity_path.display()
+            );
+        } else {
+            eprintln!(
+                "ssync: generated age identity {}; add recipient {} to the peers' config",
+                config.age_identity_path.display(),
+                id.recipient_string()
+            );
+        }
     }
-    let identity = load_identity(&config.age_identity_path)?;
+    let mut identity = load_identity(&config.age_identity_path)?;
+    identity.add_recipients(config.recipients.iter().cloned());
 
     let node_key_path = config
         .node_key_path

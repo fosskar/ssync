@@ -30,8 +30,8 @@ This file-based flow avoids two processes opening the single-writer store at onc
   only with your own machines, over a channel you trust.
 - Session **contents** are age-encrypted before they ever leave a machine, so a
   peer (or any relay) only sees ciphertext. Holding a ticket does not grant the
-  ability to decrypt sessions — that requires the shared age identity, which is
-  distributed separately (see `setup.md`).
+  ability to decrypt sessions — that requires an age identity in the recipient
+  set, provisioned separately (see `setup.md`).
 - iroh's transport is end-to-end encrypted independently of age; age is at-rest
   and defense-in-depth on top.
 

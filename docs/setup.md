@@ -1,6 +1,6 @@
 # Setup
 
-How to install ssync, generate the shared key, and pair two machines. ssync is
+How to install ssync, set up keys, and pair two machines. ssync is
 leaderless: every machine runs the same daemon as an equal peer.
 
 ## Prerequisites
@@ -9,8 +9,12 @@ leaderless: every machine runs the same daemon as an equal peer.
   keys sessions on the absolute working directory, so `~/projects/foo` on one
   machine and `~/code/foo` on another are, to pi, different sessions. See
   `identity.md`.
-- One **shared age identity**, distributed to every machine (same private key
-  everywhere). Provision it out of band (e.g. sops-nix or a manual secure copy).
+- Age keys, one of two modes:
+  - **Per-machine keypairs** (recommended): each machine keeps its own age key and
+    lists the other machines' recipients in the config's `recipients`. Enables
+    per-device revocation. The clan service sets this up automatically.
+  - **Shared identity**: the same private key on every machine (`recipients`
+    empty). Provision it out of band (e.g. sops-nix or a manual secure copy).
 
 ## Install
 
@@ -28,7 +32,9 @@ nix build github:fosskar/ssync
   imports = [ inputs.ssync.homeManagerModules.default ];
   services.ssync.enable = true;
   # agents defaults to pi at ~/.pi/agent/sessions; the age key is auto-generated.
-  # For multi-machine, point ageIdentityFile at a key you share across machines.
+  # For multi-machine: either share one key via ageIdentityFile, or keep the
+  # auto-generated per-machine key and list the peers' recipients:
+  # services.ssync.recipients = [ "age1pq1..." ];
   # To also sync omp (oh-my-pi) sessions:
   # services.ssync.agents = [
   #   { agent = "pi";  sessionDir = "${config.home.homeDirectory}/.pi/agent/sessions"; }
@@ -54,7 +60,8 @@ nix build github:fosskar/ssync
 
 A clan service (`clan.modules.ssync`, single `peer` role) is exposed for clan
 users. It wraps the NixOS module and uses `clan.vars` to generate and distribute
-**everything** — the shared age key, a shared namespace secret, and each machine's
+**everything** — a per-machine age key (peers encrypt to each other's recipients),
+a shared namespace secret, and each machine's
 node-id — so peers **auto-connect with no manual pairing** and you configure
 nothing but the peer list:
 
@@ -106,12 +113,14 @@ ssync init          # writes config.toml and generates the age key if missing
 ssync daemon        # creates a sync namespace and starts syncing
 ```
 
-Copy the generated age key (`age_identity_path`) to your other machines — the
-**same key must be present on all of them**.
+Either copy the generated age key (`age_identity_path`) to your other machines
+(shared mode), or keep one key per machine and add each peer's recipient (printed
+by `ssync init`) to every other machine's `recipients` list.
 
 ## Pairing a second machine
 
-On the second machine, install the same age key, then:
+On the second machine, install the same age key (shared mode) or exchange
+recipients (per-machine mode), then:
 
 ```bash
 ssync init
