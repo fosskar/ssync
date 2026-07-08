@@ -34,6 +34,20 @@ pub trait Adapter: Send + Sync + std::fmt::Debug {
     fn is_session_file(&self, _path: &Path) -> bool {
         true
     }
+
+    /// Session creation time, derived from cheap metadata (pi: the filename
+    /// timestamp). `None` when unavailable. Never file mtime — the engine's own
+    /// write-backs reset it.
+    fn created_at(&self, _path: &Path) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    /// Best-effort user-given session title for local CLI features (`cleanup
+    /// --unnamed`); never used for storage/sync. `Some("")` = a present but
+    /// empty title record; `None` = the agent has no title record.
+    fn title(&self, _path: &Path) -> Option<String> {
+        None
+    }
 }
 
 pub mod pi;
