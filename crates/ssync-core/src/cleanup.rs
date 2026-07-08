@@ -62,7 +62,11 @@ pub fn plan(adapters: &[Box<dyn Adapter>], filter: &Filter) -> Result<Vec<Victim
     }
     let mut victims = Vec::new();
     for adapter in adapters {
-        if filter.agent.as_deref().is_some_and(|a| a != adapter.agent()) {
+        if filter
+            .agent
+            .as_deref()
+            .is_some_and(|a| a != adapter.agent())
+        {
             continue;
         }
         let files = crate::session_files(adapter.session_root(), adapter.as_ref());
@@ -164,14 +168,18 @@ mod tests {
             "{\"type\":\"title\",\"v\":1,\"title\":\"\",\"pad\":\" \"}\n",
         );
         // named: kept
-        let named = root.join("--p--").join(
-            "2026-01-02T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl",
-        );
-        std::fs::write(&named, "{\"type\":\"title\",\"v\":1,\"title\":\"keep me\"}\n").unwrap();
+        let named = root
+            .join("--p--")
+            .join("2026-01-02T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl");
+        std::fs::write(
+            &named,
+            "{\"type\":\"title\",\"v\":1,\"title\":\"keep me\"}\n",
+        )
+        .unwrap();
         // no title record at all (plain pi): kept
-        let plain = root.join("--p--").join(
-            "2026-01-03T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4c.jsonl",
-        );
+        let plain = root
+            .join("--p--")
+            .join("2026-01-03T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4c.jsonl");
         std::fs::write(&plain, "{\"type\":\"session\",\"version\":3}\n").unwrap();
 
         let victims = plan(
@@ -214,7 +222,13 @@ mod tests {
             unnamed: false,
         };
         assert!(plan(&adapters(&root), &filter(None, None)).is_err());
-        assert!(plan(&adapters(&root), &filter(Some("codex"), Some(SystemTime::now()))).is_err());
+        assert!(
+            plan(
+                &adapters(&root),
+                &filter(Some("codex"), Some(SystemTime::now()))
+            )
+            .is_err()
+        );
         // agent-restricted: selects only from that agent
         let victims = plan(
             &adapters(&root),
