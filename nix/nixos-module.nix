@@ -136,6 +136,9 @@ in
         StateDirectory = "ssync";
         Restart = "on-failure";
         RestartSec = 5;
+        # cap glibc malloc arenas: transient session read/encrypt buffers across
+        # tokio workers otherwise pin the peak-import high-water mark as RSS.
+        Environment = [ "MALLOC_ARENA_MAX=2" ];
 
         # --- hardening ---
         # The daemon needs: RW to the session dirs (under $HOME) and its StateDirectory,

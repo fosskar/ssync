@@ -92,6 +92,9 @@ in
         ExecStart = "${cfg.package}/bin/ssync --config ${configFile} daemon";
         Restart = "on-failure";
         RestartSec = 5;
+        # cap glibc malloc arenas: transient session read/encrypt buffers across
+        # tokio workers otherwise pin the peak-import high-water mark as RSS.
+        Environment = [ "MALLOC_ARENA_MAX=2" ];
       };
     };
   };
