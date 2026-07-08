@@ -150,9 +150,9 @@ TDD is mandatory for new behavior:
 Layout and patterns:
 
 - Plain `cargo test` harness, zero third-party test deps (no tempfile/nextest/proptest).
-- `crates/ssync-core/tests/two_node_sync.rs` — the main integration suite: two in-process
-  iroh nodes through the production `Engine` path; helpers `scratch()`, `spawn_node()`,
-  `pi_engine()`, `eventually()` (poll 500ms, no fixed sleeps).
+- `crates/ssync-core/tests/multi_node_sync.rs` — the main integration suite: two or three
+  in-process iroh nodes through the production `Engine` path; helpers `scratch()`,
+  `spawn_node()`, `pi_engine()`, `eventually()` (poll 500ms, no fixed sleeps).
 - `crates/ssync-core/tests/event_flood.rs` — 1500-session deadlock regression
   (multi_thread flavor).
 - Failure injection via production hooks: `disable_auto_download()`

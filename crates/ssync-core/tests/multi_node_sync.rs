@@ -1,9 +1,10 @@
-//! M2 gate: a session created on node A appears, decrypted and byte-identical, in
-//! node B's session directory after B joins A's index namespace — no manual copy.
+//! M2 gate: a session created on one node appears, decrypted and byte-identical,
+//! in the other nodes' session directories after they join the index namespace —
+//! no manual copy.
 //!
-//! Two in-process iroh nodes, one shared age identity (as on a single user's own
-//! machines). All mutation goes through `tick_once`/`run` — the production path.
-//! Uses poll loops because sync is asynchronous over the network.
+//! Two (or three, for the multi-recipient mesh) in-process iroh nodes, shared or
+//! per-machine age identities. All mutation goes through `tick_once`/`run` — the
+//! production path. Uses poll loops because sync is asynchronous over the network.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
