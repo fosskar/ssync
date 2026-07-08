@@ -15,6 +15,7 @@ use ssync_net::iroh_docs::engine::LiveEvent;
 
 use ssync_net::iroh_blobs::Hash;
 
+pub mod cleanup;
 mod reconcile;
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 
