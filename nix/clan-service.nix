@@ -4,7 +4,9 @@
 # `clan.modules.ssync`.
 #
 # clan.vars provides everything so the user configures nothing but the peers:
-#   - a shared age key (encryption),
+#   - a per-machine age key whose public recipient is shared to the other peers
+#     (multi-recipient encryption; revoking a machine = removing it from the
+#     instance and regenerating, remaining daemons re-publish automatically),
 #   - a shared namespace secret (one deterministic namespace, no ticket), and
 #   - a per-machine node key whose public node-id is shared to the other peers,
 #     so they auto-connect.
@@ -17,9 +19,10 @@
   manifest.categories = [ "Utility" ];
   manifest.readme = ''
     Runs the ssync daemon on each machine as an equal peer (role `peer`), syncing
-    coding-agent session files. clan.vars generates and distributes the shared age
-    key, a shared namespace secret, and each machine's node-id, so peers connect
-    automatically with no manual pairing. Just list the peer machines.
+    coding-agent session files. clan.vars generates a per-machine age key (each
+    peer encrypts to all peers' recipients), a shared namespace secret, and each
+    machine's node-id, so peers connect automatically with no manual pairing.
+    Just list the peer machines.
   '';
 
   roles.peer = {
@@ -54,21 +57,40 @@
             ssync = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
             gens = config.clan.core.vars.generators;
             otherPeers = lib.filterAttrs (name: _: name != machine.name) roles.peer.machines;
+            # public var of each other peer; generators print with a trailing
+            # newline, strip it so the value stays a single TOML string.
+            fromPeers =
+              generator: file:
+              lib.mapAttrsToList (
+                name: _:
+                lib.removeSuffix "\n" (
+                  clanLib.getPublicValue {
+                    flake = config.clan.core.settings.directory;
+                    machine = name;
+                    inherit generator file;
+                  }
+                )
+              ) otherPeers;
           in
           {
             imports = [ self.nixosModules.default ];
 
-            # shared age key (encryption) — one value across all peers.
+            # per-machine age key; its public recipient is non-secret and read
+            # by the other peers so everyone encrypts to everyone.
             clan.core.vars.generators.ssync-age = {
-              share = true;
               files.key = {
                 secret = true;
                 deploy = true;
                 owner = settings.user;
               };
+              files.recipient = {
+                secret = false;
+                deploy = true;
+              };
               runtimeInputs = [ pkgs.age ];
               script = ''
                 age-keygen -pq -o "$out"/key
+                age-keygen -y "$out"/key > "$out"/recipient
               '';
             };
 
@@ -110,19 +132,8 @@
               ageIdentityFile = gens.ssync-age.files.key.path;
               namespaceSecretFile = gens.ssync-namespace.files.secret.path;
               nodeKeyFile = gens.ssync-node.files.key.path;
-              peers = lib.mapAttrsToList (
-                name: _:
-                # keygen-node prints the node-id with a trailing newline; strip
-                # it so the value stays a single TOML string.
-                lib.removeSuffix "\n" (
-                  clanLib.getPublicValue {
-                    flake = config.clan.core.settings.directory;
-                    machine = name;
-                    generator = "ssync-node";
-                    file = "id";
-                  }
-                )
-              ) otherPeers;
+              peers = fromPeers "ssync-node" "id";
+              recipients = fromPeers "ssync-age" "recipient";
             };
           };
       };

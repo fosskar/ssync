@@ -24,6 +24,11 @@ let
     + lib.optionalString (cfg.peers != [ ]) ''
       peers = [ ${lib.concatMapStringsSep ", " (p: "\"${lib.removeSuffix "\n" p}\"") cfg.peers} ]
     ''
+    + lib.optionalString (cfg.recipients != [ ]) ''
+      recipients = [ ${
+        lib.concatMapStringsSep ", " (r: "\"${lib.removeSuffix "\n" r}\"") cfg.recipients
+      } ]
+    ''
     + lib.concatMapStrings (a: ''
       [[agents]]
       agent = "${a.agent}"
@@ -84,10 +89,12 @@ in
       default = "${cfg.dataDir}/age.key";
       defaultText = lib.literalExpression "\"\${dataDir}/age.key\"";
       description = ''
-        Shared age identity file. If it does not exist the daemon generates one
-        on first run. It must be the *same* key on every machine, so for a
-        multi-machine setup point this at a secret you distribute yourself (e.g.
-        sops-nix). The clan service handles this for you via clan.vars.
+        Age identity file. If it does not exist the daemon generates one on
+        first run. Shared mode (`recipients = []`): it must be the *same* key on
+        every machine, so point this at a secret you distribute yourself (e.g.
+        sops-nix). Per-machine mode: each machine keeps its own key and lists
+        the other machines' recipients in `recipients`. The clan service
+        handles per-machine keys for you via clan.vars.
       '';
     };
 
@@ -117,6 +124,16 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = "Peer node-ids to sync with (the clan service fills these in).";
+    };
+
+    recipients = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        The other machines' age recipients (per-machine keys, multi-recipient
+        encryption; this machine's own recipient is always included). Empty =
+        shared-identity mode. The clan service fills these in.
+      '';
     };
   };
 

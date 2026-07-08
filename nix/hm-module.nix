@@ -16,6 +16,11 @@ let
       age_identity_path = "${cfg.ageIdentityFile}"
       data_dir = "${cfg.dataDir}"
     ''
+    + lib.optionalString (cfg.recipients != [ ]) ''
+      recipients = [ ${
+        lib.concatMapStringsSep ", " (r: "\"${lib.removeSuffix "\n" r}\"") cfg.recipients
+      } ]
+    ''
     + lib.concatMapStrings (a: ''
       [[agents]]
       agent = "${a.agent}"
@@ -67,9 +72,21 @@ in
       default = "${cfg.dataDir}/age.key";
       defaultText = lib.literalExpression "\"\${dataDir}/age.key\"";
       description = ''
-        Shared age identity file. If it does not exist the daemon generates one
-        on first run. It must be the *same* key on every machine, so for a
-        multi-machine setup point this at a secret you distribute (e.g. sops-nix).
+        Age identity file. If it does not exist the daemon generates one on
+        first run. Shared mode (`recipients = []`): it must be the *same* key on
+        every machine, so point this at a secret you distribute (e.g. sops-nix).
+        Per-machine mode: each machine keeps its own key and lists the other
+        machines' recipients in `recipients`.
+      '';
+    };
+
+    recipients = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        The other machines' age recipients (per-machine keys, multi-recipient
+        encryption; this machine's own recipient is always included). Empty =
+        shared-identity mode.
       '';
     };
 
