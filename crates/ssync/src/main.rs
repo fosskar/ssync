@@ -41,6 +41,24 @@ enum Command {
     Status,
     /// List sessions that have diverged across machines.
     Conflicts,
+    /// Delete old/unnamed local sessions; the daemon propagates the deletions.
+    Cleanup {
+        /// Only this agent's sessions (default: all configured agents).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Delete sessions created more than this long ago (e.g. 30d, 6w, 3m, 1y).
+        #[arg(long, conflicts_with = "before")]
+        keep: Option<String>,
+        /// Delete sessions created before this date (YYYY-MM-DD, UTC).
+        #[arg(long)]
+        before: Option<String>,
+        /// Delete sessions whose title record is present but empty.
+        #[arg(long)]
+        unnamed: bool,
+        /// Actually delete. Without it, only list what would be deleted.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Generate an iroh node key at PATH; print its node-id (for clan.vars).
     KeygenNode { path: PathBuf },
     /// Generate a shared namespace secret at PATH (for clan.vars).
@@ -61,6 +79,13 @@ async fn main() -> Result<()> {
         Command::Join { ticket } => cmd_join(&config_path, &ticket),
         Command::Status => cmd_status(&config_path),
         Command::Conflicts => cmd_conflicts(&config_path),
+        Command::Cleanup {
+            agent,
+            keep,
+            before,
+            unnamed,
+            apply,
+        } => cmd_cleanup(&config_path, agent, keep, before, unnamed, apply),
         Command::KeygenNode { path } => {
             let bytes = ssync_net::generate_key_bytes();
             write_secret_bytes(&path, &bytes)?;
@@ -71,6 +96,71 @@ async fn main() -> Result<()> {
             write_secret_bytes(&path, &ssync_net::generate_key_bytes())
         }
     }
+}
+
+fn cmd_cleanup(
+    config_path: &Path,
+    agent: Option<String>,
+    keep: Option<String>,
+    before: Option<String>,
+    unnamed: bool,
+    apply: bool,
+) -> Result<()> {
+    use ssync_core::cleanup::{Filter, parse_keep, plan};
+
+    let config = Config::load(config_path)?;
+    let cutoff = match (keep, before) {
+        (Some(k), None) => Some(
+            std::time::SystemTime::now()
+                .checked_sub(parse_keep(&k)?)
+                .ok_or_else(|| anyhow!("duration out of range"))?,
+        ),
+        (None, Some(d)) => Some(
+            ssync_adapters::pi::parse_pi_timestamp(&format!("{d}T00-00-00-000Z"))
+                .ok_or_else(|| anyhow!("invalid date {d:?} (expected YYYY-MM-DD)"))?,
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+    };
+    let adapters = config
+        .agents
+        .iter()
+        .map(|a| adapter_for(&a.agent, &a.session_dir))
+        .collect::<Result<Vec<_>>>()?;
+    let victims = plan(
+        &adapters,
+        &Filter {
+            agent,
+            before: cutoff,
+            unnamed,
+        },
+    )?;
+    if victims.is_empty() {
+        println!("nothing to delete");
+        return Ok(());
+    }
+    let total: u64 = victims.iter().map(|v| v.size).sum();
+    for v in &victims {
+        println!("{}  {}", v.agent, v.path.display());
+    }
+    println!(
+        "{} session(s), {:.1} MB{}",
+        victims.len(),
+        total as f64 / 1e6,
+        if apply {
+            ""
+        } else {
+            " — dry run, pass --apply to delete"
+        }
+    );
+    if apply {
+        for v in &victims {
+            std::fs::remove_file(&v.path)
+                .with_context(|| format!("deleting {}", v.path.display()))?;
+        }
+        println!("deleted; the daemon propagates the deletions to peers");
+    }
+    Ok(())
 }
 
 fn cmd_init(config_path: &Path) -> Result<()> {
