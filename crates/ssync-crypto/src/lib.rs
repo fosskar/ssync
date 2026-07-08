@@ -13,12 +13,14 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(feature = "rust-age")]
 pub mod rust_age;
 
-/// A shared age identity: the secret key string plus its recipient (public key).
+/// An age identity: the secret key string plus its recipient (public key),
+/// optionally extended with peer recipients for multi-recipient encryption.
 /// New identities are post-quantum hybrid (`AGE-SECRET-KEY-PQ-1…` / `age1pq1…`);
 /// classical (`AGE-SECRET-KEY-1…` / `age1…`) keys are still accepted.
 pub struct AgeIdentity {
     secret: String,
     recipient: String,
+    extra_recipients: Vec<String>,
 }
 
 impl AgeIdentity {
@@ -42,7 +44,11 @@ impl AgeIdentity {
             Some(r) => r,
             None => recipient_of(&secret)?,
         };
-        Ok(Self { secret, recipient })
+        Ok(Self {
+            secret,
+            recipient,
+            extra_recipients: Vec::new(),
+        })
     }
 
     /// Build from an age identity: either a bare `AGE-SECRET-KEY[-PQ]-1…` line or
@@ -55,7 +61,11 @@ impl AgeIdentity {
             .ok_or_else(|| anyhow!("no age secret key found"))?
             .to_string();
         let recipient = recipient_of(&secret)?;
-        Ok(Self { secret, recipient })
+        Ok(Self {
+            secret,
+            recipient,
+            extra_recipients: Vec::new(),
+        })
     }
 
     /// The secret key string. Handle as a secret; persist `0600`.
@@ -68,13 +78,26 @@ impl AgeIdentity {
         self.recipient.clone()
     }
 
-    /// Encrypt `plaintext` to this identity's recipient (binary age output).
+    /// Extend the encryption recipient set with peer recipients (their machines
+    /// can then decrypt what this one publishes). Own recipient stays included;
+    /// duplicates are dropped.
+    pub fn add_recipients<I: IntoIterator<Item = String>>(&mut self, recipients: I) {
+        for r in recipients {
+            if r != self.recipient && !self.extra_recipients.contains(&r) {
+                self.extra_recipients.push(r);
+            }
+        }
+    }
+
+    /// Encrypt `plaintext` to this identity's recipient plus any added peer
+    /// recipients (binary age output).
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        run(
-            Command::new("age").args(["-e", "-r", &self.recipient]),
-            plaintext,
-        )
-        .context("age encrypt")
+        let mut cmd = Command::new("age");
+        cmd.args(["-e", "-r", &self.recipient]);
+        for r in &self.extra_recipients {
+            cmd.args(["-r", r]);
+        }
+        run(&mut cmd, plaintext).context("age encrypt")
     }
 
     /// Decrypt age `ciphertext` with this identity.
@@ -216,5 +239,19 @@ mod tests {
         let b = AgeIdentity::generate().unwrap();
         let ct = a.encrypt(b"hello").unwrap();
         assert!(b.decrypt(&ct).is_err());
+    }
+
+    #[test]
+    fn extra_recipients_can_decrypt_and_self_stays_included() {
+        let a = AgeIdentity::generate().unwrap();
+        let b = AgeIdentity::generate().unwrap();
+        let c = AgeIdentity::generate().unwrap();
+        let mut sender = AgeIdentity::from_secret_string(&a.to_secret_string()).unwrap();
+        // duplicate of self plus b: dedup must not break encryption
+        sender.add_recipients([a.recipient_string(), b.recipient_string()]);
+        let ct = sender.encrypt(b"shared session").unwrap();
+        assert_eq!(a.decrypt(&ct).unwrap(), b"shared session");
+        assert_eq!(b.decrypt(&ct).unwrap(), b"shared session");
+        assert!(c.decrypt(&ct).is_err(), "non-recipient must not decrypt");
     }
 }
