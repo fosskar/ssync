@@ -50,8 +50,12 @@ pub trait Adapter: Send + Sync + std::fmt::Debug {
     }
 }
 
+pub mod claude_code;
+pub mod codex;
 pub mod pi;
 
+use claude_code::ClaudeCodeAdapter;
+use codex::CodexAdapter;
 use pi::PiAdapter;
 
 /// Build the adapter for a configured agent name, boxed so the engine can hold a
@@ -65,8 +69,33 @@ pub fn adapter_for(
 ) -> anyhow::Result<Box<dyn Adapter>> {
     match agent {
         "pi" | "omp" => Ok(Box::new(PiAdapter::new(agent, session_root))),
+        "claude-code" => Ok(Box::new(ClaudeCodeAdapter::new(session_root))),
+        "codex" => Ok(Box::new(CodexAdapter::new(session_root))),
         other => Err(anyhow::anyhow!(
-            "unsupported agent {other:?} (supported: pi, omp)"
+            "unsupported agent {other:?} (supported: pi, omp, claude-code, codex)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_for_builds_every_supported_agent() {
+        for (agent, root) in [
+            ("pi", "/x"),
+            ("omp", "/x"),
+            ("claude-code", "/x"),
+            ("codex", "/x"),
+        ] {
+            let a = adapter_for(agent, root).unwrap();
+            assert_eq!(a.agent(), agent);
+        }
+        assert!(adapter_for("amp", "/x").is_err(), "amp has no local files");
+        assert!(
+            adapter_for("opencode", "/x").is_err(),
+            "opencode is db-backed"
+        );
     }
 }

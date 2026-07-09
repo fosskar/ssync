@@ -100,11 +100,21 @@ session_dir = "~/.pi/agent/sessions"
 [[agents]]
 agent = "omp"
 session_dir = "~/.omp/agent/sessions"
+
+# optional: Claude Code and Codex (newest-wins on conflict until their
+# formats are verified append-only; see docs/*-format-notes.md)
+[[agents]]
+agent = "claude-code"
+session_dir = "~/.claude/projects"
+
+[[agents]]
+agent = "codex"
+session_dir = "~/.codex/sessions"
 ```
 
 The Nix modules generate this file for you from their options. `ssync init`
 writes a default config listing every known agent whose session directory
-exists on the machine (pi, omp).
+exists on the machine (pi, omp, claude-code, codex).
 
 ## First machine
 
