@@ -30,9 +30,11 @@ What ssync protects, what it exposes, and the assumptions it makes.
   machines. Every machine in the recipient set can decrypt every synced session —
   multi-recipient encryption is about *revocation*, not compartmentalization.
   With per-machine keypairs (the recommended mode), removing a machine's
-  recipient and regenerating makes the remaining daemons re-publish everything
-  under the new recipient set; the removed machine cannot read anything published
-  after that. Revocation is forward-only: blobs it already fetched stay readable.
+  recipient and regenerating only affects sessions published *after* the change:
+  imports dedup on plaintext, so unchanged sessions are never re-encrypted, and
+  their existing blobs stay readable to the removed key. The removed machine
+  also still holds the namespace secret, i.e. write access to the index. Full
+  eviction requires rotating the namespace as well — see issue #22.
 - **Age keys are the crown jewels.** Any key in the recipient set decrypts all
   synced sessions. Store keys `0600` (the daemon refuses to run on a
   group/world-readable key). In shared mode, provision the one key over a
