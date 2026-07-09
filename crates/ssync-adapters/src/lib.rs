@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, anyhow};
+
 /// Machine-independent identity of a session file (no transcript parsing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIdentity {
@@ -22,6 +24,14 @@ pub trait Adapter: Send + Sync + std::fmt::Debug {
     fn agent(&self) -> &str;
 
     fn session_root(&self) -> &Path;
+
+    /// Path relative to `session_root` (the identity's `relative_path`).
+    fn relative_to_root(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        Ok(path
+            .strip_prefix(self.session_root())
+            .with_context(|| format!("{} is not under session root", path.display()))?
+            .to_path_buf())
+    }
 
     /// Identify a path under `session_root`. May read minimal metadata (filename,
     /// a single header field) but MUST NOT parse the transcript.
@@ -48,6 +58,22 @@ pub trait Adapter: Send + Sync + std::fmt::Debug {
     fn title(&self, _path: &Path) -> Option<String> {
         None
     }
+}
+
+/// UTF-8 filename stem — the start of every path-derived identity.
+pub(crate) fn stem_str(path: &Path) -> anyhow::Result<&str> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("{}: no filename stem", path.display()))
+}
+
+/// Uuid shape: 36 chars, dashes at 8/13/18/23, hex elsewhere.
+pub(crate) fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 pub mod claude_code;

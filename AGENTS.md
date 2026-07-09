@@ -62,7 +62,8 @@ Impure shell around pure decision cores:
 - `nix/` — package, devshell, treefmt, checks (incl. two NixOS VM tests), NixOS/HM/clan
   modules, nixbot effects.
 - `docs/` — DECISIONS.md, identity.md, pairing.md, setup.md, threat-model.md,
-  pi-format-notes.md, vs-syncthing.md.
+  pi-format-notes.md, claude-code-format-notes.md, codex-format-notes.md,
+  vs-syncthing.md.
 - `.tmp/` — gitignored scratch handed over by the user; **never commit or push it**.
   (Tests do not use it; they create dirs under the system temp dir.)
 

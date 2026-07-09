@@ -9,10 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 
 use crate::pi::parse_pi_timestamp;
-use crate::{Adapter, SessionIdentity};
+use crate::{Adapter, SessionIdentity, is_uuid, stem_str};
 
 /// A codex session store (`~/.codex/sessions`).
 #[derive(Debug)]
@@ -37,13 +37,7 @@ fn split_rollout_stem(stem: &str) -> Option<(&str, &str)> {
     }
     let (ts, dash_uuid) = rest.split_at(rest.len() - 37);
     let uuid = dash_uuid.strip_prefix('-')?;
-    uuid.bytes()
-        .enumerate()
-        .all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
-        .then_some((ts, uuid))
+    is_uuid(uuid).then_some((ts, uuid))
 }
 
 impl Adapter for CodexAdapter {
@@ -56,10 +50,7 @@ impl Adapter for CodexAdapter {
     }
 
     fn identify(&self, path: &Path) -> anyhow::Result<SessionIdentity> {
-        let relative_path = path
-            .strip_prefix(&self.session_root)
-            .with_context(|| format!("{} is not under session root", path.display()))?
-            .to_path_buf();
+        let relative_path = self.relative_to_root(path)?;
 
         let project_id = relative_path
             .parent()
@@ -67,10 +58,7 @@ impl Adapter for CodexAdapter {
             .filter(|p| !p.is_empty())
             .ok_or_else(|| anyhow!("{}: no date partition dirs", path.display()))?;
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("{}: no filename stem", path.display()))?;
+        let stem = stem_str(path)?;
         let (_ts, uuid) = split_rollout_stem(stem)
             .ok_or_else(|| anyhow!("{stem}: expected rollout-<ts>-<uuid>"))?;
 

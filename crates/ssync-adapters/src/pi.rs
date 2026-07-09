@@ -7,9 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 
-use crate::{Adapter, SessionIdentity};
+use crate::{Adapter, SessionIdentity, stem_str};
 
 /// A pi-layout session store, labelled by the agent that owns it (`pi`, `omp`).
 #[derive(Debug)]
@@ -37,10 +37,7 @@ impl Adapter for PiAdapter {
     }
 
     fn identify(&self, path: &Path) -> anyhow::Result<SessionIdentity> {
-        let relative_path = path
-            .strip_prefix(&self.session_root)
-            .with_context(|| format!("{} is not under session root", path.display()))?
-            .to_path_buf();
+        let relative_path = self.relative_to_root(path)?;
 
         let project_id = relative_path
             .parent()
@@ -49,10 +46,7 @@ impl Adapter for PiAdapter {
             .ok_or_else(|| anyhow!("{}: no <encoded-cwd> parent dir", path.display()))?
             .to_string();
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("{}: no filename stem", path.display()))?;
+        let stem = stem_str(path)?;
         let session_id = stem
             .rsplit_once('_')
             .map(|(_ts, id)| id)

@@ -6,9 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, ensure};
 
-use crate::{Adapter, SessionIdentity};
+use crate::{Adapter, SessionIdentity, is_uuid, stem_str};
 
 /// A Claude Code session store.
 #[derive(Debug)]
@@ -34,10 +34,7 @@ impl Adapter for ClaudeCodeAdapter {
     }
 
     fn identify(&self, path: &Path) -> anyhow::Result<SessionIdentity> {
-        let relative_path = path
-            .strip_prefix(&self.session_root)
-            .with_context(|| format!("{} is not under session root", path.display()))?
-            .to_path_buf();
+        let relative_path = self.relative_to_root(path)?;
 
         let project_id = relative_path
             .parent()
@@ -46,11 +43,12 @@ impl Adapter for ClaudeCodeAdapter {
             .ok_or_else(|| anyhow!("{}: no <encoded-cwd> parent dir", path.display()))?
             .to_string();
 
-        let session_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("{}: no filename stem", path.display()))?
-            .to_string();
+        let session_id = stem_str(path)?;
+        ensure!(
+            is_uuid(session_id),
+            "{session_id}: expected a bare uuid stem"
+        );
+        let session_id = session_id.to_string();
 
         Ok(SessionIdentity {
             agent: self.agent().to_string(),
@@ -68,8 +66,14 @@ impl Adapter for ClaudeCodeAdapter {
         false
     }
 
+    /// The project dir holds non-session entries too (a `memory/` subdir was
+    /// observed); only uuid-named `.jsonl` files are sessions.
     fn is_session_file(&self, path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(is_uuid)
     }
 }
 
@@ -115,6 +119,20 @@ mod tests {
     fn filters_non_jsonl_files() {
         let adapter = ClaudeCodeAdapter::new("/r");
         assert!(!adapter.is_session_file(Path::new("/r/p/notes.txt")));
-        assert!(adapter.is_session_file(Path::new("/r/p/x.jsonl")));
+        assert!(
+            !adapter.is_session_file(Path::new("/r/p/b6933609-ab67-467e-af26-e48c3c8c129e.txt"))
+        );
+    }
+
+    #[test]
+    fn filters_non_uuid_jsonl_files() {
+        // the project dir holds non-session .jsonl entries too
+        // (docs/claude-code-format-notes.md); only uuid-named files are sessions.
+        let adapter = ClaudeCodeAdapter::new("/r");
+        assert!(!adapter.is_session_file(Path::new("/r/p/stray.jsonl")));
+        assert!(!adapter.is_session_file(Path::new("/r/p/memory/topics.jsonl")));
+        assert!(
+            adapter.is_session_file(Path::new("/r/p/b6933609-ab67-467e-af26-e48c3c8c129e.jsonl"))
+        );
     }
 }

@@ -53,4 +53,4 @@ Flip criteria in issue #6.
 
 - agent: `claude-code`, root: `~/.claude/projects`
 - session_id: filename stem; project_id: `<encoded-cwd>` dir
-- session filter: `*.jsonl`; created_at: none; title: none known
+- session filter: uuid-named `*.jsonl`; created_at: none; title: none known
