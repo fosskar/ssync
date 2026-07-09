@@ -18,12 +18,26 @@ leaderless: every machine runs the same daemon as an equal peer.
 
 ## Install
 
-### Plain binary (Nix)
+### From source (plain binary)
+
+No nix required: a plain Rust workspace. The daemon shells out to `age`/`age-keygen`
+≥ 1.3 (post-quantum support), which must be on `PATH` at runtime:
 
 ```bash
-nix build github:fosskar/ssync
-./result/bin/ssync --help
+cargo build --release
+./target/release/ssync --help
 ```
+
+With nix (flakes), the package wraps the `age` dependency for you:
+
+```bash
+nix run github:fosskar/ssync -- --help      # try it
+nix profile install github:fosskar/ssync   # imperative install
+```
+
+Declaratively, add ssync as a flake input (`inputs.ssync.url =
+"github:fosskar/ssync";`) and use `inputs.ssync.packages.<system>.default` — or
+better, one of the modules below (they need the flake input anyway).
 
 ### home-manager module (recommended — sessions are per-user)
 

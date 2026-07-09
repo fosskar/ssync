@@ -13,7 +13,7 @@ and writes incoming sessions back so the agent can `--resume` them anywhere.
 
 Early. Supports the **pi** and **omp** agents (lossless merge) plus **Claude Code**
 and **Codex** (newest-wins until their formats are verified append-only), under
-active construction. See `docs/DECISIONS.md` for the design rationale.
+active construction. See [docs/DECISIONS.md](docs/DECISIONS.md) for the design rationale.
 
 ## What it is / isn't
 
@@ -54,18 +54,48 @@ age ciphertext. Every daemon holds a full replica, adding a machine is just one 
 identical daemon joining the namespace, and the swarm self-meshes via gossip
 regardless of which machine you paired through.
 
+## Install
+
+The same daemon, three ways to get it:
+
+1. **From source** (no nix required) — a plain Rust workspace. The only runtime
+   dependency is `age`/`age-keygen` ≥ 1.3 (post-quantum support) on `PATH`:
+
+   ```bash
+   cargo build --release && ./target/release/ssync --help
+   ```
+
+   With nix (flakes), the package wraps the `age` dependency for you:
+
+   ```bash
+   nix run github:fosskar/ssync -- --help      # try it
+   nix profile install github:fosskar/ssync   # imperative install
+   ```
+
+   Declaratively, add `inputs.ssync.url = "github:fosskar/ssync";` to your flake
+   and use `inputs.ssync.packages.<system>.default` — or better, use a module:
+
+2. **NixOS or home-manager module** (flake input, as above) — the same binary as
+   a hardened systemd service; the module writes the config from nix options,
+   you pair once with a ticket.
+3. **[clan](https://clan.lol) service** — wraps the NixOS module and additionally
+   generates and distributes every key via clan.vars: no tickets, no manual
+   pairing, just a peer list.
+
+Step-by-step instructions for all three: **[docs/setup.md](docs/setup.md)**.
+
 ## Quick start
 
 ssync encrypts with age keys: either one **shared key** on all your machines, or a
 **key per machine** with each peer's recipient listed in `recipients` (enables
 per-device revocation). Each synced project must live at the **same absolute path**
-everywhere (see `docs/identity.md`).
+everywhere (see [docs/identity.md](docs/identity.md)).
 
 **With [clan](https://clan.lol):** just list the peer machines — the clan service generates
 a per-machine age key (peers encrypt to each other's recipients), a shared namespace secret
-and each machine's node-id, so peers auto-connect with no `ticket`/`join`. See `docs/setup.md`.
+and each machine's node-id, so peers auto-connect with no `ticket`/`join`.
 
-**Standalone** (plain binary / NixOS / home-manager), pair once with a ticket:
+**Standalone** (from source / NixOS / home-manager), pair once with a ticket:
 
 ```bash
 # first machine
@@ -80,7 +110,7 @@ ssync daemon        # joins the namespace and syncs
 ```
 
 Run `ssync daemon` on each machine (the Nix modules do this as a hardened systemd service).
-Full instructions: `docs/setup.md`. Pairing details: `docs/pairing.md`.
+Full instructions: [docs/setup.md](docs/setup.md). Pairing details: [docs/pairing.md](docs/pairing.md).
 
 ```bash
 ssync status        # namespace, session count, conflicts
@@ -99,9 +129,9 @@ deletion would not propagate (the empty-dir safety guard).
 
 Sessions often contain secrets (API keys, file contents). ssync encrypts every session at
 rest with age before it ever leaves the machine, so peers and any relay see only ciphertext.
-See `docs/threat-model.md`. Sessions are encrypted with post-quantum hybrid keys by default
+See [docs/threat-model.md](docs/threat-model.md). Sessions are encrypted with post-quantum hybrid keys by default
 (ML-KEM-768 + X25519, via `age-keygen -pq`). The NixOS module runs the daemon under a strict
-systemd sandbox (`docs/DECISIONS.md` §12).
+systemd sandbox ([docs/DECISIONS.md](docs/DECISIONS.md) §12).
 
 ## License
 
