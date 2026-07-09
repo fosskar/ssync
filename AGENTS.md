@@ -162,9 +162,8 @@ TDD is mandatory for new behavior:
 
 Layout and patterns:
 
-- Plain `cargo test` harness (`#[test]`/`#[tokio::test]`). No third-party test deps;
-  `tempfile` is pre-approved for scratch dirs, anything else needs asking. Existing tests
-  hand-roll scratch dirs under `std::env::temp_dir()` scoped by pid + tag.
+- Plain `cargo test` harness (`#[test]`/`#[tokio::test]`); zero third-party test deps.
+  Scratch dirs are hand-rolled under `std::env::temp_dir()`, scoped by pid + tag.
 - Unit tests live inline (`#[cfg(test)] mod tests`) next to the code; a `tests/` dir only
   where cross-crate or network integration is needed.
 - `crates/ssync-core/tests/multi_node_sync.rs` — the main integration suite: two/three
