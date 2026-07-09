@@ -35,9 +35,14 @@ nix run github:fosskar/ssync -- --help      # try it
 nix profile install github:fosskar/ssync   # imperative install
 ```
 
-Declaratively, add ssync as a flake input (`inputs.ssync.url =
-"github:fosskar/ssync";`) and use `inputs.ssync.packages.<system>.default` — or
-better, one of the modules below (they need the flake input anyway).
+Declaratively, add ssync as a flake input:
+
+```nix
+inputs.ssync.url = "github:fosskar/ssync";
+```
+
+and use `inputs.ssync.packages.<system>.default` — or better, one of the modules
+below (they need the flake input anyway).
 
 ### home-manager module (recommended — sessions are per-user)
 
@@ -71,6 +76,11 @@ better, one of the modules below (they need the flake input anyway).
   };
 }
 ```
+
+`user` is required (no default): the daemon runs as that user, who must own the
+agents' session dirs. It is not a cross-user bridge — for projects under `$HOME`
+the username is part of the session key, so use the *same* username on every
+machine (see `identity.md`).
 
 ### clan service
 

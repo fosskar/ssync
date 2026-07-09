@@ -17,8 +17,9 @@ Pairing uses an iroh-docs **`DocTicket`**. It carries:
 - the issuing node's direct addresses and relay URL, so the joiner can dial it.
 
 The daemon writes its current ticket to `data_dir/ticket` on every start (with
-fresh addresses). `ssync ticket` prints that file. `ssync join <ticket>` stages
-the ticket at `data_dir/remote-ticket`; the daemon consumes it on the next start,
+fresh addresses; in shared-namespace mode no ticket file is written).
+`ssync ticket` prints that file. `ssync join <ticket>` stages the ticket at
+`data_dir/remote-ticket`; the daemon consumes it on the next start,
 joins the namespace, and deletes the staged file.
 
 This file-based flow avoids two processes opening the single-writer store at once
