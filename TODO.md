@@ -12,14 +12,17 @@ connectivity, UX) — say the word if you meant literal perf and want a re-sort.
        sees ciphertext. The relay path is the one core promise never exercised in
        prod; the two-VM test covers the LAN/direct path only. Can't run in the CI
        sandbox.
-2. [ ] **More agents** — in daily use, so each unsupported agent is a 0%-synced
-       coverage gap (each = one Adapter impl + append-only determination; every
-       format needs the same investigation pi got before store-as-is is trusted —
-       see docs/pi-format-notes.md as the template):
-       - [ ] Claude Code (`~/.claude/projects/**`)
-       - [ ] Codex
-       - [ ] OpenCode
-       - [ ] amp
+2. [ ] **More agents** — investigated 2026-07 (issues #6–#9); adapters landed for the
+       two file-backed agents, merge gated off until append-only is verified against
+       a real session file:
+       - [x] Claude Code (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`) — adapter
+             `claude-code`; newest-wins until verified (#6, docs/claude-code-format-notes.md)
+       - [x] Codex (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, sqlite is only a
+             metadata index) — adapter `codex`; newest-wins until verified (#7,
+             docs/codex-format-notes.md)
+       - [ ] OpenCode — sqlite-only since 2026-02, row-mutable; blocked on the
+             DB-extraction adapter model (#8 → #20)
+       - amp — declined: no local transcripts, threads live on ampcode.com (#9)
 3. [ ] **mDNS local discovery** so LAN peers connect without a ticket that carries
        direct addresses (iroh `address-lookup-mdns`). Connectivity currently relies
        on the ticket's embedded addresses. Priority raised: DECISIONS §6, pairing.md,

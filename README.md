@@ -11,8 +11,9 @@ and writes incoming sessions back so the agent can `--resume` them anywhere.
 
 ## Status
 
-Early. Supports the **pi** and **omp** agents and is under active construction. See
-`docs/DECISIONS.md` for the design rationale.
+Early. Supports the **pi** and **omp** agents (lossless merge) plus **Claude Code**
+and **Codex** (newest-wins until their formats are verified append-only), under
+active construction. See `docs/DECISIONS.md` for the design rationale.
 
 ## What it is / isn't
 

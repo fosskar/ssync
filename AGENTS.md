@@ -5,9 +5,9 @@ lives in `docs/DECISIONS.md` (§0–§12) — cite it by section, never restate 
 
 ## Project Overview
 
-ssync syncs AI-agent session files (pi, omp) between a user's machines: leaderless p2p via
-iroh, age-encrypted at rest, no server to run. Rust workspace (edition 2024), single
-binary + daemon.
+ssync syncs AI-agent session files (pi, omp; claude-code and codex newest-wins) between a
+user's machines: leaderless p2p via iroh, age-encrypted at rest, no server to run. Rust
+workspace (edition 2024), single binary + daemon.
 
 ## Architecture & Data Flow
 
@@ -57,7 +57,8 @@ Impure shell around pure decision cores:
 - `crates/ssync-crypto/` — `AgeIdentity`: PQ-hybrid keys via the `age`/`age-keygen` CLI;
   Rust `age`-crate backend disabled behind feature `rust-age` until it gains ML-KEM.
 - `crates/ssync-adapters/` — `Adapter` trait + `adapter_for` factory. New agent = one
-  `impl Adapter` + one `adapter_for` arm (`"pi" | "omp"` share `PiAdapter`).
+  `impl Adapter` + one `adapter_for` arm (`"pi" | "omp"` share `PiAdapter`; claude-code
+  and codex have their own impls, merge gated off until append-only is verified).
 - `nix/` — package, devshell, treefmt, checks (incl. two NixOS VM tests), NixOS/HM/clan
   modules, nixbot effects.
 - `docs/` — DECISIONS.md, identity.md, pairing.md, setup.md, threat-model.md,

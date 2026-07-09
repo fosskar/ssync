@@ -62,8 +62,9 @@ impl Config {
     }
 
     /// Built-in defaults: every known agent whose session dir exists on this
-    /// machine (pi at `~/.pi/agent/sessions`, omp at `~/.omp/agent/sessions`),
-    /// falling back to pi alone on a fresh machine.
+    /// machine (pi `~/.pi/agent/sessions`, omp `~/.omp/agent/sessions`,
+    /// claude-code `~/.claude/projects`, codex `~/.codex/sessions`), falling
+    /// back to pi alone on a fresh machine.
     pub fn defaults() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
         let config = dirs::config_dir().ok_or_else(|| anyhow!("no config dir"))?;
@@ -71,6 +72,8 @@ impl Config {
         let known = [
             ("pi", home.join(".pi/agent/sessions")),
             ("omp", home.join(".omp/agent/sessions")),
+            ("claude-code", home.join(".claude/projects")),
+            ("codex", home.join(".codex/sessions")),
         ];
         let mut agents: Vec<AgentConfig> = known
             .iter()
