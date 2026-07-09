@@ -126,10 +126,10 @@ p2p:
   of Syncthing too — it's physics. The fix in both cases is to leave one machine on as an
   always-available peer; ssync keeps that peer an *equal* peer, not a privileged hub
   (`DECISIONS.md` §4).
-- **Trusted machines.** ssync assumes one user's own set of machines, all holding the shared
-  age key; there is no per-device revocation in v1. A compromised machine that already holds
-  the key can read everything — by design. Syncthing's trusted devices are equivalent
-  (`threat-model.md`).
+- **Trusted machines.** ssync assumes one user's own set of machines. Every machine in the
+  recipient set can decrypt everything — by design; per-machine keys (`recipients`) enable
+  revocation, the shared-key mode does not. A compromised machine that is still in the set
+  can read everything (`threat-model.md`). Syncthing's trusted devices are equivalent.
 - **Metadata.** ssync hides session *contents*, not their existence, size, or relative paths
   from peers in your own namespace. Syncthing similarly exposes file names/sizes to trusted
   devices.
