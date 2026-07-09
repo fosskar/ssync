@@ -30,12 +30,14 @@ connectivity, UX) first.
 4. [ ] **Surface config knobs** that are currently hardcoded: `discovery`
        (default vs lan-only), `relay` override, `[conflict] strategy`, and the
        peer re-sync interval (60s). Today it is n0 defaults + newest-wins only.
-5. [ ] **Reconcile peer-management UX.** Both mechanisms are now live: namespace
-       tickets (`ssync ticket` / `ssync join <ticket>`) do pairing, while the config
-       `peers` node-id list feeds `sync_with_peers` resync via discovery. Decide the
-       user-facing story (likely: tickets stay the pairing UX, `peers` becomes
-       plumbing that `join` populates, plus `ssync peer list/remove` for hygiene)
-       and align docs.
+5. [ ] **Reconcile peer-management UX** (#23). Membership changes outside clan are a
+       multi-step, per-machine dance: recipients edits plus the `ssync ticket` /
+       `ssync join` re-pair on every machine (removal since #22 also rotates the
+       namespace). Proposed: promote shared-namespace mode to the primary manual
+       mode with one distributable cluster artifact (`ssync cluster init/add/rm` —
+       secret + recipients; `rm` rotates the secret), so any change is one command,
+       one file copy, one restart. Ticket flow stays for ad-hoc pairing; decide the
+       story and align docs.
 6. [ ] **Path-rewriting (Option B)** so projects at _different_ absolute paths across
        machines can sync: a user-configured path map that rewrites the encoded-cwd
        dir name AND the `cwd` header field on import/export. Knowingly crosses

@@ -178,6 +178,24 @@ ssync daemon
 The second machine joins the first machine's namespace and begins syncing. See
 `pairing.md` for what the ticket contains.
 
+## Removing a machine
+
+Revocation has two layers (see `threat-model.md`):
+
+1. **Content:** remove the machine's recipient from every remaining machine's
+   `recipients` and restart the daemons — they detect the changed recipient set
+   and re-encrypt and re-publish everything under the new one.
+2. **Namespace:** the removed machine still holds the namespace secret (index
+   write access), so rotate it: on each remaining machine remove
+   `data_dir/namespace` and re-pair with a fresh `ssync ticket` / `ssync join`
+   (or distribute a new shared namespace secret). The daemon drops abandoned
+   replicas on start.
+
+The clan service does both automatically when you remove the machine from the
+instance: the peer set is part of the namespace generator's identity, so
+membership changes rotate the shared secret on the next deploy. A comparable
+single-artifact flow for non-clan setups is planned (issue #23).
+
 ## Everyday use
 
 Run `ssync daemon` on each machine (the Nix modules do this as a service). Work

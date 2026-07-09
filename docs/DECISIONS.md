@@ -199,11 +199,15 @@ the in-process crate backend is kept disabled (feature `rust-age`) for when it g
 **Key management:** **Per-machine age keypairs with multi-recipient encryption.** Each
 machine holds its own private key and encrypts to every peer's recipient (its own is
 always included), configured via the `recipients` list; the clan service generates and
-distributes recipients automatically. This enables per-device revocation: remove a
-machine's recipient and regenerate, and the remaining daemons re-publish every locally
-materialized session under the new recipient set on their next import pass (decrypt of
-the old winner fails, so the plaintext dedup misses and re-encrypts). Revocation is
-forward-only — blobs already fetched by a revoked machine stay readable to it.
+distributes recipients automatically. This enables per-device revocation, in two layers
+(issue #22): recipients gate *content* — remove a machine's recipient from the remaining
+configs and every daemon re-encrypts and re-publishes all sessions under the new set (the
+recipient set is fingerprinted in the sync state; a mismatch bypasses the plaintext
+dedup). The namespace secret gates *index write access and metadata* — eviction rotates
+the namespace (automatic in the clan service: the peer set is generator-validation, so
+membership changes regenerate the shared secret; the daemon drops abandoned replicas on
+start). Revocation is forward-only — blobs already fetched by a revoked machine stay
+readable to it.
 The original v1 mode — one **shared age identity** on every machine (`recipients = []`) —
 remains supported and is still the simplest choice for low-threat setups.
 
