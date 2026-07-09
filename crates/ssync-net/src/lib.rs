@@ -51,7 +51,7 @@ pub enum PathKind {
     Relay,
     /// Both a direct and a relay address are active (e.g. mid-migration).
     Mixed,
-    /// No active address known (never connected, or state already dropped).
+    /// No direct or relay address active (never connected, or state dropped).
     Unknown,
 }
 
