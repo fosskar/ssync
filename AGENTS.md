@@ -41,7 +41,8 @@ Impure shell around pure decision cores:
   atomically (temp + rename). Never symlink/bind it into the engine.
 - **Encryption (age) is not optional and not deferrable** (§7).
 - **Leaderless** (§4): no code path may assume a special/authority node. **User runs no
-  server** (§6): iroh public defaults + mDNS only.
+  server** (§6): iroh public defaults only (mDNS local discovery is still TODO; today
+  LAN connectivity rides the ticket's embedded addresses).
 - iroh, iroh-docs, iroh-blobs, and age move fast: when unsure of a current API, read the
   crate's actual docs/source — never code from memory.
 
