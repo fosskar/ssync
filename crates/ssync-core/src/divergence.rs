@@ -12,9 +12,9 @@ use ssync_net::iroh_blobs::Hash;
 /// The verdict for one key's version set.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Some blob is not local (or not decryptable) yet — a union over a
-    /// partial version set would transiently drop a fork's lines, so a merge
-    /// is all-or-skip.
+    /// Some blob is not local (or not decryptable) yet, so the plaintext set
+    /// does not cover the version set — a union over a partial set would
+    /// transiently drop a fork's lines, so a merge is all-or-skip.
     Incomplete,
     /// The union equals the winner; nothing to publish.
     Settled,
@@ -22,33 +22,33 @@ pub enum Verdict {
     Diverged(Vec<u8>),
 }
 
-/// Verdict computation plus a per-key cache keyed by the version-set
-/// fingerprint, so a key that still carries a stale second author entry costs
+/// Verdict computation plus a per-key cache keyed by the version set, so a
+/// key that still carries a stale second author entry costs
 /// one lookup per tick instead of re-decrypting every version.
 #[derive(Default)]
 pub struct Divergence {
-    cache: Mutex<HashMap<String, (String, bool)>>,
+    cache: Mutex<HashMap<String, (Vec<Hash>, bool)>>,
 }
 
 impl Divergence {
     /// The cached boolean verdict for exactly this version set, if known.
     pub fn cached(&self, key: &str, versions: &[Hash]) -> Option<bool> {
-        let fp = fingerprint(versions);
         self.cache
             .lock()
             .unwrap()
             .get(key)
-            .and_then(|(f, d)| (*f == fp).then_some(*d))
+            .and_then(|(v, d)| same_version_set(v, versions).then_some(*d))
     }
 
-    /// Decide from plaintexts (`None` = blob unavailable; a set shorter than
-    /// `versions` reads as unavailable too) and cache the boolean verdict.
+    /// Decide from the decrypted plaintexts and cache the boolean verdict.
+    /// A `plaintexts` set that does not cover `versions` one-for-one means
+    /// some blob is unavailable: `Incomplete`, never cached.
     pub fn verdict(
         &self,
         key: &str,
         versions: &[Hash],
         winner: Option<Vec<u8>>,
-        plaintexts: Vec<Option<Vec<u8>>>,
+        plaintexts: Vec<Vec<u8>>,
     ) -> Verdict {
         let Some(winner) = winner else {
             return Verdict::Incomplete;
@@ -56,19 +56,12 @@ impl Divergence {
         if plaintexts.len() != versions.len() {
             return Verdict::Incomplete;
         }
-        let mut pts = Vec::with_capacity(plaintexts.len());
-        for pt in plaintexts {
-            match pt {
-                Some(pt) => pts.push(pt),
-                None => return Verdict::Incomplete,
-            }
-        }
-        let merged = merge_lines(&pts);
+        let merged = merge_lines(&plaintexts);
         let diverged = merged != winner;
         self.cache
             .lock()
             .unwrap()
-            .insert(key.to_string(), (fingerprint(versions), diverged));
+            .insert(key.to_string(), (versions.to_vec(), diverged));
         if diverged {
             Verdict::Diverged(merged)
         } else {
@@ -77,11 +70,11 @@ impl Divergence {
     }
 }
 
-/// Order-insensitive identity of a version set.
-fn fingerprint(versions: &[Hash]) -> String {
-    let mut fp: Vec<String> = versions.iter().map(|h| h.to_string()).collect();
-    fp.sort();
-    fp.join(",")
+/// Order-insensitive multiset equality. Version sets are tiny (one entry per
+/// author), so the quadratic count beats allocating a sorted copy per lookup.
+fn same_version_set(a: &[Hash], b: &[Hash]) -> bool {
+    let count = |set: &[Hash], h: &Hash| set.iter().filter(|x| *x == h).count();
+    a.len() == b.len() && a.iter().all(|h| count(a, h) == count(b, h))
 }
 
 /// Merge append-only session versions: the common prefix (shared chronological
@@ -189,13 +182,14 @@ mod tests {
 
     #[test]
     fn verdict_incomplete_while_any_version_blob_is_missing() {
+        // the engine stops decrypting at the first miss; a short set never merges.
         let d = Divergence::default();
         let versions = [h(1), h(2)];
         let v = d.verdict(
             "k",
             &versions,
             Some(b"h\na\n".to_vec()),
-            vec![Some(b"h\na\n".to_vec()), None],
+            vec![b"h\na\n".to_vec()],
         );
         assert_eq!(v, Verdict::Incomplete);
         assert_eq!(d.cached("k", &versions), None, "incomplete must not cache");
@@ -208,14 +202,14 @@ mod tests {
     }
 
     #[test]
-    fn verdict_incomplete_when_plaintexts_do_not_cover_the_version_set() {
-        // the engine may stop decrypting at the first miss; a short set never merges.
+    fn verdict_incomplete_when_plaintexts_exceed_the_version_set() {
+        // over-coverage is a caller bug; never merge on mismatched sets.
         let d = Divergence::default();
         let v = d.verdict(
             "k",
-            &[h(1), h(2)],
+            &[h(1)],
             Some(b"h\n".to_vec()),
-            vec![Some(b"h\n".to_vec())],
+            vec![b"h\n".to_vec(), b"h\nx\n".to_vec()],
         );
         assert_eq!(v, Verdict::Incomplete);
     }
@@ -226,12 +220,7 @@ mod tests {
         let versions = [h(1), h(2)];
         let short = b"h\na\n".to_vec();
         let long = b"h\na\nb\n".to_vec();
-        let v = d.verdict(
-            "k",
-            &versions,
-            Some(long.clone()),
-            vec![Some(short), Some(long)],
-        );
+        let v = d.verdict("k", &versions, Some(long.clone()), vec![short, long]);
         assert_eq!(v, Verdict::Settled);
         assert_eq!(d.cached("k", &versions), Some(false));
     }
@@ -242,12 +231,7 @@ mod tests {
         let versions = [h(1), h(2)];
         let a = b"h\na1\n".to_vec();
         let b = b"h\nb1\n".to_vec();
-        let v = d.verdict(
-            "k",
-            &versions,
-            Some(a.clone()),
-            vec![Some(a.clone()), Some(b.clone())],
-        );
+        let v = d.verdict("k", &versions, Some(a.clone()), vec![a.clone(), b.clone()]);
         assert_eq!(v, Verdict::Diverged(merge_lines(&[a, b])));
         assert_eq!(d.cached("k", &versions), Some(true));
     }
@@ -257,7 +241,7 @@ mod tests {
         let d = Divergence::default();
         let a = b"h\na1\n".to_vec();
         let b = b"h\nb1\n".to_vec();
-        d.verdict("k", &[h(1), h(2)], Some(a.clone()), vec![Some(a), Some(b)]);
+        d.verdict("k", &[h(1), h(2)], Some(a.clone()), vec![a, b]);
         assert_eq!(d.cached("k", &[h(1), h(3)]), None);
         assert_eq!(d.cached("other", &[h(1), h(2)]), None);
     }
@@ -267,7 +251,19 @@ mod tests {
         let d = Divergence::default();
         let a = b"h\na1\n".to_vec();
         let b = b"h\nb1\n".to_vec();
-        d.verdict("k", &[h(1), h(2)], Some(a.clone()), vec![Some(a), Some(b)]);
+        d.verdict("k", &[h(1), h(2)], Some(a.clone()), vec![a, b]);
         assert_eq!(d.cached("k", &[h(2), h(1)]), Some(true));
+    }
+
+    #[test]
+    fn cache_distinguishes_duplicate_multiplicity() {
+        // same length, same distinct hashes, different multiset — must miss.
+        let d = Divergence::default();
+        let a = b"h\na1\n".to_vec();
+        let b = b"h\nb1\n".to_vec();
+        let versions = [h(1), h(1), h(2)];
+        d.verdict("k", &versions, Some(a.clone()), vec![a.clone(), a, b]);
+        assert_eq!(d.cached("k", &[h(1), h(2), h(2)]), None);
+        assert_eq!(d.cached("k", &versions), Some(true));
     }
 }

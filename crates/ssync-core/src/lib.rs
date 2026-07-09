@@ -259,19 +259,17 @@ impl Engine {
     }
 
     /// The divergence verdict for a key, decrypting whatever the cache cannot
-    /// answer. Decryption stops at the first unavailable blob; the all-or-skip
-    /// gate itself lives in [`Divergence::verdict`].
+    /// answer. Decryption stops at the first unavailable blob; the resulting
+    /// short set reads as incomplete in [`Divergence::verdict`].
     async fn verdict_of(&self, key: &str, winner: Hash, versions: &[Hash]) -> Verdict {
         let winner_pt = self.get_plain(winner).await;
         let mut plaintexts = Vec::with_capacity(versions.len());
         if winner_pt.is_some() {
             for h in versions {
-                let pt = self.get_plain(*h).await;
-                let missing = pt.is_none();
-                plaintexts.push(pt);
-                if missing {
+                let Some(pt) = self.get_plain(*h).await else {
                     break;
-                }
+                };
+                plaintexts.push(pt);
             }
         }
         self.divergence
