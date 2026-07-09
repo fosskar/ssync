@@ -16,9 +16,10 @@ Impure shell around pure decision cores:
 - `ssync` (bin) is the composition root: config → age identity → iroh `Node` → adapters →
   `Engine::run`.
 - `Engine::run` (ssync-core) is one `tokio::select!` loop. Event sources: notify fs
-  watcher, iroh-docs LiveEvents (drained on a dedicated task, forwarded as a bare signal
-  over an **unbounded** channel — bounded subscriber channels deadlock the iroh-docs
-  actor), 15s rescan, 60s resync. Everything funnels into a 400ms-debounced tick.
+  watcher, iroh-docs LiveEvents (drained on a dedicated task, forwarded as a `DocSignal`
+  — relevance ping or learned peer id — over an **unbounded** channel; bounded
+  subscriber channels deadlock the iroh-docs actor), 15s rescan, 60s resync. Everything
+  funnels into a 400ms-debounced tick.
 - Each tick: `local_snapshot` + `index_snapshot` → pure `reconcile()` → `Vec<Action>`
   {Import, WriteFile, DeleteLocal, Tombstone, Merge} → execute → settle into `SyncState`
   (atomic temp+rename to `data_dir/state.toml`).
@@ -63,7 +64,8 @@ Impure shell around pure decision cores:
   modules, nixbot effects.
 - `docs/` — DECISIONS.md, identity.md, pairing.md, setup.md, threat-model.md,
   pi-format-notes.md, claude-code-format-notes.md, codex-format-notes.md,
-  vs-syncthing.md.
+  m3-cross-network.md, vs-syncthing.md, logos/.
+- `TODO.md` — deferred work, ranked; see DECISIONS.md for rationale per item.
 - `.tmp/` — gitignored scratch handed over by the user; **never commit or push it**.
   (Tests do not use it; they create dirs under the system temp dir.)
 
@@ -116,7 +118,7 @@ flake.lock. CI is nixbot building the flake checks; there are no GitHub Actions.
 - Single source of truth: `[workspace.package] version` in root `Cargo.toml`;
   `nix/package.nix` reads it via `lib.importTOML` — never hardcode elsewhere. All crates
   and dep versions inherit from the workspace tables (`workspace = true`); the iroh stack
-  is deliberately minor-pinned.
+  is deliberately pinned (0.x iroh-* crates minor-pinned; `iroh` itself is 1.x, major-pinned).
 - Pre-1.0: feature/breaking → MINOR bump; bugfix/internal → PATCH; MAJOR stays 0 until
   the user declares 1.0. Bump once per user-visible-behavior task; pure refactor/docs/CI
   need no bump. After bumping, run `cargo check` so `Cargo.lock` updates; commit the lockfile.
