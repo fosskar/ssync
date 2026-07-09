@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logos/ssync-logo-transparent.svg" alt="ssync logo" width="200">
+</p>
+
 # ssync
 
 **Continuous, peer-to-peer sync of coding-agent session files across your own machines.**

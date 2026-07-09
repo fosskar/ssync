@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- ssync: leaderless full mesh — every peer syncs with every peer -->
+  <rect width="512" height="512" rx="96" fill="#26251f"/>
+
+  <!-- mesh edges: all pairs connected, drawn under the nodes -->
+  <g stroke="#5f5b50" stroke-width="14" stroke-linecap="round">
+    <line x1="256" y1="96"  x2="416" y2="256"/>
+    <line x1="416" y1="256" x2="256" y2="416"/>
+    <line x1="256" y1="416" x2="96"  y2="256"/>
+    <line x1="96"  y1="256" x2="256" y2="96"/>
+    <line x1="256" y1="96"  x2="256" y2="416"/>
+    <line x1="96"  y1="256" x2="416" y2="256"/>
+  </g>
+
+  <!-- peer nodes -->
+  <circle cx="256" cy="96"  r="36" fill="#9cc2ae"/>
+  <circle cx="416" cy="256" r="36" fill="#9bb5d6"/>
+  <circle cx="256" cy="416" r="36" fill="#cbbfa3"/>
+  <circle cx="96"  cy="256" r="36" fill="#8fb8c9"/>
+</svg>
