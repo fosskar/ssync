@@ -5,9 +5,11 @@
 #
 # clan.vars provides everything so the user configures nothing but the peers:
 #   - a per-machine age key whose public recipient is shared to the other peers
-#     (multi-recipient encryption; revoking a machine = removing it from the
-#     instance and regenerating, remaining daemons re-publish automatically),
-#   - a shared namespace secret (one deterministic namespace, no ticket), and
+#     (multi-recipient encryption),
+#   - a shared namespace secret (one deterministic namespace, no ticket) that
+#     rotates on every membership change: the departed machine keeps only the
+#     abandoned namespace (eviction, issue #22) and every remaining daemon
+#     re-imports under the current recipient set, and
 #   - a per-machine node key whose public node-id is shared to the other peers,
 #     so they auto-connect.
 { self }:
@@ -94,9 +96,12 @@
               '';
             };
 
-            # shared namespace secret — one value across all peers.
+            # shared namespace secret — one value across all peers. The peer
+            # set is part of the generator's identity: any membership change
+            # regenerates the secret, rotating the namespace (issue #22).
             clan.core.vars.generators.ssync-namespace = {
               share = true;
+              validation.peers = lib.concatStringsSep " " (lib.attrNames roles.peer.machines);
               files.secret = {
                 secret = true;
                 deploy = true;
