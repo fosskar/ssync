@@ -321,6 +321,16 @@ impl Node {
         Ok(())
     }
 
+    /// Remember a peer learned at runtime (gossip neighbor, completed sync) as
+    /// a content provider for [`fetch_blob`](Self::fetch_blob) and resync.
+    /// Ticket pairing only records peers on the joining side — the issuer
+    /// starts empty and depends on this to recover missed downloads.
+    pub fn add_peer(&mut self, id: EndpointId) {
+        if !self.peers.contains(&id) {
+            self.peers.push(id);
+        }
+    }
+
     /// Re-initiate sync with the known peers. Live links can die silently
     /// when a peer restarts (one-way sync until reconnect); the daemon calls
     /// this periodically. iroh-docs dedupes already-running syncs.

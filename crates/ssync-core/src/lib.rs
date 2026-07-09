@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use ssync_adapters::{Adapter, SessionIdentity};
 use ssync_crypto::AgeIdentity;
 use ssync_net::Node;
+use ssync_net::iroh::EndpointId;
 use ssync_net::iroh_docs::engine::LiveEvent;
 
 use ssync_net::iroh_blobs::Hash;
@@ -21,10 +22,18 @@ mod reconcile;
 use divergence::{Divergence, Verdict};
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 
+/// What the doc-event drain task forwards to the select loop.
+enum DocSignal {
+    /// A remote index change worth a reconcile tick.
+    Changed,
+    /// A peer seen on the live stream (gossip neighbor or completed sync).
+    Peer(EndpointId),
+}
+
 /// One agent to sync: its name and the session directory to watch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Agent name (`"pi"` or `"omp"`; see `ssync_adapters::adapter_for`).
+    /// Agent name (see `ssync_adapters::adapter_for` for the supported set).
     pub agent: String,
     pub session_dir: PathBuf,
 }
@@ -599,16 +608,28 @@ impl Engine {
         // iroh-docs awaits subscriber sends on bounded channels inside its
         // actor, so an unread subscription wedges the whole store once enough
         // events queue up (a large initial import is enough). Only a relevance
-        // signal crosses to the select loop, over an unbounded channel.
+        // signal (and learned peer ids) crosses to the select loop, over an
+        // unbounded channel.
         let events = self.node.subscribe().await?;
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut events = std::pin::pin!(events);
             while let Some(ev) = events.next().await {
-                if matches!(
-                    ev,
-                    Ok(LiveEvent::InsertRemote { .. }) | Ok(LiveEvent::ContentReady { .. })
-                ) && etx.send(()).is_err()
+                let sig = match ev {
+                    Ok(LiveEvent::InsertRemote { .. }) | Ok(LiveEvent::ContentReady { .. }) => {
+                        Some(DocSignal::Changed)
+                    }
+                    // Ticket pairing records peers on the joining side only;
+                    // the issuer learns its peers here (gossip neighbors and
+                    // completed syncs) so fetch_blob recovery and resync work.
+                    Ok(LiveEvent::NeighborUp(peer)) => Some(DocSignal::Peer(peer)),
+                    Ok(LiveEvent::SyncFinished(e)) if e.result.is_ok() => {
+                        Some(DocSignal::Peer(e.peer))
+                    }
+                    _ => None,
+                };
+                if let Some(sig) = sig
+                    && etx.send(sig).is_err()
                 {
                     break;
                 }
@@ -648,7 +669,15 @@ impl Engine {
                 }
                 ev = erx.recv(), if !events_ended => {
                     match ev {
-                        Some(()) => deadline = Some(tokio::time::Instant::now() + DEBOUNCE),
+                        Some(DocSignal::Changed) => {
+                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                        }
+                        // A new peer may carry content a fetch already missed;
+                        // schedule a tick so the retry happens promptly.
+                        Some(DocSignal::Peer(id)) => {
+                            self.node.add_peer(id);
+                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+                        }
                         // ended stream: disarm this select arm, or it is ready
                         // (None) on every loop iteration and spins the CPU at
                         // 100%; the rescan interval still drives ticks.

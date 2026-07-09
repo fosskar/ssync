@@ -35,6 +35,25 @@ This file-based flow avoids two processes opening the single-writer store at onc
 - iroh's transport is end-to-end encrypted independently of age; age is at-rest
   and defense-in-depth on top.
 
+## Topology (3+ machines)
+
+Two layers behave differently; both verified against the pinned crates
+(iroh-docs/iroh-gossip 0.101, live.rs `NeighborUp` → `sync_with_peer`):
+
+- **Live index sync self-meshes.** Gossip membership is HyParView: joins are
+  forwarded and peers shuffled, so machines that never exchanged tickets still
+  become direct neighbors, and iroh-docs syncs with every new neighbor. A chain
+  of tickets (B and C both joined via A) keeps converging while A is offline,
+  provided B and C are already in the swarm — gossip views live in memory, so
+  a daemon restart only re-dials explicitly known peers (see below).
+- **ssync's own peer list starts narrower but grows.** `Node::peers` — what the
+  missed-blob recovery (`fetch_blob`) and the periodic resync dial — is seeded
+  from the joined ticket (or `peers` in config for the shared-namespace mode)
+  and then extended at runtime from live sync events: every gossip neighbor and
+  successfully synced peer is remembered. So a ticket issuer, which starts with
+  no peers at all, learns its joiners as soon as they connect. Learned peers
+  are in-memory only; a restart falls back to the seeded list.
+
 ## Discovery and connectivity
 
 - On a LAN, peers can find each other via mDNS.

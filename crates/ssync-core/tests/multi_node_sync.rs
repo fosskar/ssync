@@ -715,3 +715,41 @@ async fn sync_recovers_when_peer_comes_up_late() {
         "session never reached the late peer (no periodic re-sync)"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
+    // The ticket issuer starts with an empty peer list (`join` only records
+    // peers on the joining side), so a missed content download on the issuer
+    // is unrecoverable unless it learns the joiner from live sync events.
+    let base = scratch("learn-peer");
+    let age = AgeIdentity::generate().unwrap().to_secret_string();
+
+    let root_a = base.join("a/sessions");
+    std::fs::create_dir_all(&root_a).unwrap();
+    let root_b = base.join("b/sessions");
+    let rel = "--proj--/2026-01-01T00-00-00-000Z_019efeeed0001eee71acbe20learn0001.jsonl";
+    let src = root_b.join(rel);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    let contents = b"content the issuer failed to auto-download\n";
+    std::fs::write(&src, contents).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_a.create_namespace().await.unwrap();
+    // The issuer misses every live content download — the prod failure mode
+    // (iroh-docs never retries), made deterministic.
+    node_a.disable_auto_download().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    node_b.join(ticket).await.unwrap();
+
+    let mut engine_a = pi_engine(&root_a, &age, node_a);
+    let sa = base.join("a/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
+    let mut engine_b = pi_engine(&root_b, &age, node_b);
+    let sb = base.join("b/status.toml");
+    tokio::spawn(async move { engine_b.run(&sb).await });
+
+    let dest = root_a.join(rel);
+    let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;
+    assert!(ok, "issuer never learned the joiner as a fetch peer");
+}
