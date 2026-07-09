@@ -222,6 +222,11 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     }
     let mut identity = load_identity(&config.age_identity_path)?;
     identity.add_recipients(config.recipients.iter().cloned());
+    if config.recipients.is_empty() {
+        eprintln!(
+            "ssync: shared-identity mode (`recipients` empty); per-machine keys enable revocation, see docs/setup.md"
+        );
+    }
 
     let node_key_path = config
         .node_key_path
