@@ -11,14 +11,14 @@ and writes incoming sessions back so the agent can `--resume` them anywhere.
 
 ## Status
 
-Early. v1 targets the **pi** agent only and is under active construction. See
+Early. Supports the **pi** and **omp** agents and is under active construction. See
 `docs/DECISIONS.md` for the design rationale.
 
 ## What it is / isn't
 
 - ✅ Syncs session **files** across your machines, peer-to-peer, automatically.
 - ✅ Encrypted at rest by default ([age](https://github.com/FiloSottile/age)).
-- ✅ Self-converging: diverged append-only sessions are merged losslessly (pi), and
+- ✅ Self-converging: diverged append-only sessions are merged losslessly, and
   deletions propagate.
 - ✅ No central server, no VPS, no relay you have to run. Internet sync uses iroh's free
   public discovery + hole-punching (which only ever sees ciphertext).

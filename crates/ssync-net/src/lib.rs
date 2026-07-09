@@ -5,9 +5,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use futures_lite::{Stream, StreamExt};
-use iroh::endpoint::presets;
+use iroh::endpoint::{TransportAddrUsage, presets};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use iroh_blobs::api::downloader::Shuffled;
 use iroh_blobs::store::fs::{FsStore, options::Options as FsStoreOptions};
 use iroh_blobs::store::{GcConfig, ProtectCb};
@@ -38,6 +38,39 @@ pub struct IndexRecord {
     pub winner_ts: u64,
     pub winner: Option<Hash>,
     pub versions: Vec<Hash>,
+}
+
+/// Which kind of transport path a peer connection currently uses — the
+/// evidence for the cross-network check: `Relay`/`Mixed` proves the relay
+/// bootstrap works; `Direct` is the punched p2p fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Only direct IP addresses are active.
+    Direct,
+    /// Only a relay address is active (no direct path punched yet).
+    Relay,
+    /// Both a direct and a relay address are active (e.g. mid-migration).
+    Mixed,
+    /// No direct or relay address active (never connected, or state dropped).
+    Unknown,
+}
+
+impl std::fmt::Display for PathKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Mixed => "mixed",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// One known peer and how it is currently reachable.
+#[derive(Debug, Clone)]
+pub struct PeerPath {
+    pub id: EndpointId,
+    pub kind: PathKind,
 }
 
 /// A fresh random 32-byte key seed (usable as a node key or namespace secret).
@@ -242,6 +275,40 @@ impl Node {
     /// This node's dialable address (node-id plus known transport addresses).
     pub fn endpoint_addr(&self) -> EndpointAddr {
         self.endpoint.addr()
+    }
+
+    /// Snapshot of how each known peer is currently reachable, classified from
+    /// the active transport addresses iroh reports. Duplicate peer entries
+    /// (join + resync both remember peers) are reported once.
+    pub async fn peer_paths(&self) -> Vec<PeerPath> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(self.peers.len());
+        for id in &self.peers {
+            if !seen.insert(*id) {
+                continue;
+            }
+            let mut direct = false;
+            let mut relay = false;
+            if let Some(info) = self.endpoint.remote_info(*id).await {
+                for addr in info.addrs() {
+                    if matches!(addr.usage(), TransportAddrUsage::Active) {
+                        match addr.addr() {
+                            TransportAddr::Ip(_) => direct = true,
+                            TransportAddr::Relay(_) => relay = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let kind = match (direct, relay) {
+                (true, true) => PathKind::Mixed,
+                (true, false) => PathKind::Direct,
+                (false, true) => PathKind::Relay,
+                (false, false) => PathKind::Unknown,
+            };
+            out.push(PeerPath { id: *id, kind });
+        }
+        out
     }
 
     /// Start syncing the active namespace with the given peer addresses; the
@@ -528,6 +595,57 @@ mod tests {
         tokio::time::sleep(GC_TEST_INTERVAL * 4).await;
         assert_eq!(node.get_blob(hash).await.unwrap(), b"keep-me".to_vec());
 
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_paths_observe_active_direct_path_once_connected() {
+        let (da, db) = (tempdir("paths-a"), tempdir("paths-b"));
+        let mut a = Node::spawn(&da, SecretKey::generate()).await.unwrap();
+        let mut b = Node::spawn(&db, SecretKey::generate()).await.unwrap();
+        let secret = generate_key_bytes();
+        a.open_shared_namespace(secret).await.unwrap();
+        b.open_shared_namespace(secret).await.unwrap();
+        let (addr_a, addr_b) = (a.endpoint_addr(), b.endpoint_addr());
+        let id_a = addr_a.id;
+        a.sync_with(vec![addr_b]).await.unwrap();
+        b.sync_with(vec![addr_a]).await.unwrap();
+        a.publish("pi/p/s", b"ciphertext".to_vec()).await.unwrap();
+
+        // poll: the connection (and its path classification) settles async.
+        // Direct = localhost only; Mixed allowed because on a networked dev
+        // machine the n0 relay may also be active — the invariant is that the
+        // direct localhost path is observed, not that the relay is absent.
+        let mut kind = PathKind::Unknown;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if let Some(p) = b.peer_paths().await.iter().find(|p| p.id == id_a) {
+                kind = p.kind;
+                if matches!(kind, PathKind::Direct | PathKind::Mixed) {
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(kind, PathKind::Direct | PathKind::Mixed),
+            "in-process peers must show an active direct path, got {kind}"
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_paths_report_unconnected_peer_once_as_unknown() {
+        let dir = tempdir("paths-unknown");
+        let mut node = Node::spawn(&dir, SecretKey::generate()).await.unwrap();
+        node.create_namespace().await.unwrap();
+        let bogus = EndpointAddr::from(SecretKey::generate().public());
+        // remembered twice (join + resync do this in prod) — reported once
+        node.sync_with(vec![bogus.clone()]).await.unwrap();
+        node.sync_with(vec![bogus]).await.unwrap();
+        let paths = node.peer_paths().await;
+        assert_eq!(paths.len(), 1, "duplicate peer entries must be deduped");
+        assert_eq!(paths[0].kind, PathKind::Unknown);
         node.shutdown().await.unwrap();
     }
 
