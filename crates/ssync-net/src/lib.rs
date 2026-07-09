@@ -272,6 +272,31 @@ impl Node {
         Ok(id)
     }
 
+    /// Drop every replica in the docs store other than the active namespace.
+    /// Namespace rotation is the eviction mechanism (issue #22): a revoked
+    /// peer still holds the old namespace secret (= write capability), so the
+    /// old replica must not linger — dropping it also unprotects its blobs
+    /// for GC. Returns the dropped namespace ids.
+    pub async fn drop_stale_replicas(&mut self) -> Result<Vec<NamespaceId>> {
+        let keep = self.doc()?.id();
+        let mut stale = Vec::new();
+        let mut replicas = self.docs.api().list().await.context("listing replicas")?;
+        while let Some(item) = replicas.next().await {
+            let (id, _cap) = item?;
+            if id != keep {
+                stale.push(id);
+            }
+        }
+        for id in &stale {
+            self.docs
+                .api()
+                .drop_doc(*id)
+                .await
+                .with_context(|| format!("dropping stale replica {id}"))?;
+        }
+        Ok(stale)
+    }
+
     /// This node's dialable address (node-id plus known transport addresses).
     pub fn endpoint_addr(&self) -> EndpointAddr {
         self.endpoint.addr()

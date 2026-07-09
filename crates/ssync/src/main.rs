@@ -268,6 +268,12 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         std::fs::write(config.data_dir.join("ticket"), ticket.to_string())?;
     }
 
+    // namespace rotation = eviction (issue #22): abandon replicas the current
+    // config no longer names, so a revoked peer cannot keep syncing them.
+    for ns in node.drop_stale_replicas().await? {
+        println!("ssync: dropped stale namespace {ns}");
+    }
+
     let adapters = config
         .agents
         .iter()
