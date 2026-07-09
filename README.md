@@ -26,7 +26,7 @@ active construction. See `docs/DECISIONS.md` for the design rationale.
 - ❌ Not a live "continue a running process on another machine" tool.
 - ❌ Not an agent orchestrator or dashboard (see cctl, ccmanager, etc. for that).
 
-## How it works (one paragraph)
+## How it works
 
 Every machine runs the same daemon — there is no hub. Each daemon watches the agent's
 session directory, encrypts changed sessions with age, and publishes them into a shared,
@@ -39,24 +39,19 @@ namespace secret and each machine's node-id), then sync directly via iroh discov
 hole-punching.
 
 ```mermaid
-flowchart TB
-    subgraph A["Machine A"]
-        sA["session dirs<br>(~/.pi, ~/.omp, …)"] <-- "watch /<br>write back" --> dA["ssync daemon<br>+ full replica"]
-    end
-    subgraph B["Machine B"]
-        sB["session dirs"] <-- "watch /<br>write back" --> dB["ssync daemon<br>+ full replica"]
-    end
-    subgraph C["Machine C"]
-        sC["session dirs"] <-- "watch /<br>write back" --> dC["ssync daemon<br>+ full replica"]
-    end
+flowchart LR
+    A["<b>Machine A</b><br>ssync daemon + full replica<br>⇄ session dirs (~/.pi, ~/.omp, …)"]
+    B["<b>Machine B</b><br>ssync daemon + full replica<br>⇄ session dirs"]
+    C["<b>Machine C</b><br>ssync daemon + full replica<br>⇄ session dirs"]
 
-    dA <-- "p2p sync<br>(encrypted)" --> dB
-    dB <-- "p2p sync<br>(encrypted)" --> dC
-    dA <-- "p2p sync<br>(encrypted)" --> dC
+    A <--> B
+    B <--> C
+    A <--> C
 ```
 
-No hub, no server: every daemon holds a full replica, and adding a machine is just one
-more identical daemon joining the namespace. The swarm self-meshes via gossip
+No hub, no server: the machine-to-machine links are direct p2p sync carrying only
+age ciphertext. Every daemon holds a full replica, adding a machine is just one more
+identical daemon joining the namespace, and the swarm self-meshes via gossip
 regardless of which machine you paired through.
 
 ## Quick start
