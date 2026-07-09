@@ -143,6 +143,18 @@ pub struct StatusReport {
     pub namespace: Option<String>,
     pub sessions: usize,
     pub conflicts: Vec<String>,
+    /// Known peers and the transport path each connection uses (direct /
+    /// relay / mixed / unknown) — the evidence for the cross-network check.
+    /// Defaulted so a status.toml from an older daemon still parses.
+    #[serde(default)]
+    pub peers: Vec<PeerStatus>,
+}
+
+/// One peer as shown by `ssync status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub id: String,
+    pub path: String,
 }
 
 /// The sync engine for one node: one or more agent adapters (pi, omp, ...)
@@ -304,10 +316,21 @@ impl Engine {
                 conflicts.push(rel);
             }
         }
+        let peers = self
+            .node
+            .peer_paths()
+            .await
+            .into_iter()
+            .map(|p| PeerStatus {
+                id: p.id.to_string(),
+                path: p.kind.to_string(),
+            })
+            .collect();
         Ok(StatusReport {
             namespace: self.node.namespace().map(|n| n.to_string()),
             sessions,
             conflicts,
+            peers,
         })
     }
 
@@ -922,5 +945,41 @@ mod tests {
             Verdict::Settled
         );
         assert_eq!(engine.divergence.cached("k", &[h1, h2, hu]), Some(false));
+    }
+
+    #[tokio::test]
+    async fn status_report_lists_known_peers_with_path_kind() {
+        let base = std::env::temp_dir().join(format!("ssync-status-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        let bogus = ssync_net::iroh::SecretKey::generate().public();
+        node.sync_with(vec![ssync_net::iroh::EndpointAddr::from(bogus)])
+            .await
+            .unwrap();
+        let engine = Engine::new(
+            PiAdapter::new("pi", base.join("sessions")),
+            AgeIdentity::generate().unwrap(),
+            node,
+        );
+        let report = engine.status_report().await.unwrap();
+        assert_eq!(report.peers.len(), 1);
+        assert_eq!(report.peers[0].id, bogus.to_string());
+        assert_eq!(report.peers[0].path, "unknown");
+    }
+
+    #[test]
+    fn status_report_parses_without_peers_field() {
+        // status.toml written by an older daemon has no peers table
+        let report: StatusReport = toml::from_str(
+            r#"
+            sessions = 3
+            conflicts = []
+            "#,
+        )
+        .unwrap();
+        assert!(report.peers.is_empty());
     }
 }

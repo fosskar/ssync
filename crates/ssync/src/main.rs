@@ -309,6 +309,9 @@ fn cmd_status(config_path: &Path) -> Result<()> {
     println!("namespace: {}", s.namespace.as_deref().unwrap_or("(none)"));
     println!("sessions:  {}", s.sessions);
     println!("conflicts: {}", s.conflicts.len());
+    for p in &s.peers {
+        println!("peer:      {} ({})", p.id, p.path);
+    }
     if let Some(age) = age {
         println!("updated:   {}s ago", age.as_secs());
     }
