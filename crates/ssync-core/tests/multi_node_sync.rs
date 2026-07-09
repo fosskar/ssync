@@ -742,12 +742,27 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     let ticket = node_a.share().await.unwrap();
     node_b.join(ticket).await.unwrap();
 
-    let mut engine_a = pi_engine(&root_a, &age, node_a);
-    let sa = base.join("a/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
     let mut engine_b = pi_engine(&root_b, &age, node_b);
     let sb = base.join("b/status.toml");
     tokio::spawn(async move { engine_b.run(&sb).await });
+
+    // Deterministic ordering: wait until the joiner's entry reached the
+    // issuer's index *before* the issuer's engine (and thus its event
+    // subscription) exists — every live peer event has then already fired
+    // unheard, so only the persisted-peer seed can recover the download.
+    let mut synced = false;
+    for _ in 0..60 {
+        if !node_a.index_records().await.unwrap().is_empty() {
+            synced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(synced, "joiner's entry never reached the issuer's index");
+
+    let mut engine_a = pi_engine(&root_a, &age, node_a);
+    let sa = base.join("a/status.toml");
+    tokio::spawn(async move { engine_a.run(&sa).await });
 
     let dest = root_a.join(rel);
     let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;

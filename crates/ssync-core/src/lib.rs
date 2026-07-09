@@ -475,6 +475,13 @@ impl Engine {
         // signal (and learned peer ids) crosses to the select loop, over an
         // unbounded channel.
         let events = self.node.subscribe().await?;
+        // Peer events fired before this subscription existed are lost (the
+        // ticket issuer would otherwise wait a full peer resync interval to
+        // learn the joiner). iroh-docs persists synced peers before emitting
+        // the event, so seeding after subscribing leaves no gap.
+        if let Err(e) = self.node.load_persisted_peers().await {
+            eprintln!("ssync: loading persisted peers: {e:#}");
+        }
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut events = std::pin::pin!(events);

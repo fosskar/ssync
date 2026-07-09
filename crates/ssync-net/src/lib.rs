@@ -331,6 +331,20 @@ impl Node {
         }
     }
 
+    /// Seed the fetch-peer list from the peers iroh-docs persisted for the
+    /// active namespace (it registers every successfully synced peer before
+    /// emitting the corresponding live event). Events fired before
+    /// [`subscribe`](Self::subscribe) existed are lost; the store is not, so
+    /// subscribing and then seeding leaves no gap — and covers restarts.
+    pub async fn load_persisted_peers(&mut self) -> Result<()> {
+        if let Some(peers) = self.doc()?.get_sync_peers().await? {
+            for bytes in peers {
+                self.add_peer(EndpointId::from_bytes(&bytes)?);
+            }
+        }
+        Ok(())
+    }
+
     /// Re-initiate sync with the known peers. Live links can die silently
     /// when a peer restarts (one-way sync until reconnect); the daemon calls
     /// this periodically. iroh-docs dedupes already-running syncs.
