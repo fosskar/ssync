@@ -16,7 +16,9 @@ use ssync_net::iroh_docs::engine::LiveEvent;
 use ssync_net::iroh_blobs::Hash;
 
 pub mod cleanup;
+mod divergence;
 mod reconcile;
+use divergence::{Divergence, Verdict};
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 
 /// One agent to sync: its name and the session directory to watch.
@@ -155,11 +157,9 @@ pub struct Engine {
     state_path: Option<PathBuf>,
     /// Merges already announced (log once, not per tick).
     merged_logged: std::collections::HashSet<String>,
-    /// Divergence verdict per key, keyed by the distinct-hash fingerprint of
-    /// its author entries. Skips re-decrypting sessions whose version set has
-    /// not changed — without it every status write decrypts every session that
-    /// still carries a stale second author entry.
-    divergence_cache: std::sync::Mutex<std::collections::HashMap<String, (String, bool)>>,
+    /// Cached divergence verdicts; skips re-decrypting sessions whose version
+    /// set has not changed (e.g. a stale second author entry on every tick).
+    divergence: Divergence,
     /// How often the daemon re-initiates sync with the known peers.
     resync_interval: std::time::Duration,
 }
@@ -181,7 +181,7 @@ impl Engine {
             state: SyncState::default(),
             state_path: None,
             merged_logged: Default::default(),
-            divergence_cache: Default::default(),
+            divergence: Divergence::default(),
             resync_interval: std::time::Duration::from_secs(60),
         }
     }
@@ -258,35 +258,24 @@ impl Engine {
             .identify(path)
     }
 
-    /// The one divergence verdict: does the union of `versions` differ from
-    /// `winner`? `None` (uncached) while any blob is missing — a partial union
-    /// would be transiently lossy. Cached by version-set fingerprint.
-    async fn is_diverged(&self, key: &str, winner: Hash, versions: &[Hash]) -> Option<bool> {
-        let mut fingerprint: Vec<String> = versions.iter().map(|h| h.to_string()).collect();
-        fingerprint.sort();
-        let fingerprint = fingerprint.join(",");
-        if let Some((fp, verdict)) = self.divergence_cache.lock().unwrap().get(key)
-            && *fp == fingerprint
-        {
-            return Some(*verdict);
-        }
-        let winner_pt = self.get_plain(winner).await?;
-        let plaintexts = self.all_plaintexts(versions).await?;
-        let divergent = merge_lines(&plaintexts) != winner_pt;
-        self.divergence_cache
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (fingerprint, divergent));
-        Some(divergent)
-    }
-
-    /// Decrypt every version blob, or `None` while any is still downloading.
-    async fn all_plaintexts(&self, versions: &[Hash]) -> Option<Vec<Vec<u8>>> {
+    /// The divergence verdict for a key, decrypting whatever the cache cannot
+    /// answer. Decryption stops at the first unavailable blob; the all-or-skip
+    /// gate itself lives in [`Divergence::verdict`].
+    async fn verdict_of(&self, key: &str, winner: Hash, versions: &[Hash]) -> Verdict {
+        let winner_pt = self.get_plain(winner).await;
         let mut plaintexts = Vec::with_capacity(versions.len());
-        for h in versions {
-            plaintexts.push(self.get_plain(*h).await?);
+        if winner_pt.is_some() {
+            for h in versions {
+                let pt = self.get_plain(*h).await;
+                let missing = pt.is_none();
+                plaintexts.push(pt);
+                if missing {
+                    break;
+                }
+            }
         }
-        Some(plaintexts)
+        self.divergence
+            .verdict(key, versions, winner_pt, plaintexts)
     }
 
     /// One index scan: live session count plus the still-diverged sessions
@@ -306,7 +295,14 @@ impl Engine {
             let Some(rel) = self.relative_of(&key).map(str::to_string) else {
                 continue;
             };
-            if self.is_diverged(&key, winner, &rec.versions).await == Some(true) {
+            let diverged = match self.divergence.cached(&key, &rec.versions) {
+                Some(d) => d,
+                None => matches!(
+                    self.verdict_of(&key, winner, &rec.versions).await,
+                    Verdict::Diverged(_)
+                ),
+            };
+            if diverged {
                 conflicts.push(rel);
             }
         }
@@ -322,9 +318,9 @@ impl Engine {
         self.identity.decrypt(&ciphertext).ok()
     }
 
-    /// Publish the lossless union for a diverged key; [`is_diverged`]
-    /// (Self::is_diverged) gates it, so a settled key costs one cache lookup.
-    /// Returns the relative path when it published.
+    /// Publish the lossless union for a diverged key; the cached verdict gates
+    /// it, so a settled key costs one lookup. Returns the relative path when
+    /// it published.
     async fn merge_one(&self, key: &str) -> Result<Option<String>> {
         let Some(rel) = self.relative_of(key).map(str::to_string) else {
             return Ok(None);
@@ -339,13 +335,12 @@ impl Engine {
         if rec.versions.len() <= 1 {
             return Ok(None);
         }
-        if self.is_diverged(key, winner, &rec.versions).await != Some(true) {
+        if self.divergence.cached(key, &rec.versions) == Some(false) {
             return Ok(None);
         }
-        let Some(plaintexts) = self.all_plaintexts(&rec.versions).await else {
+        let Verdict::Diverged(merged) = self.verdict_of(key, winner, &rec.versions).await else {
             return Ok(None);
         };
-        let merged = merge_lines(&plaintexts);
         let ciphertext = self.identity.encrypt(&merged)?;
         self.node.publish(key.to_string(), ciphertext).await?;
         Ok(Some(rel))
@@ -668,43 +663,6 @@ impl ImportOutcome {
     }
 }
 
-/// Merge append-only session versions: the common prefix (shared chronological
-/// history, duplicates intact) followed by each fork's remaining lines, deduped
-/// only across versions (a line both forks appended stays single; a duplicate
-/// within one version survives). Version order is content-derived, so every
-/// peer computes the identical merge. Lossless — safe for pi, whose sessions
-/// only ever grow (compaction is an appended marker, never a rewrite; see
-/// docs/pi-format-notes.md).
-fn merge_lines(versions: &[Vec<u8>]) -> Vec<u8> {
-    let mut split: Vec<Vec<&[u8]>> = versions
-        .iter()
-        .map(|v| v.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect())
-        .collect();
-    split.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-
-    let mut prefix = split.first().map_or(0, |v| v.len());
-    for v in &split[1..] {
-        prefix = (0..prefix.min(v.len()))
-            .take_while(|&i| v[i] == split[0][i])
-            .count();
-    }
-
-    let mut lines: Vec<&[u8]> = split.first().map_or(Vec::new(), |v| v[..prefix].to_vec());
-    let mut emitted: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-    for v in &split {
-        let suffix = &v[prefix..];
-        lines.extend(suffix.iter().filter(|l| !emitted.contains(*l)));
-        emitted.extend(suffix.iter().copied());
-    }
-
-    let mut out = Vec::new();
-    for line in &lines {
-        out.extend_from_slice(line);
-        out.push(b'\n');
-    }
-    out
-}
-
 /// Metadata stamp `(mtime_micros, len)` used to detect whether a file changed;
 /// mtime is on the iroh-docs microsecond scale so it compares against index
 /// timestamps directly (used for the resurrection guard in `reconcile`).
@@ -874,64 +832,6 @@ mod tests {
         assert_eq!(cfg.node_key_path, None);
     }
 
-    #[test]
-    fn merge_preserves_duplicate_lines_within_a_version() {
-        // two identical entries (same bytes) in one version must both survive.
-        let a = b"h\nx\nx\na1\n".to_vec();
-        let b = b"h\nx\nx\nb1\n".to_vec();
-        let m = String::from_utf8(merge_lines(&[a, b])).unwrap();
-        assert_eq!(
-            m.lines().filter(|l| *l == "x").count(),
-            2,
-            "duplicate entry collapsed: {m:?}"
-        );
-    }
-
-    #[test]
-    fn merge_is_deterministic_regardless_of_input_order() {
-        let a = b"h\na1\n".to_vec();
-        let b = b"h\nb1\n".to_vec();
-        assert_eq!(
-            merge_lines(&[a.clone(), b.clone()]),
-            merge_lines(&[b, a]),
-            "peers feeding versions in different order must converge"
-        );
-    }
-
-    #[test]
-    fn merge_keeps_common_history_in_order() {
-        // shared prefix must stay chronological, fork suffixes appended after.
-        let a = b"h\nc1\nc2\na1\n".to_vec();
-        let b = b"h\nc1\nc2\nb1\nb2\n".to_vec();
-        let m = String::from_utf8(merge_lines(&[a, b])).unwrap();
-        let lines: Vec<&str> = m.lines().collect();
-        assert_eq!(&lines[..3], &["h", "c1", "c2"], "prefix reordered: {m:?}");
-        assert_eq!(lines.len(), 6);
-    }
-
-    #[test]
-    fn merge_superset_is_the_superset() {
-        let short = b"h\na\nb\n".to_vec();
-        let long = b"h\na\nb\nc\n".to_vec();
-        assert_eq!(merge_lines(&[short, long.clone()]), long);
-    }
-
-    #[test]
-    fn merge_fork_unions_all_lines_losslessly() {
-        let a = b"h\na1\na2\n".to_vec();
-        let b = b"h\na1\nb2\n".to_vec();
-        let m = merge_lines(&[a, b]);
-        let s = String::from_utf8(m).unwrap();
-        for line in ["h", "a1", "a2", "b2"] {
-            assert!(s.lines().any(|l| l == line), "missing {line} in {s:?}");
-        }
-        assert_eq!(
-            s.lines().filter(|l| *l == "h").count(),
-            1,
-            "header duplicated"
-        );
-    }
-
     #[tokio::test]
     async fn tick_imports_encrypted_and_round_trips_decrypted() {
         let base = std::env::temp_dir().join(format!("ssync-core-{}", std::process::id()));
@@ -985,9 +885,13 @@ mod tests {
         let h1 = engine.node.add_blob(v1).await.unwrap();
         let missing = Hash::new(b"never-added");
 
-        assert_eq!(engine.is_diverged("pi/p/s", h1, &[h1, missing]).await, None);
-        assert!(
-            engine.divergence_cache.lock().unwrap().is_empty(),
+        assert_eq!(
+            engine.verdict_of("pi/p/s", h1, &[h1, missing]).await,
+            Verdict::Incomplete
+        );
+        assert_eq!(
+            engine.divergence.cached("pi/p/s", &[h1, missing]),
+            None,
             "partial verdict must not be cached"
         );
     }
@@ -1008,32 +912,17 @@ mod tests {
         let h1 = engine.node.add_blob(enc(b"h\na\n")).await.unwrap();
         let h2 = engine.node.add_blob(enc(b"h\nb\n")).await.unwrap();
 
-        assert_eq!(engine.is_diverged("k", h2, &[h1, h2]).await, Some(true));
-        assert_eq!(
-            engine
-                .divergence_cache
-                .lock()
-                .unwrap()
-                .get("k")
-                .map(|(_, v)| *v),
-            Some(true)
-        );
+        let Verdict::Diverged(union) = engine.verdict_of("k", h2, &[h1, h2]).await else {
+            panic!("fork must read as diverged");
+        };
+        assert_eq!(engine.divergence.cached("k", &[h1, h2]), Some(true));
 
         // once the union is the winner, the same key settles
-        let union = merge_lines(&[b"h\na\n".to_vec(), b"h\nb\n".to_vec()]);
         let hu = engine.node.add_blob(enc(&union)).await.unwrap();
         assert_eq!(
-            engine.is_diverged("k", hu, &[h1, h2, hu]).await,
-            Some(false)
+            engine.verdict_of("k", hu, &[h1, h2, hu]).await,
+            Verdict::Settled
         );
-        assert_eq!(
-            engine
-                .divergence_cache
-                .lock()
-                .unwrap()
-                .get("k")
-                .map(|(_, v)| *v),
-            Some(false)
-        );
+        assert_eq!(engine.divergence.cached("k", &[h1, h2, hu]), Some(false));
     }
 }
