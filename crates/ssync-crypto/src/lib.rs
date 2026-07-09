@@ -78,6 +78,15 @@ impl AgeIdentity {
         self.recipient.clone()
     }
 
+    /// Every recipient this identity encrypts to (own plus extras), sorted —
+    /// the canonical form for detecting recipient-set changes.
+    pub fn recipients(&self) -> Vec<String> {
+        let mut all = self.extra_recipients.clone();
+        all.push(self.recipient.clone());
+        all.sort_unstable();
+        all
+    }
+
     /// Extend the encryption recipient set with peer recipients (their machines
     /// can then decrypt what this one publishes). Own recipient stays included;
     /// duplicates are dropped.

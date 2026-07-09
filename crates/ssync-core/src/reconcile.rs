@@ -69,6 +69,11 @@ pub struct KeyState {
 #[derive(Debug, Default)]
 pub struct SyncState {
     pub keys: HashMap<String, KeyState>,
+    /// Fingerprint of the recipient set the published blobs were encrypted to.
+    /// A mismatch with the configured set forces a full re-publish (issue #22:
+    /// plaintext dedup alone would keep old ciphertext readable by a removed
+    /// key and unreadable by an added one).
+    pub recipients: Option<String>,
 }
 
 impl SyncState {
@@ -101,6 +106,7 @@ impl SyncState {
     /// resumes instead of re-verifying every session. Small: one row per key.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let dto = StateFile {
+            recipients: self.recipients.clone(),
             keys: self
                 .keys
                 .iter()
@@ -117,23 +123,29 @@ impl SyncState {
     /// Load persisted state; absent or unreadable file ⇒ fresh state (the
     /// engine then re-verifies, which is always safe — just slower).
     pub fn load(path: &Path) -> Self {
-        let keys = std::fs::read_to_string(path)
+        let Some(dto) = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| toml::from_str::<StateFile>(&text).ok())
-            .map(|dto| {
-                dto.keys
-                    .into_iter()
-                    .filter_map(|(k, s)| Some((k, s.try_into().ok()?)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self { keys }
+        else {
+            return Self::default();
+        };
+        Self {
+            recipients: dto.recipients,
+            keys: dto
+                .keys
+                .into_iter()
+                .filter_map(|(k, s)| Some((k, s.try_into().ok()?)))
+                .collect(),
+        }
     }
 }
 
 /// On-disk form of [`SyncState`] (`data_dir/state.toml`).
 #[derive(Serialize, Deserialize)]
 struct StateFile {
+    // scalar first: TOML requires values before tables (the keys map).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipients: Option<String>,
     keys: HashMap<String, KeyStateDto>,
 }
 
@@ -353,6 +365,7 @@ mod tests {
                 .iter()
                 .map(|(k, s)| (k.to_string(), s.clone()))
                 .collect(),
+            recipients: None,
         }
     }
 

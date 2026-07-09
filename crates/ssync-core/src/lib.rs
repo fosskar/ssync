@@ -50,6 +50,13 @@ pub struct Engine {
     divergence: Divergence,
     /// How often the daemon re-initiates sync with the known peers.
     resync_interval: std::time::Duration,
+    /// Fingerprint of the configured recipient set (sorted, hashed).
+    recipients_fp: String,
+    /// Set while a recipient-set rotation is re-publishing (issue #22);
+    /// cleared once a pass completes with no import errors.
+    rotation_pending: bool,
+    /// Import failures in the current pass; a rotation only settles at zero.
+    import_errors: usize,
 }
 
 impl Engine {
@@ -62,6 +69,7 @@ impl Engine {
         identity: AgeIdentity,
         node: Node,
     ) -> Self {
+        let recipients_fp = Hash::new(identity.recipients().join("\n")).to_string();
         Self {
             adapters,
             identity,
@@ -71,6 +79,9 @@ impl Engine {
             merged_logged: Default::default(),
             divergence: Divergence::default(),
             resync_interval: std::time::Duration::from_secs(60),
+            recipients_fp,
+            rotation_pending: false,
+            import_errors: 0,
         }
     }
 
@@ -120,16 +131,20 @@ impl Engine {
 
     /// Read → encrypt → blob → upsert index. Dedups on *plaintext* (age
     /// ciphertext is randomized), or the exporter's own write-back echoes.
+    /// `force` (recipient-set rotation) bypasses the dedup: the plaintext is
+    /// unchanged but the encryption no longer matches the configured set.
     async fn import_action(
         &self,
         key: &str,
         path: &Path,
         winner: Option<Hash>,
+        force: bool,
     ) -> Result<ImportOutcome> {
         let plaintext = tokio::fs::read(path)
             .await
             .with_context(|| format!("reading session file {}", path.display()))?;
-        if let Some(w) = winner
+        if !force
+            && let Some(w) = winner
             && self.get_plain(w).await.as_deref() == Some(&plaintext)
         {
             return Ok(ImportOutcome::Unchanged(w));
@@ -325,6 +340,23 @@ impl Engine {
     /// One pass: snapshot both sides, [`reconcile`], execute. The daemon loop
     /// and tests drive this same path. Returns whether anything changed.
     pub async fn tick_once(&mut self) -> bool {
+        // Recipient-set rotation (issue #22): a changed set invalidates every
+        // published blob's encryption even though no plaintext changed, so
+        // clear the import stamps once and re-publish with the dedup bypassed.
+        if !self.rotation_pending
+            && self
+                .state
+                .recipients
+                .as_ref()
+                .is_some_and(|stored| *stored != self.recipients_fp)
+        {
+            self.rotation_pending = true;
+            for ks in self.state.keys.values_mut() {
+                ks.import_stamp = None;
+            }
+        }
+        self.import_errors = 0;
+
         let local = self.local_snapshot();
         let index = match self.index_snapshot().await {
             Ok(i) => i,
@@ -336,6 +368,12 @@ impl Engine {
         let mut changed = false;
         for action in reconcile(&self.state, &local, &index) {
             changed |= self.execute(&action).await;
+        }
+        // the rotation (or a fresh state) settles only after a clean pass, so
+        // a failed import keeps forcing until every blob is re-encrypted.
+        if self.import_errors == 0 && (self.rotation_pending || self.state.recipients.is_none()) {
+            self.state.recipients = Some(self.recipients_fp.clone());
+            self.rotation_pending = false;
         }
         // prune state for keys gone from both dir and index
         let live: std::collections::HashSet<&str> = local
@@ -361,12 +399,16 @@ impl Engine {
                 path,
                 stamp,
                 winner,
-            } => match self.import_action(key, path, *winner).await {
+            } => match self
+                .import_action(key, path, *winner, self.rotation_pending)
+                .await
+            {
                 Ok(outcome) => {
                     self.state.settle_import(key, *stamp, outcome.hash());
                     matches!(outcome, ImportOutcome::Published(_))
                 }
                 Err(e) => {
+                    self.import_errors += 1;
                     eprintln!("ssync: import {}: {e:#}", path.display());
                     false
                 }
