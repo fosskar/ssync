@@ -18,3 +18,6 @@ ssync-net.workspace = true
 tokio.workspace = true
 clap.workspace = true
 toml.workspace = true
+
+[lints]
+workspace = true

@@ -14,6 +14,9 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/fosskar/ssync"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 anyhow = "1"
 age = "0.11"

@@ -14,3 +14,6 @@ iroh-gossip.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 futures-lite.workspace = true
+
+[lints]
+workspace = true
