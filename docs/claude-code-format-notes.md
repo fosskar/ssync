@@ -34,18 +34,20 @@ remains doc-claimed only — re-verify before flipping the merge gate.
 
 ## Append-only status: partially verified, merge still gated
 
-Verified on a real file (2.1.205, 2026-07-09): resume (`claude -p --resume
-<id>`) appended new records to the same file; the prior bytes stayed a
-byte-identical prefix (`cmp -n` check). Layout and identity claims above were
-confirmed against the same file.
+Verified on a real file (2.1.205, 2026-07-09, unauthenticated flow): resume
+(`claude -p --resume <id>`) appended records to the same file with the prior
+bytes a byte-identical prefix (`cmp -n`). Caveat: the run was unauthenticated,
+so the appended turn was the CLI's synthetic auth-error exchange — this proves
+the transcript writer appends on resume, not how real assistant/tool turns
+grow the file. Layout and identity claims above were confirmed against the
+same file and hold regardless.
 
-Still unverified: `/compact` and rewind/fork file-level behavior — docs say
-compaction appends a summary entry (no truncation) and the SDK store contract
-is append/load, but neither was exercised (needs an authed session long
-enough to compact). Those are precisely the risky operations for the
-line-union merge, so `ClaudeCodeAdapter::append_only()` stays **false**
-(newest-wins) until a real session file is diffed across a compaction and a
-rewind. Flip criteria in issue #6.
+Still unverified: real conversational growth, `/compact`, and rewind/fork
+file-level behavior (all need an authed session). Those are precisely the
+risky operations for the line-union merge, so
+`ClaudeCodeAdapter::append_only()` stays **false** (newest-wins) until a real
+authed session is diffed across normal turns, a compaction, and a rewind.
+Flip criteria in issue #6.
 
 ## Adapter mapping
 
