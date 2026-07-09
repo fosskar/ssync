@@ -45,14 +45,15 @@ better, one of the modules below (they need the flake input anyway).
 {
   imports = [ inputs.ssync.homeManagerModules.default ];
   services.ssync.enable = true;
-  # agents defaults to pi at ~/.pi/agent/sessions; the age key is auto-generated.
+  # agents defaults to pi and omp at the user's home; the age key is auto-generated.
   # For multi-machine: either share one key via ageIdentityFile, or keep the
   # auto-generated per-machine key and list the peers' recipients:
   # services.ssync.recipients = [ "age1pq1..." ];
-  # To also sync omp (oh-my-pi) sessions:
+  # To also sync Claude Code sessions (newest-wins on conflict):
   # services.ssync.agents = [
   #   { agent = "pi";  sessionDir = "${config.home.homeDirectory}/.pi/agent/sessions"; }
   #   { agent = "omp"; sessionDir = "${config.home.homeDirectory}/.omp/agent/sessions"; }
+  #   { agent = "claude-code"; sessionDir = "${config.home.homeDirectory}/.claude/projects"; }
   # ];
 }
 ```
@@ -65,7 +66,8 @@ better, one of the modules below (they need the flake input anyway).
   services.ssync = {
     enable = true;
     user = "alice";
-    # agents defaults to pi at alice's ~/.pi/agent/sessions; age key auto-generated.
+    # agents defaults to pi and omp at the configured user's home; the age key
+    # is auto-generated.
   };
 }
 ```

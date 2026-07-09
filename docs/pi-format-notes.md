@@ -10,7 +10,8 @@ session file. Re-verify against the installed pi version before relying on this.
 ```
 
 - Config dir defaults to `~/.pi`; `getSessionsDir() = getAgentDir() + "/sessions"`.
-- The omp fork uses `~/.omp/agent/` — out of scope for v1.
+- The omp fork uses `~/.omp/agent/` — same layout, synced through the same adapter
+  (`"pi" | "omp"` share `PiAdapter`).
 
 ## Per-project subdirectory = encoded absolute cwd
 
@@ -51,7 +52,8 @@ requirement that a project must live at the **same absolute path on every machin
   just another appended entry of `type:"compaction"` (a summary marker), not an in-place
   rewrite.
 - Therefore merge IS safe for pi (union lines, keep the header once, order by per-entry
-  `timestamp`/`id`). v1 still ships newest-wins (DECISIONS §8); merge stays a TODO.
+  `timestamp`/`id`) — shipped as the lossless line-union merge (DECISIONS §8), live for
+  pi and omp.
 
 ## Write pattern
 

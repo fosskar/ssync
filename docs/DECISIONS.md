@@ -139,9 +139,9 @@ deduplicated, resumable).
 - `iroh-blobs` (first-class) → content-addressed transfer of the actual session files.
 - `iroh-docs` (see status note below) → the synced index + conflict metadata.
 
-**Status note (verified June 2026):** iroh core is at **v1.0.0-rc.1** (stable, 8.7k
+**Status note (verified July 2026):** iroh core is at **v1.0.1** (stable, 8.7k
 stars, 563 dependents). iroh-blobs is first-class and healthy. **iroh-docs is maintained
-and tracks core releases (latest v0.100.0, same day as the 1.0 RC) but is a pre-1.0,
+and tracks core releases (v0.101.0) but is a pre-1.0,
 minor crate (56 stars).** We accept this: its model fits exactly and it's the lowest-code
 path. The risk is occasional breaking changes across its 0.x releases and a small
 community. If iroh-docs is ever abandoned, the architecture is unchanged — the CRDT-index
@@ -273,7 +273,9 @@ as its own boxed `impl Adapter` in the same engine — genuinely plug-in, no eng
 pi/omp format is known (verified from source): per-session append-only JSONL at
 `<root>/<encoded-cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in the filename, append-only
 confirmed (so merge is safe — §8). The cwd-encoding differs between pi and omp but identity
-never decodes it (the dir name is opaque). Remaining agents stay in the repo TODO. See
+never decodes it (the dir name is opaque). claude-code and codex adapters have since
+shipped (newest-wins until append-only is verified — issues #6/#7); remaining agents
+stay in the repo TODO. See
 docs/pi-format-notes.md.
 
 **Superseded:** an earlier draft scoped v1 to **pi only** to keep the pipeline and test
@@ -359,7 +361,7 @@ encrypt/decrypt (DECISIONS §7), so that combination was the real risk and it ho
 | Infra the user runs | **None.** LAN via mDNS (planned — TODO.md); internet via iroh's free public relay (ciphertext only) |
 | Encryption          | **age, on by default**, PQ-hybrid if a mature plugin exists; shared identity across machines |
 | Conflicts (v1)      | No lease; detect + keep-both; **lossless line-union merge** for pi (newest-wins fallback)    |
-| agents              | **pi + omp** (share pi layout); more via boxed plug-in `Adapter`s, one per agent             |
+| agents              | **pi + omp** (share pi layout, merge) + **claude-code, codex** (newest-wins); more via boxed `Adapter`s |
 | Boundary            | **Watch-and-import**, never sync-in-place                                                    |
 | Language            | **Rust**, single binary                                                                      |
 | Packaging           | plain binary → Nix flake (HM + NixOS modules) → optional clan wrapper                        |
