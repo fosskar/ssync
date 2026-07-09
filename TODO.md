@@ -1,9 +1,8 @@
 # ssync — TODO
 
 Deferred work, captured so v1 stays small. See DECISIONS.md for rationale on each.
-Open items are ranked highest gain first. Note: almost nothing here is a compute-
-performance item, so "gain" means expected user-facing value (reliability,
-connectivity, UX) — say the word if you meant literal perf and want a re-sort.
+Open items are ranked highest expected user-facing value (reliability,
+connectivity, UX) first.
 
 ## Open
 
