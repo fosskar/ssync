@@ -157,7 +157,8 @@ in
         # tokio workers otherwise pin the peak-import high-water mark as RSS.
         Environment = [ "MALLOC_ARENA_MAX=2" ];
 
-        # --- hardening ---
+        # --- hardening (parity with the home-manager module and `ssync service
+        # install`, crates/ssync/src/service.rs — change all three together) ---
         # The daemon needs: RW to the session dirs (under $HOME) and its StateDirectory,
         # read access to the secrets it is pointed at (/run/secrets, /nix/store),
         # and outbound QUIC/UDP plus netlink for iroh. Everything else is denied.

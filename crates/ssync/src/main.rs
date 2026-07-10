@@ -1,5 +1,7 @@
 // ssync — p2p sync of coding-agent session files. See docs/DECISIONS.md.
 
+mod service;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -59,15 +61,33 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Install or remove a hardened systemd unit running the daemon.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Generate an iroh node key at PATH; print its node-id (for clan.vars).
     KeygenNode { path: PathBuf },
     /// Generate a shared namespace secret at PATH (for clan.vars).
     KeygenNamespace { path: PathBuf },
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Write the unit and `enable --now` it (user unit; system unit as root).
+    Install {
+        /// Run the system unit as this user (root-only; user units need none).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Disable the unit, delete it, and reload systemd.
+    Uninstall,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config_explicit = cli.config.is_some();
     let config_path = match cli.config {
         Some(p) => p,
         None => Config::default_path()?,
@@ -86,6 +106,12 @@ async fn main() -> Result<()> {
             unnamed,
             apply,
         } => cmd_cleanup(&config_path, agent, keep, before, unnamed, apply),
+        Command::Service { action } => match action {
+            ServiceAction::Install { user } => {
+                service::cmd_service_install(&config_path, config_explicit, user)
+            }
+            ServiceAction::Uninstall => service::cmd_service_uninstall(),
+        },
         Command::KeygenNode { path } => {
             let bytes = ssync_net::generate_key_bytes();
             write_secret_bytes(&path, &bytes)?;
