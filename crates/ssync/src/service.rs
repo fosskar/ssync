@@ -30,7 +30,7 @@ pub struct ServiceSpec {
 /// `RuntimeDirectory` for SecretFile, read access to the secrets it is
 /// pointed at, and outbound QUIC/UDP plus netlink for iroh; everything else
 /// is denied.
-const HARDENING: &str = "\
+pub(crate) const HARDENING: &str = "\
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -61,19 +61,21 @@ SystemCallArchitectures=native
 UMask=0077
 ";
 
-/// Refuse specs a unit file cannot carry verbatim: systemd expands `%`
+/// Refuse a value a unit file cannot carry verbatim: systemd expands `%`
 /// specifiers in every interpolated setting, splits `ReadWritePaths` on
 /// whitespace, and `"`/`\` alter its quoting — better one loud install
 /// error than a unit that silently means something else.
+pub(crate) fn ensure_unit_safe(value: &str, what: &str) -> Result<()> {
+    ensure!(
+        !value.contains(['%', '"', '\\']) && !value.chars().any(|c| c.is_whitespace()),
+        "{what} `{value}` contains characters a systemd unit cannot carry \
+         (whitespace, %, \", \\)"
+    );
+    Ok(())
+}
+
 pub fn validate_spec(spec: &ServiceSpec) -> Result<()> {
-    let check = |value: &str, what: &str| -> Result<()> {
-        ensure!(
-            !value.contains(['%', '"', '\\']) && !value.chars().any(|c| c.is_whitespace()),
-            "{what} `{value}` contains characters a systemd unit cannot carry \
-             (whitespace, %, \", \\)"
-        );
-        Ok(())
-    };
+    let check = ensure_unit_safe;
     check(&spec.exec.display().to_string(), "binary path")?;
     check(&spec.config_path.display().to_string(), "config path")?;
     for p in &spec.read_write_paths {
@@ -137,21 +139,21 @@ pub fn render_unit(spec: &ServiceSpec) -> String {
     )
 }
 
-/// Where the user-manager unit lives (`$XDG_CONFIG_HOME/systemd/user/`).
-pub fn user_unit_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("systemd/user/ssync.service")
+/// Where the user-manager units live (`$XDG_CONFIG_HOME/systemd/user/`).
+pub fn user_unit_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("systemd/user")
 }
 
-/// The unit file the current invocation manages.
-fn unit_path_for(user_mode: bool) -> Result<PathBuf> {
+/// The directory whose units the current invocation manages.
+pub(crate) fn unit_dir(user_mode: bool) -> Result<PathBuf> {
     Ok(if user_mode {
-        user_unit_path(&dirs::config_dir().context("no config dir")?)
+        user_unit_dir(&dirs::config_dir().context("no config dir")?)
     } else {
-        PathBuf::from(SYSTEM_UNIT_PATH)
+        PathBuf::from(SYSTEM_UNIT_DIR)
     })
 }
 
-const SYSTEM_UNIT_PATH: &str = "/etc/systemd/system/ssync.service";
+const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
 const UNIT_NAME: &str = "ssync.service";
 
 /// System-mode configs must not use `~/` paths: install expands them with
@@ -164,7 +166,7 @@ pub fn config_uses_tilde(raw: &str) -> bool {
 
 /// Effective uid, via the ownership of this process's own /proc entry
 /// (std has no geteuid, and the workspace forbids unsafe/libc).
-fn is_root() -> Result<bool> {
+pub(crate) fn is_root() -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata("/proc/self").context("reading /proc/self (uid check)")?;
     Ok(meta.uid() == 0)
@@ -201,7 +203,7 @@ fn daemon_path(search_path: &str) -> Result<(String, Vec<PathBuf>)> {
     Ok((path, bins))
 }
 
-fn systemctl(user_mode: bool, args: &[&str]) -> Result<()> {
+pub(crate) fn systemctl(user_mode: bool, args: &[&str]) -> Result<()> {
     let mut cmd = Command::new("systemctl");
     if user_mode {
         cmd.arg("--user");
@@ -242,13 +244,13 @@ fn missing_components(p: &Path) -> Vec<PathBuf> {
 
 /// Identity the system-mode daemon runs as, resolved via `id` (std has no
 /// passwd lookup). `groups` includes the primary gid.
-struct ServiceUser {
+pub(crate) struct ServiceUser {
     uid: u32,
     gid: u32,
     groups: Vec<u32>,
 }
 
-fn service_user_of(user: &str) -> Result<ServiceUser> {
+pub(crate) fn service_user_of(user: &str) -> Result<ServiceUser> {
     let lookup = |flag: &str| -> Result<String> {
         let out = Command::new("id")
             .args([flag, user])
@@ -294,7 +296,7 @@ fn mode_allows(meta: &fs::Metadata, who: &ServiceUser, bits: u32) -> bool {
 /// (x) on every ancestor, `leaf_bits` on the leaf. A root install resolving
 /// root-only locations (0700 /root, nix profiles) otherwise becomes a
 /// runtime crash-loop under `User=`.
-fn check_access(path: &Path, who: &ServiceUser, leaf_bits: u32) -> Result<()> {
+pub(crate) fn check_access(path: &Path, who: &ServiceUser, leaf_bits: u32) -> Result<()> {
     let mut cur = Some(path);
     while let Some(p) = cur {
         let meta =
@@ -315,7 +317,7 @@ fn check_access(path: &Path, who: &ServiceUser, leaf_bits: u32) -> Result<()> {
 /// Create the write paths 0700. A root (system-mode) install chowns every
 /// component it created to the service user — the daemon runs as `User=` and
 /// root-owned dirs would fail it on first start.
-fn create_write_paths(paths: &[PathBuf], owner: Option<&ServiceUser>) -> Result<()> {
+pub(crate) fn create_write_paths(paths: &[PathBuf], owner: Option<&ServiceUser>) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     for p in paths {
         let created = missing_components(p);
@@ -410,7 +412,7 @@ pub fn cmd_service_install(
     };
     validate_spec(&spec)?;
 
-    let unit_path = unit_path_for(user_mode)?;
+    let unit_path = unit_dir(user_mode)?.join(UNIT_NAME);
     if let Some(parent) = unit_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -446,7 +448,7 @@ pub fn cmd_service_install(
 
 pub fn cmd_service_uninstall() -> Result<()> {
     let user_mode = !is_root()?;
-    let unit_path = unit_path_for(user_mode)?;
+    let unit_path = unit_dir(user_mode)?.join(UNIT_NAME);
     if !unit_path.exists() {
         bail!(
             "nothing to uninstall: {} does not exist",
@@ -552,10 +554,10 @@ mod tests {
     }
 
     #[test]
-    fn user_unit_path_is_under_the_user_manager_dir() {
+    fn user_unit_dir_is_under_the_user_manager_dir() {
         assert_eq!(
-            user_unit_path(Path::new("/home/alice/.config")),
-            PathBuf::from("/home/alice/.config/systemd/user/ssync.service")
+            user_unit_dir(Path::new("/home/alice/.config")),
+            PathBuf::from("/home/alice/.config/systemd/user")
         );
     }
 

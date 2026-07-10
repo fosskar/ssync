@@ -27,6 +27,55 @@ let
       session_dir = "${a.sessionDir}"
     '') cfg.agents
   );
+  cleanupArgs = lib.concatStringsSep " " (
+    lib.optionals (cfg.autoCleanup.keep != null) [
+      "--keep"
+      cfg.autoCleanup.keep
+    ]
+    ++ lib.optional cfg.autoCleanup.unnamed "--unnamed"
+  );
+  # --- hardening (parity with the NixOS module and `ssync service install`,
+  # crates/ssync/src/service.rs — change all three together) ---
+  # The daemon needs: RW to the session dirs and dataDir (both under
+  # $HOME), the RuntimeDirectory for age key temp files, read access to
+  # the secrets it is pointed at, and outbound QUIC/UDP plus netlink for
+  # iroh. Everything else is denied. Sandboxing in user units needs
+  # unprivileged user namespaces (default on NixOS; some distros restrict).
+  # The cleanup oneshot reuses the same set (it only deletes session files).
+  hardening = {
+    ReadWritePaths = (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ];
+    RuntimeDirectory = "ssync";
+    NoNewPrivileges = true;
+    ProtectSystem = "strict";
+    ProtectHome = "read-only";
+    PrivateTmp = true;
+    PrivateDevices = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectControlGroups = true;
+    ProtectProc = "invisible";
+    ProcSubset = "pid";
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK";
+    LockPersonality = true;
+    MemoryDenyWriteExecute = true;
+    RemoveIPC = true;
+    CapabilityBoundingSet = "";
+    AmbientCapabilities = "";
+    SystemCallFilter = [
+      "@system-service"
+      "~@privileged"
+      "~@resources"
+    ];
+    SystemCallErrorNumber = "EPERM";
+    SystemCallArchitectures = "native";
+    UMask = "0077";
+  };
 in
 {
   options.services.ssync = {
@@ -98,9 +147,50 @@ in
       defaultText = lib.literalExpression ''"''${config.xdg.dataHome}/ssync"'';
       description = "ssync's own managed state (node key, blobs, docs, index).";
     };
+
+    autoCleanup = {
+      enable = lib.mkEnableOption ''
+        scheduled session cleanup. Deletions propagate MESH-WIDE: the daemon
+        tombstones every pruned session and all peers delete their copies, so
+        a timer on one machine prunes all machines (enabling it on several is
+        harmless but redundant)
+      '';
+
+      schedule = lib.mkOption {
+        type = lib.types.str;
+        default = "weekly";
+        example = "*-*-* 03:00:00";
+        description = "systemd `OnCalendar` expression for the cleanup timer.";
+      };
+
+      keep = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "90d";
+        description = ''
+          Delete sessions created more than this long ago (`ssync cleanup
+          --keep`; `<n>` + `d`/`w`/`m`/`y`). Null to select by `unnamed` only.
+        '';
+      };
+
+      unnamed = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Also delete sessions whose title record is present but empty
+          (combines with `keep` as AND).
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !cfg.autoCleanup.enable || cfg.autoCleanup.keep != null || cfg.autoCleanup.unnamed;
+        message = "services.ssync.autoCleanup selects nothing: set keep or unnamed";
+      }
+    ];
+
     # ReadWritePaths requires the paths to exist at unit start.
     systemd.user.tmpfiles.rules = map (d: "d \"${d}\" 0700 - - -") (
       (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ]
@@ -125,47 +215,33 @@ in
           # point it at the unit's own (writable) RuntimeDirectory.
           "XDG_RUNTIME_DIR=%t/ssync"
         ];
+      }
+      // hardening;
+    };
 
-        # --- hardening (parity with the NixOS module and `ssync service install`,
-        # crates/ssync/src/service.rs — change all three together) ---
-        # The daemon needs: RW to the session dirs and dataDir (both under
-        # $HOME), the RuntimeDirectory for age key temp files, read access to
-        # the secrets it is pointed at, and outbound QUIC/UDP plus netlink for
-        # iroh. Everything else is denied. Sandboxing in user units needs
-        # unprivileged user namespaces (default on NixOS; some distros restrict).
-        ReadWritePaths = (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ];
-        RuntimeDirectory = "ssync";
-        NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ProtectHome = "read-only";
-        PrivateTmp = true;
-        PrivateDevices = true;
-        ProtectClock = true;
-        ProtectHostname = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectKernelLogs = true;
-        ProtectControlGroups = true;
-        ProtectProc = "invisible";
-        ProcSubset = "pid";
-        RestrictNamespaces = true;
-        RestrictRealtime = true;
-        RestrictSUIDSGID = true;
-        RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK";
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
-        RemoveIPC = true;
-        CapabilityBoundingSet = "";
-        AmbientCapabilities = "";
-        SystemCallFilter = [
-          "@system-service"
-          "~@privileged"
-          "~@resources"
-        ];
-        SystemCallErrorNumber = "EPERM";
-        SystemCallArchitectures = "native";
-        UMask = "0077";
+    # scheduled cleanup: prune old sessions via the plain cleanup CLI; the
+    # running daemon tombstones the deletions and every peer follows.
+    systemd.user.services.ssync-cleanup = lib.mkIf cfg.autoCleanup.enable {
+      Unit = {
+        Description = "ssync scheduled session cleanup";
+        After = [ "ssync.service" ];
       };
+      Service = {
+        Type = "oneshot";
+        ExecStart = "${cfg.package}/bin/ssync --config ${configFile} cleanup ${cleanupArgs} --apply";
+      }
+      // hardening;
+    };
+
+    systemd.user.timers.ssync-cleanup = lib.mkIf cfg.autoCleanup.enable {
+      Unit.Description = "ssync scheduled session cleanup timer";
+      Timer = {
+        OnCalendar = cfg.autoCleanup.schedule;
+        # a machine that slept through the window catches up on next login
+        Persistent = true;
+        RandomizedDelaySec = "1h";
+      };
+      Install.WantedBy = [ "timers.target" ];
     };
   };
 }

@@ -1,5 +1,6 @@
 // ssync — p2p sync of coding-agent session files. See docs/DECISIONS.md.
 
+mod cleanup_timer;
 mod service;
 
 use std::path::{Path, PathBuf};
@@ -61,6 +62,12 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Manage a systemd timer running `ssync cleanup --apply` on a schedule.
+    /// Deletions propagate to every peer: one machine's timer prunes all.
+    CleanupTimer {
+        #[command(subcommand)]
+        action: CleanupTimerAction,
+    },
     /// Install or remove a hardened systemd unit running the daemon.
     Service {
         #[command(subcommand)]
@@ -82,6 +89,33 @@ enum ServiceAction {
     },
     /// Disable the unit, delete it, and reload systemd.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum CleanupTimerAction {
+    /// Install and start the timer/service pair (user units; system as root).
+    Enable {
+        /// Schedule: `2d`, `7d`, `weekly`, or a raw systemd calendar expression.
+        #[arg(long)]
+        every: String,
+        /// Delete sessions older than this (e.g. 30d, 6w, 3m, 1y). Defaults
+        /// to 90d unless --unnamed is the only selector.
+        #[arg(long)]
+        keep: Option<String>,
+        /// Also delete sessions whose title record is present but empty.
+        #[arg(long)]
+        unnamed: bool,
+        /// Only this agent's sessions (default: all configured agents).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Run cleanup as this user (root-only; user units need none).
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Stop the timer, delete both units, and reload systemd.
+    Disable,
+    /// Show the timer's systemd status.
+    Status,
 }
 
 #[tokio::main]
@@ -111,6 +145,25 @@ async fn main() -> Result<()> {
                 service::cmd_service_install(&config_path, config_explicit, user)
             }
             ServiceAction::Uninstall => service::cmd_service_uninstall(),
+        },
+        Command::CleanupTimer { action } => match action {
+            CleanupTimerAction::Enable {
+                every,
+                keep,
+                unnamed,
+                agent,
+                user,
+            } => cleanup_timer::cmd_enable(
+                &config_path,
+                config_explicit,
+                every,
+                keep,
+                unnamed,
+                agent,
+                user,
+            ),
+            CleanupTimerAction::Disable => cleanup_timer::cmd_disable(),
+            CleanupTimerAction::Status => cleanup_timer::cmd_status(),
         },
         Command::KeygenNode { path } => {
             let bytes = ssync_net::generate_key_bytes();
