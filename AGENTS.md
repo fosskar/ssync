@@ -92,8 +92,8 @@ The nix build serializes tests (`--test-threads=1`; parallel in-process iroh nod
 each other under CI load) — mimic with `cargo test -- --test-threads=1` when two-node
 tests flake locally. Never `nix shell nixpkgs#cargo …` — registry nixpkgs drifts from
 flake.lock. CI is nixbot building the flake checks; the only GitHub Action is
-`.github/workflows/release.yml` (auto-release on version bump, gated on
-`nix build .#default`).
+`.github/workflows/release.yml` (auto-release on version bump, gated on nixbot's
+check runs — it builds nothing itself).
 
 ## Code Conventions & Common Patterns
 
@@ -130,10 +130,10 @@ flake.lock. CI is nixbot building the flake checks; the only GitHub Action is
 - Pre-1.0: feature/breaking → MINOR bump; bugfix/internal → PATCH; MAJOR stays 0 until
   the user declares 1.0. Bump once per user-visible-behavior task; pure refactor/docs/CI
   need no bump. After bumping, run `cargo check` so `Cargo.lock` updates; commit the lockfile.
-- Version bumps are manual; releases are not: `.github/workflows/release.yml` runs
-  `nix build .#default` (checkPhase = test suite) on any push to main whose workspace
-  version has no tag yet, then tags `v0.x.y` + creates the GitHub release. Never tag
-  by hand.
+- Version bumps are manual; releases are not: on any push to main whose workspace
+  version has no tag yet, `.github/workflows/release.yml` waits for nixbot's check
+  runs to go green on that commit, then tags `v0.x.y` + creates the GitHub release.
+  Never tag by hand.
 
 ### VCS
 
