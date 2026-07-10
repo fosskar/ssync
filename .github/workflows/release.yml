@@ -1,0 +1,37 @@
+name: release
+# Version bumps are manual (workspace version in Cargo.toml); releasing is not:
+# every push to main whose version has no v-tag yet gets built and, on success,
+# tagged + released automatically. The nix build's checkPhase runs the test
+# suite, so a broken bump can never become a release. Full CI (nix flake
+# check, incl. VM tests) stays nixbot's job.
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write # creates the git tag + github release
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Cheap gate first: most pushes carry no version bump and skip the build.
+      - name: check for unreleased version
+        id: gate
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/v$version")" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: cachix/install-nix-action@v31
+        if: steps.gate.outputs.release == 'true'
+      - name: build and test
+        if: steps.gate.outputs.release == 'true'
+        run: nix build .#default
+      - name: tag and github release
+        if: steps.gate.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ steps.gate.outputs.version }}" --generate-notes --target "$GITHUB_SHA"
