@@ -44,6 +44,29 @@ inputs.ssync.url = "github:fosskar/ssync";
 and use `inputs.ssync.packages.<system>.default` — or better, one of the modules
 below (they need the flake input anyway).
 
+### systemd service (non-nix)
+
+For plain-binary deployments, `ssync service install` writes a hardened unit
+and enables it (`ssync init` first — install reads the config to open the
+sandbox for exactly the session dirs and `data_dir`, creating them if missing):
+
+- as a regular user: a user unit at `~/.config/systemd/user/ssync.service`,
+  enabled and started immediately.
+- as root: a system unit at `/etc/systemd/system/ssync.service`. Pass
+  `--user <name>` (sessions, keys, and watched dirs are per-user, so the daemon
+  runs as that user) and an explicit `--config` whose paths are absolute (`~/`
+  would expand differently for root and the service user).
+
+`age`/`age-keygen` are resolved at install time and pinned in the unit's
+`PATH`, so a key setup that works in your shell keeps working under systemd.
+`ssync service uninstall` disables the unit, removes it, and reloads systemd.
+
+The unit carries the same hardening set as the nix modules below. Sandboxing in
+user units needs unprivileged user namespaces (default on most distros; some
+kernels restrict them — if the service fails with a namespace error, check
+`sysctl kernel.unprivileged_userns_clone`). Not on systemd? The daemon is a
+plain foreground process; a cron `@reboot` line or any supervisor works.
+
 ### home-manager module (recommended — sessions are per-user)
 
 ```nix

@@ -126,7 +126,8 @@ in
           "XDG_RUNTIME_DIR=%t/ssync"
         ];
 
-        # --- hardening (parity with the NixOS module, user-manager adapted) ---
+        # --- hardening (parity with the NixOS module and `ssync service install`,
+        # crates/ssync/src/service.rs — change all three together) ---
         # The daemon needs: RW to the session dirs and dataDir (both under
         # $HOME), the RuntimeDirectory for age key temp files, read access to
         # the secrets it is pointed at, and outbound QUIC/UDP plus netlink for
