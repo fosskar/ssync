@@ -65,7 +65,8 @@ Impure shell around pure decision cores:
 - `docs/` — DECISIONS.md, identity.md, pairing.md, setup.md, threat-model.md,
   pi-format-notes.md, claude-code-format-notes.md, codex-format-notes.md,
   m3-cross-network.md, vs-syncthing.md, logos/.
-- `TODO.md` — deferred work, ranked; see DECISIONS.md for rationale per item.
+- Deferred work lives in the GitHub issue tracker, not a repo file; DECISIONS.md
+  carries the rationale per item.
 - `.tmp/` — gitignored scratch handed over by the user; **never commit or push it**.
   (Tests do not use it; they create dirs under the system temp dir.)
 

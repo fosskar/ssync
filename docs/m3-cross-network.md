@@ -51,5 +51,5 @@ The relay never holds a decryption key. See docs/threat-model.md.
 
 ## Result
 
-Record the outcome (date, networks used, observed path kinds) in TODO.md and
-tick the M3 item.
+Record the outcome (date, networks used, observed path kinds) in the tracking
+issue (the 2026-07-09 run is recorded in issue #5, closed).

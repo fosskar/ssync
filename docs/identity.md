@@ -63,4 +63,4 @@ written independently on two machines — a conflict (see DECISIONS §3, §8).
 Supporting projects at *different* absolute paths across machines would require a
 user-configured path map that rewrites both the encoded-cwd directory name and the
 `cwd` header field on import/export. That knowingly crosses the store-as-is rule,
-so it is opt-in and deferred (see `../TODO.md`).
+so it is opt-in and deferred (issue #13).

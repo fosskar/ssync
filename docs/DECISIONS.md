@@ -148,6 +148,13 @@ community. If iroh-docs is ever abandoned, the architecture is unchanged — the
 box could be refilled with automerge or yrs over iroh transport+blobs. **We are choosing
 iroh-docs deliberately, with eyes open.**
 
+**Amended (2026-07, for the record):** iroh-docs awaits subscriber sends on bounded
+channels inside its actor, so a subscriber that stops reading while awaiting a docs RPC
+wedges the whole store (repro: ssync's `event_flood` test before the drain-task fix;
+related closed issue n0-computer/iroh-docs#81 removed `blocking_send` but kept the
+awaited bounded send). Decided against reporting upstream: ssync's drain-task +
+unbounded-channel workaround is **permanent, not transitional**.
+
 ---
 
 ## 6. No relay the user has to run; NAT bootstrap via iroh's free public infrastructure
@@ -156,7 +163,7 @@ iroh-docs deliberately, with eyes open.**
 
 - **On a LAN** (both machines on the same network, e.g. at home): peers discover each
   other via **mDNS local discovery**. Genuinely zero infrastructure, no internet involved.
-  (Not yet implemented — see TODO.md; today LAN connectivity rides the ticket's
+  (Not yet implemented — issue #10; today LAN connectivity rides the ticket's
   embedded direct addresses.)
 - **Across the internet** (laptop on mobile data, desktop at home): discovery and NAT-
   traversal bootstrap go through **iroh's built-in public discovery + relay infrastructure
@@ -278,8 +285,8 @@ pi/omp format is known (verified from source): per-session append-only JSONL at
 `<root>/<encoded-cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in the filename, append-only
 confirmed (so merge is safe — §8). The cwd-encoding differs between pi and omp but identity
 never decodes it (the dir name is opaque). claude-code and codex adapters have since
-shipped (newest-wins until append-only is verified — issues #6/#7); remaining agents
-stay in the repo TODO. See
+shipped (newest-wins until append-only is verified — #25, history in #6/#7); remaining
+agents are tracked in the issue tracker (#8, #20). See
 docs/pi-format-notes.md.
 
 **Superseded:** an earlier draft scoped v1 to **pi only** to keep the pipeline and test
@@ -371,7 +378,7 @@ encrypt/decrypt (DECISIONS §7), so that combination was the real risk and it ho
 | Identity            | `(agent, project, session_id)`; machine is provenance metadata only                          |
 | Topology            | **Leaderless p2p**, all peers equal; no hub/server                                           |
 | Sync stack          | **iroh** (transport) + **iroh-docs** (CRDT index) + **iroh-blobs** (file transfer)           |
-| Infra the user runs | **None.** LAN via mDNS (planned — TODO.md); internet via iroh's free public relay (ciphertext only) |
+| Infra the user runs | **None.** LAN via mDNS (planned — issue #10); internet via iroh's free public relay (ciphertext only) |
 | Encryption          | **age, on by default**, PQ-hybrid if a mature plugin exists; shared identity across machines |
 | Conflicts (v1)      | No lease; detect + keep-both; **lossless line-union merge** for pi (newest-wins fallback)    |
 | agents              | **pi + omp** (share pi layout, merge) + **claude-code, codex** (newest-wins); more via boxed `Adapter`s |

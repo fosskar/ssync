@@ -57,8 +57,8 @@ Two layers behave differently; both verified against the pinned crates
 
 ## Discovery and connectivity
 
-- On a LAN, peers will find each other via mDNS (not yet implemented — see
-  TODO.md; today LAN connectivity rides the ticket's embedded direct addresses).
+- On a LAN, peers will find each other via mDNS (not yet implemented — issue #10;
+  today LAN connectivity rides the ticket's embedded direct addresses).
 - Across the internet, iroh's public discovery + relay infrastructure bootstraps
   the connection; once a direct path is punched, data flows peer-to-peer. The
   relay only ever carries ciphertext, and only as a fallback.
