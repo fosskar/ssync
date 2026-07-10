@@ -21,6 +21,7 @@ use iroh_docs::store::{DownloadPolicy, Query};
 use iroh_docs::{AuthorId, DocTicket, NamespaceId};
 use iroh_docs::{Capability, NamespaceSecret};
 use iroh_gossip::net::Gossip;
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 pub use {iroh, iroh_blobs, iroh_docs};
 
 /// Map iroh-docs' tombstone sentinel (`Hash::EMPTY` content) to `None`.
@@ -143,6 +144,26 @@ impl Node {
     /// No index namespace is active until one is created, opened or joined.
     pub async fn spawn(data_dir: &Path, secret_key: SecretKey) -> Result<Self> {
         Self::spawn_with_gc(data_dir, secret_key, GC_INTERVAL).await
+    }
+
+    /// Register mDNS address lookup: LAN peers become dialable by node-id
+    /// alone — the connectivity story for shared-namespace mode and for
+    /// tickets whose embedded addresses went stale (DECISIONS §6, issue #10).
+    /// Daemon-only wiring, not part of [`spawn`](Self::spawn): in-process
+    /// test nodes must not announce themselves on the host's real LAN. A
+    /// failed mDNS socket (loopback-only sandbox, offline start) degrades to
+    /// the preset's DNS/pkarr lookup instead of killing the daemon.
+    pub fn enable_mdns(&self) {
+        let registered = MdnsAddressLookup::builder()
+            .build(self.endpoint.id())
+            .map_err(anyhow::Error::new)
+            .and_then(|mdns| {
+                self.endpoint.address_lookup()?.add(mdns);
+                Ok(())
+            });
+        if let Err(e) = registered {
+            eprintln!("ssync: mdns discovery disabled: {e}");
+        }
     }
 
     /// [`spawn`](Self::spawn) with a custom blob-GC interval (tests).

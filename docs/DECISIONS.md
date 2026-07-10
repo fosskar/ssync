@@ -163,8 +163,6 @@ unbounded-channel workaround is **permanent, not transitional**.
 
 - **On a LAN** (both machines on the same network, e.g. at home): peers discover each
   other via **mDNS local discovery**. Genuinely zero infrastructure, no internet involved.
-  (Not yet implemented — issue #10; today LAN connectivity rides the ticket's
-  embedded direct addresses.)
 - **Across the internet** (laptop on mobile data, desktop at home): discovery and NAT-
   traversal bootstrap go through **iroh's built-in public discovery + relay infrastructure
   (run for free by n0/number0)**. The user hosts and configures nothing.
@@ -378,7 +376,7 @@ encrypt/decrypt (DECISIONS §7), so that combination was the real risk and it ho
 | Identity            | `(agent, project, session_id)`; machine is provenance metadata only                          |
 | Topology            | **Leaderless p2p**, all peers equal; no hub/server                                           |
 | Sync stack          | **iroh** (transport) + **iroh-docs** (CRDT index) + **iroh-blobs** (file transfer)           |
-| Infra the user runs | **None.** LAN via mDNS (planned — issue #10); internet via iroh's free public relay (ciphertext only) |
+| Infra the user runs | **None.** LAN via mDNS; internet via iroh's free public relay (ciphertext only)              |
 | Encryption          | **age, on by default**, PQ-hybrid if a mature plugin exists; shared identity across machines |
 | Conflicts (v1)      | No lease; detect + keep-both; **lossless line-union merge** for pi (newest-wins fallback)    |
 | agents              | **pi + omp** (share pi layout, merge) + **claude-code, codex** (newest-wins); more via boxed `Adapter`s |

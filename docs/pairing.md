@@ -57,8 +57,12 @@ Two layers behave differently; both verified against the pinned crates
 
 ## Discovery and connectivity
 
-- On a LAN, peers will find each other via mDNS (not yet implemented — issue #10;
-  today LAN connectivity rides the ticket's embedded direct addresses).
+- On a LAN, peers find each other via mDNS local discovery: any peer named by
+  node-id (shared-namespace `peers`, or a ticket whose embedded addresses went
+  stale) is dialable without internet or relay.
+  Caveat: the underlying swarm-discovery announces only on the default-route
+  interface, so a multi-homed machine whose default route is not the shared
+  LAN won't be discovered over that LAN (relay/DNS still cover it).
 - Across the internet, iroh's public discovery + relay infrastructure bootstraps
   the connection; once a direct path is punched, data flows peer-to-peer. The
   relay only ever carries ciphertext, and only as a fallback.

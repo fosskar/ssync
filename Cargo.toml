@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/fosskar/ssync"
@@ -25,6 +25,7 @@ iroh = "1.0.1"
 iroh-blobs = { version = "0.103", features = ["fs-store"] }
 iroh-docs = { version = "0.101", features = ["fs-store"] }
 iroh-gossip = { version = "0.101", features = ["net"] }
+iroh-mdns-address-lookup = "0.4"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 futures-lite = "2"

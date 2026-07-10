@@ -242,6 +242,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         .unwrap_or_else(|| config.data_dir.join("node.key"));
     let secret = load_or_create_secret_key(&node_key_path).await?;
     let mut node = Node::spawn(&config.data_dir, secret).await?;
+    node.enable_mdns();
 
     if let Some(ns_path) = &config.namespace_secret_path {
         // shared-namespace mode (clan): one deterministic namespace on every peer

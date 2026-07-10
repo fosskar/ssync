@@ -24,7 +24,7 @@ correctly, and encrypting at rest with keys your peers cannot silently read.
 | Post-quantum | No | ML-KEM-768 + X25519 hybrid by default |
 | Peers can read your data | Yes (trusted devices hold plaintext) | No (peers hold ciphertext unless they also hold the age key) |
 | Transport | TLS over relays/direct | iroh QUIC, end-to-end encrypted, dial-by-public-key |
-| Infra you run | None (public relays/discovery) | None (iroh public relays/discovery; LAN mDNS planned) |
+| Infra you run | None (public relays/discovery) | None (iroh public relays/discovery + LAN mDNS) |
 | Agent integration | None | Watch-and-import boundary; writes back atomically |
 
 ---
