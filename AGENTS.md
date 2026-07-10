@@ -33,6 +33,11 @@ Impure shell around pure decision cores:
   newest-wins. The merge verdict is all-or-skip: a partial version set never merges.
 - Per-key errors are logged (`eprintln!("ssync: …")`) and retried next tick; one bad key
   never kills the daemon.
+- Pairing is two modes: ticket exchange (`ssync ticket`/`join`; the ticket embeds direct
+  addresses) or shared-namespace mode (clan: `namespace_secret_path` derives the same
+  namespace on every peer, `peers` node-ids resolve via iroh discovery — no ticket).
+  `recipients` set = per-machine age identities with multi-recipient encryption; empty =
+  one shared identity. Recipient-set or namespace changes re-publish/evict (issue #22).
 
 ### Hard rules (pointers into docs/DECISIONS.md — don't re-litigate)
 
@@ -137,8 +142,9 @@ flake.lock. CI is nixbot building the flake checks; there are no GitHub Actions.
 
 - `crates/ssync/src/main.rs` — CLI + daemon wiring, entry point.
 - `crates/ssync-core/src/reconcile.rs` — pure sync decision core; most invariants live here.
-- `crates/ssync-core/src/lib.rs` — `Config` (`$XDG_CONFIG_HOME/ssync/config.toml`, `~/`
-  expanded per-machine), `Engine`.
+- `crates/ssync-core/src/lib.rs` — `Engine`, the event loop.
+- `crates/ssync-core/src/config.rs` — `Config` (`$XDG_CONFIG_HOME/ssync/config.toml`, `~/`
+  expanded per-machine).
 - `crates/ssync-net/src/lib.rs` — `Node`, `publish`, `fetch_blob`, `IndexRecord`.
 - `crates/ssync-adapters/src/lib.rs` — `Adapter` trait + `adapter_for` (extensibility point).
 - `Cargo.toml` (root) — workspace version + all dep versions.
@@ -177,6 +183,8 @@ Layout and patterns:
   (`eventually()`, 500ms steps), never fixed sleeps; drive all mutation through
   `tick_once()`/`run()`.
 - `crates/ssync-core/tests/event_flood.rs` — 1500-session deadlock regression.
+- `crates/ssync-core/tests/recipient_rotation.rs` — issue #22 regressions: recipient-set
+  change re-publishes every session; namespace rotation drops the stale replica.
 - Failure injection via production hooks: `disable_auto_download()` (simulates missed
   downloads), bogus peer addrs, `set_resync_interval`.
 - Pure-core changes: extend the inline unit tests (`reconcile`, divergence/merge,
