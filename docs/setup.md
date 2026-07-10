@@ -51,21 +51,30 @@ and enables it (`ssync init` first — install reads the config to open the
 sandbox for exactly the session dirs and `data_dir`, creating them if missing):
 
 - as a regular user: a user unit at `~/.config/systemd/user/ssync.service`,
-  enabled and started immediately.
+  enabled and started immediately. Install also enables lingering (best
+  effort) so the daemon survives logout and starts at boot; if that fails,
+  run `loginctl enable-linger` yourself.
 - as root: a system unit at `/etc/systemd/system/ssync.service`. Pass
   `--user <name>` (sessions, keys, and watched dirs are per-user, so the daemon
   runs as that user) and an explicit `--config` whose paths are absolute (`~/`
-  would expand differently for root and the service user).
+  would expand differently for root and the service user). Install verifies the
+  service user can actually reach the binary, config, `age`, and every write
+  path — a root-only location (`/root/.nix-profile`, a 0700 home) fails the
+  install instead of crash-looping the unit.
 
 `age`/`age-keygen` are resolved at install time and pinned in the unit's
 `PATH`, so a key setup that works in your shell keeps working under systemd.
-`ssync service uninstall` disables the unit, removes it, and reloads systemd.
+Re-running install after a config or binary change rewrites the unit and
+restarts the daemon. `ssync service uninstall` stops and disables the unit,
+removes it, and reloads systemd.
 
 The unit carries the same hardening set as the nix modules below. Sandboxing in
 user units needs unprivileged user namespaces (default on most distros; some
 kernels restrict them — if the service fails with a namespace error, check
-`sysctl kernel.unprivileged_userns_clone`). Not on systemd? The daemon is a
-plain foreground process; a cron `@reboot` line or any supervisor works.
+`sysctl kernel.unprivileged_userns_clone` on Debian-family kernels, or
+`user.max_user_namespaces` / AppArmor restrictions elsewhere). Not on systemd?
+The daemon is a plain foreground process; a cron `@reboot` line or any
+supervisor works.
 
 ### home-manager module (recommended — sessions are per-user)
 
