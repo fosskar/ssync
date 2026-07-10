@@ -134,6 +134,8 @@ flake.lock. CI is nixbot building the flake checks (plus the nixbot effects in
   `nix/effects.nix` runs after nixbot's build goes green on a main push and tags
   `v0.x.y` + creates the GitHub release if the workspace version has no tag yet.
   Never tag by hand.
+  Release notes are `--generate-notes`: only merged PRs between tags appear, direct
+  pushes to main are invisible — route user-visible work through PRs.
 
 ### VCS
 
