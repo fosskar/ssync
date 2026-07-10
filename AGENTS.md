@@ -18,8 +18,9 @@ Impure shell around pure decision cores:
 - `Engine::run` (ssync-core) is one `tokio::select!` loop. Event sources: notify fs
   watcher, iroh-docs LiveEvents (drained on a dedicated task, forwarded as a `DocSignal`
   — relevance ping or learned peer id — over an **unbounded** channel; bounded
-  subscriber channels deadlock the iroh-docs actor), 15s rescan, 60s resync. Everything
-  funnels into a 400ms-debounced tick.
+  subscriber channels deadlock the iroh-docs actor), 15s rescan, 60s resync. FS and
+  index events funnel into a 400ms-debounced tick; the rescan ticks directly, the
+  resync only re-initiates peer sync.
 - Each tick: `local_snapshot` + `index_snapshot` → pure `reconcile()` → `Vec<Action>`
   {Import, WriteFile, DeleteLocal, Tombstone, Merge} → execute → settle into `SyncState`
   (atomic temp+rename to `data_dir/state.toml`).
