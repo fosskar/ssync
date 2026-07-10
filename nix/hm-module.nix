@@ -73,10 +73,12 @@ in
       defaultText = lib.literalExpression "\"\${dataDir}/age.key\"";
       description = ''
         Age identity file. If it does not exist the daemon generates one on
-        first run. Shared mode (`recipients = []`): it must be the *same* key on
-        every machine, so point this at a secret you distribute (e.g. sops-nix).
-        Per-machine mode: each machine keeps its own key and lists the other
-        machines' recipients in `recipients`.
+        first run — that only works under `dataDir`, the one place outside the
+        session dirs the hardened unit may write; a custom path must already
+        exist (readable is enough). Shared mode (`recipients = []`): it must be
+        the *same* key on every machine, so point this at a secret you
+        distribute (e.g. sops-nix). Per-machine mode: each machine keeps its
+        own key and lists the other machines' recipients in `recipients`.
       '';
     };
 
@@ -99,6 +101,11 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # ReadWritePaths requires the paths to exist at unit start.
+    systemd.user.tmpfiles.rules = map (d: "d \"${d}\" 0700 - - -") (
+      (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ]
+    );
+
     systemd.user.services.ssync = {
       Unit = {
         Description = "ssync coding-agent session sync";
@@ -109,9 +116,54 @@ in
         ExecStart = "${cfg.package}/bin/ssync --config ${configFile} daemon";
         Restart = "on-failure";
         RestartSec = 5;
-        # cap glibc malloc arenas: transient session read/encrypt buffers across
-        # tokio workers otherwise pin the peak-import high-water mark as RSS.
-        Environment = [ "MALLOC_ARENA_MAX=2" ];
+        Environment = [
+          # cap glibc malloc arenas: transient session read/encrypt buffers across
+          # tokio workers otherwise pin the peak-import high-water mark as RSS.
+          "MALLOC_ARENA_MAX=2"
+          # ssync-crypto's SecretFile prefers $XDG_RUNTIME_DIR, but
+          # ProtectSystem=strict leaves /run/user/$UID read-only in a user unit;
+          # point it at the unit's own (writable) RuntimeDirectory.
+          "XDG_RUNTIME_DIR=%t/ssync"
+        ];
+
+        # --- hardening (parity with the NixOS module, user-manager adapted) ---
+        # The daemon needs: RW to the session dirs and dataDir (both under
+        # $HOME), the RuntimeDirectory for age key temp files, read access to
+        # the secrets it is pointed at, and outbound QUIC/UDP plus netlink for
+        # iroh. Everything else is denied. Sandboxing in user units needs
+        # unprivileged user namespaces (default on NixOS; some distros restrict).
+        ReadWritePaths = (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ];
+        RuntimeDirectory = "ssync";
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = "read-only";
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK";
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        RemoveIPC = true;
+        CapabilityBoundingSet = "";
+        AmbientCapabilities = "";
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
+        SystemCallErrorNumber = "EPERM";
+        SystemCallArchitectures = "native";
+        UMask = "0077";
       };
     };
   };
