@@ -1,7 +1,40 @@
-# nixbot scheduled effects. The GitToken comes from nixbot at runtime (a
+# nixbot effects. The GitToken comes from nixbot at runtime (a
 # github app installation token on github repos).
 { pkgs }:
-_args: {
+let
+  inherit ((pkgs.lib.importTOML ../Cargo.toml).workspace.package) version;
+in
+{ primaryRepo, ... }:
+{
+  # Auto-release on version bump: push effects run only after the whole build
+  # (nix flake check) succeeded on that commit, so a broken bump can never
+  # become a release. No-op while the workspace version is already tagged.
+  onPush.default.outputs.effects = pkgs.lib.optionalAttrs (primaryRepo.branch or null == "main") {
+    release =
+      pkgs.runCommand "effect-release"
+        {
+          nativeBuildInputs = [
+            pkgs.cacert
+            pkgs.gh
+            pkgs.jq
+          ];
+          secretsMap = builtins.toJSON { git.type = "GitToken"; };
+          HOME = "/build";
+        }
+        ''
+          set -euo pipefail
+          GH_TOKEN=$(jq -re '.git.data.token' "$HERCULES_CI_SECRETS_JSON")
+          export GH_TOKEN
+
+          if gh api "repos/fosskar/ssync/git/ref/tags/v${version}" > /dev/null 2>&1; then
+            echo "v${version} already released"
+          else
+            gh release create "v${version}" --repo fosskar/ssync \
+              --generate-notes --target "${primaryRepo.rev}"
+          fi
+        '';
+  };
+
   onSchedule.update-flake-inputs = {
     when = {
       hour = 5;

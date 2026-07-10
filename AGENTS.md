@@ -47,8 +47,8 @@ Impure shell around pure decision cores:
   atomically (temp + rename). Never symlink/bind it into the engine.
 - **Encryption (age) is not optional and not deferrable** (§7).
 - **Leaderless** (§4): no code path may assume a special/authority node. **User runs no
-  server** (§6): iroh public defaults only (mDNS local discovery is still TODO; today
-  LAN connectivity rides the ticket's embedded addresses).
+  server** (§6): iroh public defaults plus mDNS local discovery (LAN peers dialable
+  by node-id alone; tickets additionally embed direct addresses).
 - iroh, iroh-docs, iroh-blobs, and age move fast: when unsure of a current API, read the
   crate's actual docs/source — never code from memory.
 
@@ -91,9 +91,8 @@ nix flake check                                         # full CI gate (package,
 The nix build serializes tests (`--test-threads=1`; parallel in-process iroh nodes starve
 each other under CI load) — mimic with `cargo test -- --test-threads=1` when two-node
 tests flake locally. Never `nix shell nixpkgs#cargo …` — registry nixpkgs drifts from
-flake.lock. CI is nixbot building the flake checks; the only GitHub Action is
-`.github/workflows/release.yml` (auto-release on version bump, gated on nixbot's
-check runs — it builds nothing itself).
+flake.lock. CI is nixbot building the flake checks (plus the nixbot effects in
+`nix/effects.nix`); there are no GitHub Actions.
 
 ## Code Conventions & Common Patterns
 
@@ -130,9 +129,9 @@ check runs — it builds nothing itself).
 - Pre-1.0: feature/breaking → MINOR bump; bugfix/internal → PATCH; MAJOR stays 0 until
   the user declares 1.0. Bump once per user-visible-behavior task; pure refactor/docs/CI
   need no bump. After bumping, run `cargo check` so `Cargo.lock` updates; commit the lockfile.
-- Version bumps are manual; releases are not: on any push to main whose workspace
-  version has no tag yet, `.github/workflows/release.yml` waits for nixbot's check
-  runs to go green on that commit, then tags `v0.x.y` + creates the GitHub release.
+- Version bumps are manual; releases are not: the `release` push effect in
+  `nix/effects.nix` runs after nixbot's build goes green on a main push and tags
+  `v0.x.y` + creates the GitHub release if the workspace version has no tag yet.
   Never tag by hand.
 
 ### VCS
@@ -195,8 +194,8 @@ Layout and patterns:
 - Pure-core changes: extend the inline unit tests (`reconcile`, divergence/merge,
   cleanup selection) first — they cover the invariants cheaply; two-node tests are for
   the wiring.
-- `nix flake check` additionally runs two NixOS VM tests (`vm-sync` e2e over virtual LAN,
-  `vm-module` service/hardening test).
+- `nix flake check` additionally runs three NixOS VM tests (`vm-sync` e2e over virtual
+  LAN, `vm-mdns` node-id-only pairing via mDNS, `vm-module` service/hardening test).
 
 ## pi session format (caveat)
 
