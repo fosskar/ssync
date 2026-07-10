@@ -239,3 +239,45 @@ them on any machine.
 ssync status      # namespace, session count, conflict count
 ssync conflicts   # list sessions that diverged across machines
 ```
+
+## Automatic cleanup
+
+`ssync cleanup` prunes old sessions but is manual. To schedule it, either use
+the CLI (plain-binary deployments) or the nix module option.
+
+**Deletions propagate mesh-wide.** Cleanup deletes local files; the daemon
+tombstones them and every peer deletes its copy. A timer on *one* machine
+prunes *all* machines — that is the feature. One machine with a timer is
+enough; enabling it on several is harmless (selection is idempotent) but
+redundant. The wipe guard still applies: a run that would delete *all* of an
+agent's sessions (e.g. an empty or unmounted session dir) refuses instead.
+
+With the CLI, `cleanup-timer enable` installs and starts a systemd
+timer/service pair running `ssync cleanup --apply` (user units; system units
+as root with `--user`/`--config`, same rules as `ssync service install`):
+
+```bash
+ssync cleanup-timer enable --every weekly              # delete sessions older than 90d
+ssync cleanup-timer enable --every 2d --keep 30d       # every 2 days, 30d retention
+ssync cleanup-timer enable --every weekly --unnamed    # only untitled sessions, any age
+ssync cleanup-timer status
+ssync cleanup-timer disable
+```
+
+`--every` accepts `2d`/`7d` style periods, or a raw systemd calendar
+expression (`weekly`, `*-*-* 03:00:00`). Calendar schedules catch up after
+downtime (`Persistent=true`); day periods that `OnCalendar` cannot express run
+on unit uptime instead. `--keep` defaults to `90d` unless `--unnamed` is the
+only selector. Non-systemd platforms: the cleanup command is non-interactive,
+so a cron line works — `0 3 * * 0 ssync cleanup --keep 90d --apply`.
+
+With the NixOS or home-manager module:
+
+```nix
+services.ssync.autoCleanup = {
+  enable = true;
+  schedule = "weekly";  # systemd OnCalendar expression
+  keep = "90d";         # null to select by `unnamed` only
+  unnamed = false;      # also delete untitled sessions
+};
+```

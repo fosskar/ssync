@@ -35,6 +35,57 @@ let
       session_dir = "${a.sessionDir}"
     '') cfg.agents
   );
+  cleanupArgs = lib.concatStringsSep " " (
+    lib.optionals (cfg.autoCleanup.keep != null) [
+      "--keep"
+      cfg.autoCleanup.keep
+    ]
+    ++ lib.optional cfg.autoCleanup.unnamed "--unnamed"
+  );
+  # --- hardening (parity with the home-manager module and `ssync service
+  # install`, crates/ssync/src/service.rs — change all three together) ---
+  # The daemon needs: RW to the session dirs (under $HOME) and its StateDirectory,
+  # read access to the secrets it is pointed at (/run/secrets, /nix/store),
+  # and outbound QUIC/UDP plus netlink for iroh. Everything else is denied.
+  # The cleanup oneshot reuses the same set (it only deletes session files).
+  hardening = {
+    ReadWritePaths = map (a: a.sessionDir) cfg.agents;
+    NoNewPrivileges = true;
+    ProtectSystem = "strict";
+    ProtectHome = "read-only";
+    PrivateTmp = true;
+    PrivateDevices = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectControlGroups = true;
+    ProtectProc = "invisible";
+    ProcSubset = "pid";
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    RestrictAddressFamilies = [
+      "AF_INET"
+      "AF_INET6"
+      "AF_UNIX"
+      "AF_NETLINK"
+    ];
+    LockPersonality = true;
+    MemoryDenyWriteExecute = true;
+    RemoveIPC = true;
+    CapabilityBoundingSet = "";
+    AmbientCapabilities = "";
+    SystemCallFilter = [
+      "@system-service"
+      "~@privileged"
+      "~@resources"
+    ];
+    SystemCallErrorNumber = "EPERM";
+    SystemCallArchitectures = "native";
+    UMask = "0077";
+  };
 in
 {
   options.services.ssync = {
@@ -135,9 +186,50 @@ in
         shared-identity mode. The clan service fills these in.
       '';
     };
+
+    autoCleanup = {
+      enable = lib.mkEnableOption ''
+        scheduled session cleanup. Deletions propagate MESH-WIDE: the daemon
+        tombstones every pruned session and all peers delete their copies, so
+        a timer on one machine prunes all machines (enabling it on several is
+        harmless but redundant)
+      '';
+
+      schedule = lib.mkOption {
+        type = lib.types.str;
+        default = "weekly";
+        example = "*-*-* 03:00:00";
+        description = "systemd `OnCalendar` expression for the cleanup timer.";
+      };
+
+      keep = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = "90d";
+        description = ''
+          Delete sessions created more than this long ago (`ssync cleanup
+          --keep`; `<n>` + `d`/`w`/`m`/`y`). Null to select by `unnamed` only.
+        '';
+      };
+
+      unnamed = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Also delete sessions whose title record is present but empty
+          (combines with `keep` as AND).
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !cfg.autoCleanup.enable || cfg.autoCleanup.keep != null || cfg.autoCleanup.unnamed;
+        message = "services.ssync.autoCleanup selects nothing: set keep or unnamed";
+      }
+    ];
+
     # ensure the watched session dirs exist so the sandbox's ReadWritePaths bind
     # succeeds on first boot (owner cfg.user, 0700).
     systemd.tmpfiles.rules = map (a: "d ${a.sessionDir} 0700 ${cfg.user} - - -") cfg.agents;
@@ -156,48 +248,30 @@ in
         # cap glibc malloc arenas: transient session read/encrypt buffers across
         # tokio workers otherwise pin the peak-import high-water mark as RSS.
         Environment = [ "MALLOC_ARENA_MAX=2" ];
+      }
+      // hardening;
+    };
 
-        # --- hardening (parity with the home-manager module and `ssync service
-        # install`, crates/ssync/src/service.rs — change all three together) ---
-        # The daemon needs: RW to the session dirs (under $HOME) and its StateDirectory,
-        # read access to the secrets it is pointed at (/run/secrets, /nix/store),
-        # and outbound QUIC/UDP plus netlink for iroh. Everything else is denied.
-        ReadWritePaths = map (a: a.sessionDir) cfg.agents;
-        NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ProtectHome = "read-only";
-        PrivateTmp = true;
-        PrivateDevices = true;
-        ProtectClock = true;
-        ProtectHostname = true;
-        ProtectKernelTunables = true;
-        ProtectKernelModules = true;
-        ProtectKernelLogs = true;
-        ProtectControlGroups = true;
-        ProtectProc = "invisible";
-        ProcSubset = "pid";
-        RestrictNamespaces = true;
-        RestrictRealtime = true;
-        RestrictSUIDSGID = true;
-        RestrictAddressFamilies = [
-          "AF_INET"
-          "AF_INET6"
-          "AF_UNIX"
-          "AF_NETLINK"
-        ];
-        LockPersonality = true;
-        MemoryDenyWriteExecute = true;
-        RemoveIPC = true;
-        CapabilityBoundingSet = "";
-        AmbientCapabilities = "";
-        SystemCallFilter = [
-          "@system-service"
-          "~@privileged"
-          "~@resources"
-        ];
-        SystemCallErrorNumber = "EPERM";
-        SystemCallArchitectures = "native";
-        UMask = "0077";
+    # scheduled cleanup: prune old sessions via the plain cleanup CLI; the
+    # running daemon tombstones the deletions and every peer follows.
+    systemd.services.ssync-cleanup = lib.mkIf cfg.autoCleanup.enable {
+      description = "ssync scheduled session cleanup";
+      after = [ "ssync.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${cfg.package}/bin/ssync --config ${configFile} cleanup ${cleanupArgs} --apply";
+        User = cfg.user;
+      }
+      // hardening;
+    };
+
+    systemd.timers.ssync-cleanup = lib.mkIf cfg.autoCleanup.enable {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.autoCleanup.schedule;
+        # a machine that slept through the window catches up on next boot
+        Persistent = true;
+        RandomizedDelaySec = "1h";
       };
     };
   };
