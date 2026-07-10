@@ -47,8 +47,8 @@ Impure shell around pure decision cores:
   atomically (temp + rename). Never symlink/bind it into the engine.
 - **Encryption (age) is not optional and not deferrable** (§7).
 - **Leaderless** (§4): no code path may assume a special/authority node. **User runs no
-  server** (§6): iroh public defaults plus mDNS local discovery (LAN peers dialable
-  by node-id alone; tickets additionally embed direct addresses).
+  server** (§6): iroh public defaults only (mDNS local discovery is still TODO; today
+  LAN connectivity rides the ticket's embedded addresses).
 - iroh, iroh-docs, iroh-blobs, and age move fast: when unsure of a current API, read the
   crate's actual docs/source — never code from memory.
 
@@ -194,8 +194,8 @@ Layout and patterns:
 - Pure-core changes: extend the inline unit tests (`reconcile`, divergence/merge,
   cleanup selection) first — they cover the invariants cheaply; two-node tests are for
   the wiring.
-- `nix flake check` additionally runs three NixOS VM tests (`vm-sync` e2e over virtual
-  LAN, `vm-mdns` node-id-only pairing via mDNS, `vm-module` service/hardening test).
+- `nix flake check` additionally runs two NixOS VM tests (`vm-sync` e2e over virtual LAN,
+  `vm-module` service/hardening test).
 
 ## pi session format (caveat)
 
