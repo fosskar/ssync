@@ -41,10 +41,11 @@ let
   # the secrets it is pointed at, and outbound QUIC/UDP plus netlink for
   # iroh. Everything else is denied. Sandboxing in user units needs
   # unprivileged user namespaces (default on NixOS; some distros restrict).
-  # The cleanup oneshot reuses the same set (it only deletes session files).
+  # The cleanup oneshot reuses the same set, but path grants are per unit:
+  # sharing RuntimeDirectory would let the oneshot's exit remove it under
+  # the running daemon (systemd#5394 — runtime dirs are not ref-counted),
+  # and the oneshot only deletes session files, so no dataDir write access.
   hardening = {
-    ReadWritePaths = (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ];
-    RuntimeDirectory = "ssync";
     NoNewPrivileges = true;
     ProtectSystem = "strict";
     ProtectHome = "read-only";
@@ -215,6 +216,8 @@ in
           # point it at the unit's own (writable) RuntimeDirectory.
           "XDG_RUNTIME_DIR=%t/ssync"
         ];
+        ReadWritePaths = (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ];
+        RuntimeDirectory = "ssync";
       }
       // hardening;
     };
@@ -229,6 +232,7 @@ in
       Service = {
         Type = "oneshot";
         ExecStart = "${cfg.package}/bin/ssync --config ${configFile} cleanup ${cleanupArgs} --apply";
+        ReadWritePaths = map (a: a.sessionDir) cfg.agents;
       }
       // hardening;
     };

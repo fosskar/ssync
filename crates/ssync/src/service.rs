@@ -342,30 +342,7 @@ pub fn cmd_service_install(
     user: Option<String>,
 ) -> Result<()> {
     let user_mode = !is_root()?;
-    if user_mode {
-        ensure!(
-            user.is_none(),
-            "--user only applies to a system unit; run as root to install one"
-        );
-    } else {
-        ensure!(
-            user.is_some(),
-            "a system unit needs an explicit --user <name> to run the daemon as \
-             (sessions, keys, and watched dirs are per-user)"
-        );
-        ensure!(
-            config_explicit,
-            "system mode needs an explicit --config: root's default config path \
-             is not readable by the service user"
-        );
-        let raw = fs::read_to_string(config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
-        ensure!(
-            !config_uses_tilde(&raw),
-            "system-mode config must use absolute paths: `~/` expands to root's \
-             home at install time but to --user's home in the daemon"
-        );
-    }
+    ensure_install_mode(user_mode, user.as_ref(), config_explicit, config_path)?;
 
     let config = Config::load(config_path)
         .with_context(|| format!("loading {} (run `ssync init` first)", config_path.display()))?;
@@ -455,17 +432,65 @@ pub fn cmd_service_uninstall() -> Result<()> {
             unit_path.display()
         );
     }
-    // best effort, separately: a masked or never-enabled unit must not block
-    // removal, and a failed `disable` must not leave the daemon running
-    for args in [&["stop", UNIT_NAME], &["disable", UNIT_NAME]] {
+    remove_units(user_mode, UNIT_NAME, &[UNIT_NAME])?;
+    println!("removed {}", unit_path.display());
+    Ok(())
+}
+
+/// Shared user/system mode rules for the unit-installing commands
+/// (`service install`, `cleanup-timer enable`): user mode takes no `--user`,
+/// system mode requires one plus an explicit, tilde-free config.
+pub(crate) fn ensure_install_mode(
+    user_mode: bool,
+    user: Option<&String>,
+    config_explicit: bool,
+    config_path: &Path,
+) -> Result<()> {
+    if user_mode {
+        ensure!(
+            user.is_none(),
+            "--user only applies to system units; run as root to install them"
+        );
+    } else {
+        ensure!(
+            user.is_some(),
+            "system units need an explicit --user <name> to run as \
+             (sessions, keys, and watched dirs are per-user)"
+        );
+        ensure!(
+            config_explicit,
+            "system mode needs an explicit --config: root's default config path \
+             is not readable by the service user"
+        );
+        let raw = fs::read_to_string(config_path)
+            .with_context(|| format!("reading {}", config_path.display()))?;
+        ensure!(
+            !config_uses_tilde(&raw),
+            "system-mode config must use absolute paths: `~/` expands to root's \
+             home at install time but to --user's home in the unit"
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort stop/disable of `stop_unit`, remove `files` from the unit
+/// dir, daemon-reload. Best effort separately: a masked or never-enabled
+/// unit must not block removal, and a failed `disable` must not leave it
+/// running.
+pub(crate) fn remove_units(user_mode: bool, stop_unit: &str, files: &[&str]) -> Result<()> {
+    for args in [&["stop", stop_unit], &["disable", stop_unit]] {
         if let Err(e) = systemctl(user_mode, args) {
             eprintln!("ssync: {e}");
         }
     }
-    fs::remove_file(&unit_path).with_context(|| format!("removing {}", unit_path.display()))?;
-    systemctl(user_mode, &["daemon-reload"])?;
-    println!("removed {}", unit_path.display());
-    Ok(())
+    let dir = unit_dir(user_mode)?;
+    for name in files {
+        let path = dir.join(name);
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    systemctl(user_mode, &["daemon-reload"])
 }
 
 #[cfg(test)]

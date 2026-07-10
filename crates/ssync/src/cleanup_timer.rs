@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail, ensure};
 use ssync_core::Config;
 
 use crate::service::{
-    HARDENING, check_access, config_uses_tilde, create_write_paths, ensure_unit_safe, is_root,
-    service_user_of, systemctl, unit_dir,
+    HARDENING, check_access, create_write_paths, ensure_install_mode, ensure_unit_safe, is_root,
+    remove_units, service_user_of, systemctl, unit_dir,
 };
 
 const SERVICE_NAME: &str = "ssync-cleanup.service";
@@ -40,9 +40,12 @@ pub fn schedule_of(every: &str) -> Result<Schedule> {
         every
             .strip_suffix(suffix)
             .and_then(|n| n.parse::<u64>().ok())
-            .map(|n| n * per)
+            .map(|n| (n, per))
     };
-    if let Some(n) = days('d', 1).or_else(|| days('w', 7)) {
+    if let Some((n, per)) = days('d', 1).or_else(|| days('w', 7)) {
+        let n = n
+            .checked_mul(per)
+            .with_context(|| format!("--every {every} is out of range"))?;
         ensure!(n > 0, "--every {every} never fires");
         return Ok(match n {
             1 => Schedule::Calendar("daily".into()),
@@ -147,16 +150,20 @@ pub fn render_timer(spec: &TimerSpec) -> String {
     )
 }
 
+/// The cleanup selectors the timer runs with (`ssync cleanup-timer enable
+/// --keep/--unnamed/--agent`).
+pub struct CleanupSelectors {
+    pub keep: Option<String>,
+    pub unnamed: bool,
+    pub agent: Option<String>,
+}
+
 /// The `cleanup` arguments the timer runs with. `--keep` defaults to 90d
-/// unless the invocation is unnamed-only (then age is not a criterion).
-pub fn cleanup_args_of(
-    keep: Option<String>,
-    unnamed: bool,
-    agent: Option<String>,
-) -> Result<Vec<String>> {
-    let keep = match keep {
+/// unless `--unnamed` is given (then age is not a criterion).
+pub fn cleanup_args_of(sel: CleanupSelectors) -> Result<Vec<String>> {
+    let keep = match sel.keep {
         Some(k) => Some(k),
-        None if unnamed => None,
+        None if sel.unnamed => None,
         None => Some("90d".to_string()),
     };
     let mut args = Vec::new();
@@ -164,10 +171,10 @@ pub fn cleanup_args_of(
         ssync_core::cleanup::parse_keep(k)?;
         args.extend(["--keep".to_string(), k.clone()]);
     }
-    if unnamed {
+    if sel.unnamed {
         args.push("--unnamed".to_string());
     }
-    if let Some(a) = agent {
+    if let Some(a) = sel.agent {
         args.extend(["--agent".to_string(), a]);
     }
     Ok(args)
@@ -188,46 +195,19 @@ fn validate_calendar(expr: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_enable(
     config_path: &Path,
     config_explicit: bool,
     every: String,
-    keep: Option<String>,
-    unnamed: bool,
-    agent: Option<String>,
+    selectors: CleanupSelectors,
     user: Option<String>,
 ) -> Result<()> {
     let user_mode = !is_root()?;
-    // same mode rules as `ssync service install` — see cmd_service_install
-    if user_mode {
-        ensure!(
-            user.is_none(),
-            "--user only applies to system units; run as root to install them"
-        );
-    } else {
-        ensure!(
-            user.is_some(),
-            "system units need an explicit --user <name> to run cleanup as \
-             (sessions are per-user)"
-        );
-        ensure!(
-            config_explicit,
-            "system mode needs an explicit --config: root's default config path \
-             is not readable by the service user"
-        );
-        let raw = fs::read_to_string(config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?;
-        ensure!(
-            !config_uses_tilde(&raw),
-            "system-mode config must use absolute paths: `~/` expands to root's \
-             home at install time but to --user's home in the unit"
-        );
-    }
+    ensure_install_mode(user_mode, user.as_ref(), config_explicit, config_path)?;
 
     let config = Config::load(config_path)
         .with_context(|| format!("loading {} (run `ssync init` first)", config_path.display()))?;
-    if let Some(a) = &agent {
+    if let Some(a) = &selectors.agent {
         ensure!(
             config.agents.iter().any(|c| c.agent == *a),
             "agent {a:?} is not in the config"
@@ -237,7 +217,7 @@ pub fn cmd_enable(
     if let Schedule::Calendar(expr) = &schedule {
         validate_calendar(expr)?;
     }
-    let cleanup_args = cleanup_args_of(keep, unnamed, agent)?;
+    let cleanup_args = cleanup_args_of(selectors)?;
 
     // resolve everything fallible before touching the filesystem
     let exec = std::env::current_exe()
@@ -262,6 +242,12 @@ pub fn cmd_enable(
         .map(|a| a.session_dir.clone())
         .collect();
     create_write_paths(&session_dirs, service_user.as_ref())?;
+    if let Some(who) = &service_user {
+        // pre-existing dirs were never chowned; catch a root-owned leaf now
+        for p in &session_dirs {
+            check_access(p, who, 0o7)?;
+        }
+    }
 
     let spec = TimerSpec {
         exec,
@@ -305,20 +291,7 @@ pub fn cmd_disable() -> Result<()> {
             dir.join(TIMER_NAME).display()
         );
     }
-    // best effort, separately: a masked or never-enabled timer must not
-    // block removal
-    for args in [&["stop", TIMER_NAME], &["disable", TIMER_NAME]] {
-        if let Err(e) = systemctl(user_mode, args) {
-            eprintln!("ssync: {e}");
-        }
-    }
-    for name in [TIMER_NAME, SERVICE_NAME] {
-        let path = dir.join(name);
-        if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        }
-    }
-    systemctl(user_mode, &["daemon-reload"])?;
+    remove_units(user_mode, TIMER_NAME, &[TIMER_NAME, SERVICE_NAME])?;
     println!("removed {TIMER_NAME}");
     Ok(())
 }
@@ -343,6 +316,14 @@ pub fn cmd_status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sel(keep: Option<String>, unnamed: bool, agent: Option<String>) -> CleanupSelectors {
+        CleanupSelectors {
+            keep,
+            unnamed,
+            agent,
+        }
+    }
 
     fn spec(schedule: Schedule, user: Option<&str>) -> TimerSpec {
         TimerSpec {
@@ -400,9 +381,15 @@ mod tests {
     }
 
     #[test]
+    fn schedule_rejects_overflowing_counts() {
+        // u64-parseable count whose *7 overflows
+        assert!(schedule_of("9999999999999999999w").is_err());
+    }
+
+    #[test]
     fn cleanup_args_default_retention_is_90d() {
         assert_eq!(
-            cleanup_args_of(None, false, None).unwrap(),
+            cleanup_args_of(sel(None, false, None)).unwrap(),
             vec!["--keep", "90d"]
         );
     }
@@ -410,7 +397,7 @@ mod tests {
     #[test]
     fn cleanup_args_unnamed_only_skips_retention() {
         assert_eq!(
-            cleanup_args_of(None, true, None).unwrap(),
+            cleanup_args_of(sel(None, true, None)).unwrap(),
             vec!["--unnamed"]
         );
     }
@@ -418,14 +405,14 @@ mod tests {
     #[test]
     fn cleanup_args_combine_all_selectors() {
         assert_eq!(
-            cleanup_args_of(Some("30d".into()), true, Some("pi".into())).unwrap(),
+            cleanup_args_of(sel(Some("30d".into()), true, Some("pi".into()))).unwrap(),
             vec!["--keep", "30d", "--unnamed", "--agent", "pi"]
         );
     }
 
     #[test]
     fn cleanup_args_reject_bad_keep() {
-        assert!(cleanup_args_of(Some("soon".into()), false, None).is_err());
+        assert!(cleanup_args_of(sel(Some("soon".into()), false, None)).is_err());
     }
 
     #[test]

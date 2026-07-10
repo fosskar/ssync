@@ -99,7 +99,7 @@ enum CleanupTimerAction {
         #[arg(long)]
         every: String,
         /// Delete sessions older than this (e.g. 30d, 6w, 3m, 1y). Defaults
-        /// to 90d unless --unnamed is the only selector.
+        /// to 90d unless --unnamed is given.
         #[arg(long)]
         keep: Option<String>,
         /// Also delete sessions whose title record is present but empty.
@@ -157,9 +157,11 @@ async fn main() -> Result<()> {
                 &config_path,
                 config_explicit,
                 every,
-                keep,
-                unnamed,
-                agent,
+                cleanup_timer::CleanupSelectors {
+                    keep,
+                    unnamed,
+                    agent,
+                },
                 user,
             ),
             CleanupTimerAction::Disable => cleanup_timer::cmd_disable(),
