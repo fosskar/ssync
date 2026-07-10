@@ -346,24 +346,37 @@ async fn deletion_propagates_and_does_not_resurrect() {
     let mut engine_b = pi_engine(&root_b, &secret, node_b);
 
     std::fs::write(root_a.join(rel), b"header\nto-be-deleted\n").unwrap();
+    // the session's artifact dir (omp subagent transcript) syncs and must be
+    // swept on B once the deletion empties it.
+    let artifact_dir_rel = rel.strip_suffix(".jsonl").unwrap();
+    let artifact_rel = format!("{artifact_dir_rel}/Sub.jsonl");
+    std::fs::create_dir_all(root_a.join(artifact_dir_rel)).unwrap();
+    std::fs::write(root_a.join(&artifact_rel), b"header\nsub\n").unwrap();
 
     let sa = base.join("a/status.toml");
     let sb = base.join("b/status.toml");
     tokio::spawn(async move { engine_a.run(&sa).await });
     tokio::spawn(async move { engine_b.run(&sb).await });
 
-    // it appears on B
+    // both files appear on B
     let dest = root_b.join(rel);
+    let dest_artifact = root_b.join(&artifact_rel);
     assert!(
-        eventually(|| dest.exists()).await,
-        "session never reached B"
+        eventually(|| dest.exists() && dest_artifact.exists()).await,
+        "session (and artifact) never reached B"
     );
 
-    // delete on A -> must disappear on B and stay gone
+    // delete on A (file victims only, as cleanup does) -> must disappear on B,
+    // including the emptied artifact dir, and stay gone
+    std::fs::remove_file(root_a.join(&artifact_rel)).unwrap();
     std::fs::remove_file(root_a.join(rel)).unwrap();
     assert!(
         eventually(|| !dest.exists()).await,
         "deletion did not propagate to B"
+    );
+    assert!(
+        eventually(|| !root_b.join(artifact_dir_rel).exists()).await,
+        "emptied artifact dir not removed on B"
     );
 
     // confirm it does not resurrect

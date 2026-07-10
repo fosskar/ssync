@@ -144,7 +144,7 @@ fn cmd_cleanup(
         println!("{}  {}", v.agent, v.path.display());
     }
     println!(
-        "{} session(s), {:.1} MB{}",
+        "{} session file(s), {:.1} MB{}",
         victims.len(),
         total as f64 / 1e6,
         if apply {
@@ -154,9 +154,17 @@ fn cmd_cleanup(
         }
     );
     if apply {
+        let root_of: std::collections::HashMap<&str, &Path> = adapters
+            .iter()
+            .map(|a| (a.agent(), a.session_root()))
+            .collect();
         for v in &victims {
             std::fs::remove_file(&v.path)
                 .with_context(|| format!("deleting {}", v.path.display()))?;
+            // sweep the artifact dir a fully-deleted session leaves empty
+            if let Some(root) = root_of.get(v.agent.as_str()) {
+                ssync_core::cleanup::remove_empty_parents(&v.path, root);
+            }
         }
         println!("deleted; the daemon propagates the deletions to peers");
     }

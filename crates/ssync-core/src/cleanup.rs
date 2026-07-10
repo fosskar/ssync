@@ -4,7 +4,7 @@
 //! reset it) and/or by empty session title. Refuses to delete an agent's last
 //! sessions: the reconcile wipe guard would silently suppress propagation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
@@ -83,7 +83,7 @@ pub fn plan(adapters: &[Box<dyn Adapter>], filter: &Filter) -> Result<Vec<Victim
         }
         if !files.is_empty() && selected.len() == files.len() {
             bail!(
-                "refusing: would delete all {} {} sessions — deleting an agent's \
+                "refusing: would delete all {} {} session files — deleting an agent's \
                  last session does not propagate (empty-dir wipe guard); keep at \
                  least one or narrow the filter",
                 files.len(),
@@ -100,6 +100,21 @@ pub fn plan(adapters: &[Box<dyn Adapter>], filter: &Filter) -> Result<Vec<Victim
         }
     }
     Ok(victims)
+}
+/// Best-effort sweep of now-empty parent dirs after deleting a session file,
+/// up to (never including) the session root: an omp artifact dir whose files
+/// were all deleted is residue, not a session (DECISIONS §9).
+pub fn remove_empty_parents(path: &Path, root: &Path) {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d == root || !d.starts_with(root) {
+            break;
+        }
+        if std::fs::remove_dir(d).is_err() {
+            break; // not empty (or already gone)
+        }
+        dir = d.parent();
+    }
 }
 
 #[cfg(test)]
@@ -239,5 +254,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(victims.len(), 1);
+    }
+
+    #[test]
+    fn before_cutoff_selects_old_session_artifacts_not_new_ones() {
+        // omp nests subagent transcripts one level below the main session file:
+        // <root>/<enc>/<ts>_<uuid>/<Name>.jsonl. A --before sweep must select an
+        // old session's artifact files alongside its main file, and leave a new
+        // session's artifact files untouched (created_at from the dir timestamp).
+        let root = scratch("nested");
+        let enc = root.join("--p--");
+
+        // Old session: main file + nested artifact transcript.
+        let old_main =
+            enc.join("2026-01-01T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl");
+        std::fs::write(&old_main, "{\"type\":\"session\",\"version\":3}\n").unwrap();
+        let old_dir = enc.join("2026-01-01T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let old_artifact = old_dir.join("Tests.jsonl");
+        std::fs::write(&old_artifact, "{\"type\":\"session\",\"version\":3}\n").unwrap();
+
+        // New session: main file + nested artifact, both after the cutoff.
+        let new_main =
+            enc.join("2026-07-01T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl");
+        std::fs::write(&new_main, "{\"type\":\"session\",\"version\":3}\n").unwrap();
+        let new_dir = enc.join("2026-07-01T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let new_artifact = new_dir.join("Tests.jsonl");
+        std::fs::write(&new_artifact, "{\"type\":\"session\",\"version\":3}\n").unwrap();
+
+        // cutoff between the two sessions (2026-04-12).
+        let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(1_776_000_000);
+        let victims = plan(
+            &adapters(&root),
+            &Filter {
+                agent: None,
+                before: Some(cutoff),
+                unnamed: false,
+            },
+        )
+        .unwrap();
+        let paths: Vec<_> = victims.iter().map(|v| v.path.clone()).collect();
+
+        // The old session's main file AND its nested artifact are both selected.
+        assert!(
+            paths.contains(&old_main),
+            "old main not selected: {paths:?}"
+        );
+        assert!(
+            paths.contains(&old_artifact),
+            "old session artifact not selected: {paths:?}"
+        );
+        // The new session's files are left alone.
+        assert!(!paths.contains(&new_main), "new main wrongly selected");
+        assert!(
+            !paths.contains(&new_artifact),
+            "new session artifact wrongly selected"
+        );
+    }
+    #[test]
+    fn remove_empty_parents_sweeps_emptied_dirs_but_never_the_root() {
+        let root = scratch("sweep");
+        let enc = root.join("--p--");
+        let art = enc.join("2026-01-01T00-00-00-000Z_id");
+        std::fs::create_dir_all(&art).unwrap();
+        let artifact = art.join("Sub.jsonl");
+        std::fs::write(&artifact, b"x").unwrap();
+        let keep = enc.join("other.jsonl");
+        std::fs::write(&keep, b"x").unwrap();
+
+        // artifact dir empties -> swept; <enc> still holds a file -> stays
+        std::fs::remove_file(&artifact).unwrap();
+        remove_empty_parents(&artifact, &root);
+        assert!(!art.exists(), "emptied artifact dir must be removed");
+        assert!(enc.exists(), "non-empty <encoded-cwd> dir must stay");
+
+        // last file goes -> <enc> swept too, but never the session root
+        std::fs::remove_file(&keep).unwrap();
+        remove_empty_parents(&keep, &root);
+        assert!(!enc.exists(), "emptied <encoded-cwd> dir must be removed");
+        assert!(root.exists(), "session root must never be removed");
     }
 }

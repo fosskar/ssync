@@ -45,6 +45,8 @@ pub struct Engine {
     state_path: Option<PathBuf>,
     /// Merges already announced (log once, not per tick).
     merged_logged: std::collections::HashSet<String>,
+    /// Identify failures already announced (log once, not per tick).
+    identify_logged: std::collections::HashSet<PathBuf>,
     /// Cached divergence verdicts; skips re-decrypting sessions whose version
     /// set has not changed (e.g. a stale second author entry on every tick).
     divergence: Divergence,
@@ -77,6 +79,7 @@ impl Engine {
             state: SyncState::default(),
             state_path: None,
             merged_logged: Default::default(),
+            identify_logged: Default::default(),
             divergence: Divergence::default(),
             resync_interval: std::time::Duration::from_secs(60),
             recipients_fp,
@@ -181,18 +184,27 @@ impl Engine {
 
     /// One index scan: live session count plus the still-diverged sessions
     /// (union of all authors' lines differs from the winner; cached verdicts).
+    /// Artifact files carry their own index keys but belong to a session
+    /// (DECISIONS §9), so the count is distinct session identities, not keys.
     pub async fn status_report(&self) -> Result<StatusReport> {
-        let mut sessions = 0;
+        let mut sessions = std::collections::HashSet::new();
         let mut conflicts = Vec::new();
         for rec in self.node.index_records().await? {
             let Some(winner) = rec.winner else {
                 continue; // deleted — never resurrect from stale live entries
             };
-            sessions += 1;
+            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            match self
+                .dest_of(&key)
+                .and_then(|dest| self.adapter_of_key(&key)?.identify(&dest).ok())
+            {
+                Some(id) => sessions.insert((id.agent, id.project_id, id.session_id)),
+                // unconfigured agent or unparseable path: the key is the session
+                None => sessions.insert((key.clone(), String::new(), String::new())),
+            };
             if rec.versions.len() <= 1 {
                 continue;
             }
-            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
             let Some(rel) = self.relative_of(&key).map(str::to_string) else {
                 continue;
             };
@@ -219,7 +231,7 @@ impl Engine {
             .collect();
         Ok(StatusReport {
             namespace: self.node.namespace().map(|n| n.to_string()),
-            sessions,
+            sessions: sessions.len(),
             conflicts,
             peers,
         })
@@ -297,14 +309,21 @@ impl Engine {
     }
 
     /// Snapshot every configured session dir as `reconcile` input.
-    fn local_snapshot(&self) -> Vec<LocalFile> {
+    fn local_snapshot(&mut self) -> Vec<LocalFile> {
         let mut out = Vec::new();
         for path in self.all_session_files() {
             let Some(stamp) = file_stamp_micros(&path) else {
                 continue;
             };
-            let Ok(id) = self.identify(&path) else {
-                continue;
+            let id = match self.identify(&path) {
+                Ok(id) => id,
+                Err(e) => {
+                    // per-key errors are logged, never silently dropped
+                    if self.identify_logged.insert(path.clone()) {
+                        eprintln!("ssync: skipping {}: {e:#}", path.display());
+                    }
+                    continue;
+                }
             };
             out.push(LocalFile {
                 key: self.index_key(&id),
@@ -458,6 +477,10 @@ impl Engine {
                 };
                 let existed = dest.exists();
                 let _ = tokio::fs::remove_file(&dest).await;
+                // sweep the emptied artifact dir the deletion may leave behind
+                if let Some(adapter) = self.adapter_of_key(key) {
+                    cleanup::remove_empty_parents(&dest, adapter.session_root());
+                }
                 existed
             }
             Action::Tombstone { key } => match self.node.index_delete(key).await {
@@ -806,5 +829,85 @@ mod tests {
         assert_eq!(report.peers.len(), 1);
         assert_eq!(report.peers[0].id, bogus.to_string());
         assert_eq!(report.peers[0].path, "unknown");
+    }
+
+    #[tokio::test]
+    async fn tick_imports_nested_artifact_file() {
+        // omp stores subagent transcripts in a per-session artifact dir nested
+        // inside the session root: <root>/<enc>/<ts>_<uuid>/<Name>.jsonl. These
+        // depth-3 files must import just like the depth-2 main session file. The
+        // CamelCase name (no underscore) is the case silently skipped today.
+        let base = std::env::temp_dir().join(format!("ssync-core-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sessions_root = base.join("sessions");
+        let proj = sessions_root.join("--home-simon-Projects-demo--");
+        let sess = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a";
+        std::fs::create_dir_all(&proj).unwrap();
+        // main session file (depth 2)
+        std::fs::write(
+            proj.join(format!("{sess}.jsonl")),
+            b"{\"type\":\"session\",\"version\":3}\n",
+        )
+        .unwrap();
+        // nested subagent transcript (depth 3), CamelCase name with no underscore
+        let artifact_dir = proj.join(sess);
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(
+            artifact_dir.join("Tests.jsonl"),
+            b"{\"type\":\"session\",\"version\":3}\n{\"agent\":\"Tests\"}\n",
+        )
+        .unwrap();
+
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        let mut engine = Engine::new(
+            PiAdapter::new("pi", &sessions_root),
+            AgeIdentity::generate().unwrap(),
+            node,
+        );
+
+        assert!(engine.tick_once().await, "first tick must import");
+
+        // The nested artifact is indexed under its full relative-path key.
+        let key = "pi/--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/Tests.jsonl";
+        let rec = engine.node.index_record(key).await.unwrap();
+        assert!(
+            rec.is_some(),
+            "depth-3 artifact file must be indexed under {key}"
+        );
+    }
+    #[tokio::test]
+    async fn status_counts_sessions_not_files() {
+        // artifact files get their own index keys but are part of their
+        // session (DECISIONS §9): status must count distinct sessions.
+        let base = std::env::temp_dir().join(format!("ssync-core-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sessions_root = base.join("sessions");
+        let proj = sessions_root.join("--p--");
+        let sess = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a";
+        std::fs::create_dir_all(proj.join(sess)).unwrap();
+        std::fs::write(
+            proj.join(format!("{sess}.jsonl")),
+            b"{\"type\":\"session\",\"version\":3}\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join(sess).join("Tests.jsonl"), b"{\"a\":1}\n").unwrap();
+        std::fs::write(proj.join(sess).join("__advisor.jsonl"), b"{\"a\":2}\n").unwrap();
+
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        let mut engine = Engine::new(
+            PiAdapter::new("pi", &sessions_root),
+            AgeIdentity::generate().unwrap(),
+            node,
+        );
+        assert!(engine.tick_once().await, "tick must import");
+
+        let report = engine.status_report().await.unwrap();
+        assert_eq!(report.sessions, 1, "3 files, 1 session");
     }
 }

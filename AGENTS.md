@@ -190,7 +190,10 @@ pi stores sessions at `~/.pi/agent/sessions/<encoded-cwd>/<ts>_<sessionId>.jsonl
 append-only JSONL file per session, header on line 1 (`version:3`, `id` uuidv7, `cwd`). pi
 keys on the **absolute cwd**, so a synced project must live at the **same absolute path on
 every machine** — a v1 requirement, not a bug. Derive `PiAdapter` identity from the
-path/filename alone; treat `<encoded-cwd>` as opaque (pi and omp encode differently). omp
-uses the same layout at `~/.omp/agent/sessions`. pi appends in place (no temp+rename), so
+path alone; treat `<encoded-cwd>` as opaque (pi and omp encode differently). omp uses the
+same layout at `~/.omp/agent/sessions` and adds a per-session artifact dir
+(`<encoded-cwd>/<ts>_<sessionId>/`: subagent transcripts, `__advisor.jsonl`) whose files
+are part of the session and sync with it (identity from the artifact dir name — DECISIONS
+§9). pi appends in place (no temp+rename), so
 imports must stay debounced. Full reference: `docs/pi-format-notes.md` (re-verify against
 the installed pi version before relying on it).

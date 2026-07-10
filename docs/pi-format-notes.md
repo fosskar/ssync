@@ -63,11 +63,21 @@ requirement that a project must live at the **same absolute path on every machin
 
 ## Adapter implications
 
-- `PiAdapter` derives identity from path/filename alone (both machine-independent):
-  - `session_id` = uuid after the last `_` in the filename stem
-  - `project_id` = the `<encoded-cwd>` parent directory name
+- `PiAdapter` derives identity from the path alone (machine-independent), from the
+  **second path component** — the file stem for a main session file, the artifact dir
+  name for a nested artifact file; both are shaped `<ts>_<sessionId>`:
+  - `session_id` = uuid after the last `_` in that component
+  - `project_id` = the `<encoded-cwd>` first component
   - `relative_path` = path relative to the sessions root
 - Reading the single header line (to cross-check `id`/`cwd`) is allowed metadata access, not
   transcript parsing. Header cross-validation is deferred to M1.
 - `append_only = true` for pi.
-- `is_session_file` = files with the `.jsonl` extension.
+- `is_session_file` = files with the `.jsonl` extension, at any depth under the root.
+- omp keeps a per-session artifact dir `<encoded-cwd>/<ts>_<sessionId>/` next to the main
+  file (subagent transcripts, `__advisor.jsonl`). These are part of the session
+  (DECISIONS §9): they sync, inherit the session's `created_at` from the dir name, and
+  read their title from the sibling main file. Artifact files are pi-format JSONL
+  transcripts appended as their subagents run and are treated as append-only like main
+  sessions, so the line-union merge (DECISIONS §8, `append_only = true`) covers them —
+  not yet verified against omp's storage source; re-verify if a merge ever surfaces
+  lines omp did not write. Plain pi has no artifact dirs.

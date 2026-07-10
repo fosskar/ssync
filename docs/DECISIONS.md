@@ -286,6 +286,15 @@ docs/pi-format-notes.md.
 surface small; omp was trivial to add (identical layout) and proved the multi-agent seam,
 so it landed too.
 
+**Amended (0.8.0):** a session is more than its main transcript. omp keeps a per-session
+artifact directory next to the main file (`<root>/<encoded-cwd>/<ts>_<id>/`) holding
+subagent transcripts and the advisor log (`__advisor.jsonl`) — the main transcript
+references them, so they are **part of the session and sync with it**. Identity for a
+nested artifact file derives from the second path component (the artifact dir name,
+shaped `<ts>_<id>` like a main-file stem): same session id, same creation time, title
+read from the sibling main file — so cleanup selects a session and its artifacts
+together. Plain pi has no artifact dirs; nothing changes for it.
+
 ---
 
 ## 10. Architecture: watch-and-import, never sync-in-place
