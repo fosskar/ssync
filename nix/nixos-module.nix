@@ -236,6 +236,10 @@ in
       }
     ];
 
+    # the daemon runs from the store path, but status/conflicts/ticket/cleanup
+    # are user-facing — put the CLI on PATH.
+    environment.systemPackages = [ cfg.package ];
+
     # ensure the watched session dirs exist so the sandbox's ReadWritePaths bind
     # succeeds on first boot (owner cfg.user, 0700).
     systemd.tmpfiles.rules = map (a: "d ${a.sessionDir} 0700 ${cfg.user} - - -") cfg.agents;
