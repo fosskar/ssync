@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use futures_lite::StreamExt;
 use notify::{RecursiveMode, Watcher};
 use ssync_adapters::{Adapter, SessionIdentity};
@@ -33,6 +33,10 @@ enum DocSignal {
     Peer(EndpointId),
 }
 
+/// Consecutive state-persist ENOENT failures after which the daemon exits so
+/// its supervisor restarts it with a fresh mount namespace.
+const PERSIST_WEDGE_THRESHOLD: u32 = 5;
+
 /// The sync engine for one node: one or more agent adapters (pi, omp, ...)
 /// sharing a single index namespace, partitioned by the `{agent}/` key prefix.
 pub struct Engine {
@@ -47,6 +51,14 @@ pub struct Engine {
     merged_logged: std::collections::HashSet<String>,
     /// Identify failures already announced (log once, not per tick).
     identify_logged: std::collections::HashSet<PathBuf>,
+    /// Conflicts already announced; replaced with the current set on every
+    /// announcing pass so a resolved-then-returned conflict logs again.
+    conflicts_logged: std::collections::HashSet<String>,
+    /// Consecutive state-persist ENOENT failures. A system switch can leave
+    /// the running unit's mount namespace stale — every data_dir write fails
+    /// ENOENT until restart — so [`persist_wedged`](Self::persist_wedged)
+    /// escalates instead of retrying forever.
+    persist_enoent: u32,
     /// Cached divergence verdicts; skips re-decrypting sessions whose version
     /// set has not changed (e.g. a stale second author entry on every tick).
     divergence: Divergence,
@@ -80,6 +92,8 @@ impl Engine {
             state_path: None,
             merged_logged: Default::default(),
             identify_logged: Default::default(),
+            conflicts_logged: Default::default(),
+            persist_enoent: 0,
             divergence: Divergence::default(),
             resync_interval: std::time::Duration::from_secs(60),
             recipients_fp,
@@ -295,15 +309,16 @@ impl Engine {
 
     /// Write the status snapshot; `announce` additionally logs conflicts (off
     /// for the periodic liveness refresh, which would repeat them every tick).
-    async fn write_status(&self, path: &Path, announce: bool) {
+    async fn write_status(&mut self, path: &Path, announce: bool) {
         if let Ok(report) = self.status_report().await {
             if let Ok(text) = toml::to_string_pretty(&report) {
                 let _ = tokio::fs::write(path, text).await;
             }
             if announce {
-                for c in &report.conflicts {
+                for c in newly_diverged(&self.conflicts_logged, &report.conflicts) {
                     eprintln!("ssync: conflict on {c} (both versions kept; newest wins)");
                 }
+                self.conflicts_logged = report.conflicts.into_iter().collect();
             }
         }
     }
@@ -401,12 +416,29 @@ impl Engine {
             .chain(index.keys().map(String::as_str))
             .collect();
         self.state.keys.retain(|k, _| live.contains(k.as_str()));
-        if let Some(path) = &self.state_path
-            && let Err(e) = self.state.save(path)
-        {
-            eprintln!("ssync: persist state {}: {e:#}", path.display());
+        if let Some(path) = &self.state_path {
+            match self.state.save(path) {
+                Ok(()) => self.persist_enoent = 0,
+                Err(e) => {
+                    eprintln!("ssync: persist state {}: {e:#}", path.display());
+                    if e.root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        self.persist_enoent += 1;
+                    }
+                }
+            }
         }
         changed
+    }
+
+    /// Whether persisting state has hit ENOENT for so many consecutive passes
+    /// that the data dir is presumed gone from this process's view (a stale
+    /// mount namespace after a system switch). Retrying is then pointless;
+    /// [`run`](Self::run) exits so the supervisor restarts with a fresh one.
+    pub fn persist_wedged(&self) -> bool {
+        self.persist_enoent >= PERSIST_WEDGE_THRESHOLD
     }
 
     /// Execute one action and settle it into the carried state, so a
@@ -512,10 +544,17 @@ impl Engine {
     }
 
     /// A [`tick_once`](Self::tick_once) pass plus the status refresh (the
-    /// snapshot's mtime is the liveness signal for `ssync status`).
-    async fn step(&mut self, status_path: &Path) {
+    /// snapshot's mtime is the liveness signal for `ssync status`). Errors
+    /// only when persisting state is wedged (stale mount namespace): the
+    /// daemon must exit so its supervisor restarts it with a fresh one.
+    async fn step(&mut self, status_path: &Path) -> Result<()> {
         let changed = self.tick_once().await;
         self.write_status(status_path, changed).await;
+        ensure!(
+            !self.persist_wedged(),
+            "state dir unreachable ({PERSIST_WEDGE_THRESHOLD} consecutive ENOENT persisting state); exiting for a clean restart"
+        );
+        Ok(())
     }
 
     /// Run the daemon: filesystem events, index events, and a periodic rescan
@@ -574,7 +613,7 @@ impl Engine {
         let mut events_ended = false;
 
         // initial reconcile
-        self.step(status_path).await;
+        self.step(status_path).await?;
 
         let mut rescan = tokio::time::interval(Duration::from_secs(15));
         rescan.tick().await;
@@ -622,10 +661,10 @@ impl Engine {
                 }
                 _ = settle, if deadline.is_some() => {
                     deadline = None;
-                    self.step(status_path).await;
+                    self.step(status_path).await?;
                 }
                 _ = rescan.tick() => {
-                    self.step(status_path).await;
+                    self.step(status_path).await?;
                 }
                 _ = resync.tick() => {
                     if let Err(e) = self.node.resync().await {
@@ -687,6 +726,20 @@ fn session_files(root: &Path, adapter: &dyn Adapter) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Conflicts to announce this pass: those in `current` not yet logged. The
+/// caller replaces its logged set with `current` afterwards, so a conflict
+/// that resolved and re-diverged announces again.
+fn newly_diverged<'a>(
+    logged: &std::collections::HashSet<String>,
+    current: &'a [String],
+) -> Vec<&'a str> {
+    current
+        .iter()
+        .filter(|c| !logged.contains(*c))
+        .map(String::as_str)
+        .collect()
 }
 
 /// Write `data` to `dest` atomically: temp file in the same dir, then rename, so
@@ -909,5 +962,55 @@ mod tests {
 
         let report = engine.status_report().await.unwrap();
         assert_eq!(report.sessions, 1, "3 files, 1 session");
+    }
+
+    #[tokio::test]
+    async fn persist_enoent_wedges_after_consecutive_failures() {
+        // a system switch can invalidate the running unit's mount namespace:
+        // every write under data_dir fails ENOENT until restart (observed as a
+        // 17h silent retry loop). the engine must read as wedged so the daemon
+        // exits and systemd restarts it with a fresh namespace.
+        let base = std::env::temp_dir().join(format!("ssync-core-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        let mut engine = Engine::new(
+            PiAdapter::new("pi", base.join("sessions")),
+            AgeIdentity::generate().unwrap(),
+            node,
+        );
+        let state_path = base.join("missing-dir/state.toml");
+        engine.persist_state(&state_path);
+
+        for _ in 0..PERSIST_WEDGE_THRESHOLD {
+            assert!(!engine.persist_wedged(), "must not wedge early");
+            engine.tick_once().await;
+        }
+        assert!(engine.persist_wedged(), "consecutive ENOENT must wedge");
+
+        // dir back (namespace healed / different failure): one good pass resets
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        engine.tick_once().await;
+        assert!(!engine.persist_wedged(), "successful persist must reset");
+    }
+
+    #[test]
+    fn conflicts_announce_once_and_reannounce_on_return() {
+        let logged = std::collections::HashSet::new();
+        let current = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(newly_diverged(&logged, &current), ["a", "b"]);
+
+        // already-announced conflicts stay quiet
+        let logged: std::collections::HashSet<String> = current.iter().cloned().collect();
+        assert!(newly_diverged(&logged, &current).is_empty());
+        let wider = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(newly_diverged(&logged, &wider), ["c"]);
+
+        // a conflict that resolved and re-diverged announces again: the caller
+        // replaces its logged set with the current set each announcing pass
+        let logged: std::collections::HashSet<String> = ["a".to_string()].into();
+        assert_eq!(newly_diverged(&logged, &current), ["b"]);
     }
 }

@@ -56,6 +56,15 @@ impl Divergence {
         if plaintexts.len() != versions.len() {
             return Verdict::Incomplete;
         }
+        // byte-equal versions are settled by definition; the line-union is not
+        // an identity on binary content (omp-blobs), so never let it decide.
+        if plaintexts.iter().all(|p| *p == winner) {
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (versions.to_vec(), false));
+            return Verdict::Settled;
+        }
         let merged = merge_lines(&plaintexts);
         let diverged = merged != winner;
         self.cache
@@ -221,6 +230,20 @@ mod tests {
         let short = b"h\na\n".to_vec();
         let long = b"h\na\nb\n".to_vec();
         let v = d.verdict("k", &versions, Some(long.clone()), vec![short, long]);
+        assert_eq!(v, Verdict::Settled);
+        assert_eq!(d.cached("k", &versions), Some(false));
+    }
+
+    #[test]
+    fn verdict_settled_for_identical_binary_versions() {
+        // content-addressed blobs (omp-blobs) import as byte-identical
+        // plaintexts on every machine but distinct ciphertext hashes; the
+        // line-union is not an identity on binary bytes (empty lines dropped,
+        // trailing newline appended), so equality must settle first.
+        let d = Divergence::default();
+        let versions = [h(1), h(2)];
+        let png = b"\x89PNG\r\n\x1a\n\n\nbinary\xffpayload".to_vec();
+        let v = d.verdict("k", &versions, Some(png.clone()), vec![png.clone(), png]);
         assert_eq!(v, Verdict::Settled);
         assert_eq!(d.cached("k", &versions), Some(false));
     }
