@@ -237,8 +237,10 @@ in
     ];
 
     # the daemon runs from the store path, but status/conflicts/ticket/cleanup
-    # are user-facing — put the CLI on PATH.
+    # are user-facing — put the CLI on PATH and its config where the CLI's
+    # default-path fallback looks.
     environment.systemPackages = [ cfg.package ];
+    environment.etc."ssync/config.toml".source = configFile;
 
     # ensure the watched session dirs exist so the sandbox's ReadWritePaths bind
     # succeeds on first boot (owner cfg.user, 0700).
