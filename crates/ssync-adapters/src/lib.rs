@@ -76,10 +76,12 @@ pub(crate) fn is_uuid(s: &str) -> bool {
         })
 }
 
+pub mod blob_store;
 pub mod claude_code;
 pub mod codex;
 pub mod pi;
 
+use blob_store::BlobStoreAdapter;
 use claude_code::ClaudeCodeAdapter;
 use codex::CodexAdapter;
 use pi::PiAdapter;
@@ -95,10 +97,11 @@ pub fn adapter_for(
 ) -> anyhow::Result<Box<dyn Adapter>> {
     match agent {
         "pi" | "omp" => Ok(Box::new(PiAdapter::new(agent, session_root))),
+        "omp-blobs" => Ok(Box::new(BlobStoreAdapter::new(agent, session_root))),
         "claude-code" => Ok(Box::new(ClaudeCodeAdapter::new(session_root))),
         "codex" => Ok(Box::new(CodexAdapter::new(session_root))),
         other => Err(anyhow::anyhow!(
-            "unsupported agent {other:?} (supported: pi, omp, claude-code, codex)"
+            "unsupported agent {other:?} (supported: pi, omp, omp-blobs, claude-code, codex)"
         )),
     }
 }
@@ -114,6 +117,7 @@ mod tests {
             ("omp", "/x"),
             ("claude-code", "/x"),
             ("codex", "/x"),
+            ("omp-blobs", "/x"),
         ] {
             let a = adapter_for(agent, root).unwrap();
             assert_eq!(a.agent(), agent);
