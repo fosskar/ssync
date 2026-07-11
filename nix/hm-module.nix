@@ -198,6 +198,10 @@ in
       }
     ];
 
+    # the daemon runs from the store path, but status/conflicts/ticket/cleanup
+    # are user-facing — put the CLI on PATH.
+    home.packages = [ cfg.package ];
+
     # ReadWritePaths requires the paths to exist at unit start.
     systemd.user.tmpfiles.rules = map (d: "d \"${d}\" 0700 - - -") (
       (map (a: a.sessionDir) cfg.agents) ++ [ cfg.dataDir ]
