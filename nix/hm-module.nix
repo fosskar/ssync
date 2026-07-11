@@ -199,8 +199,10 @@ in
     ];
 
     # the daemon runs from the store path, but status/conflicts/ticket/cleanup
-    # are user-facing — put the CLI on PATH.
+    # are user-facing — put the CLI on PATH and its config at the CLI's
+    # default path.
     home.packages = [ cfg.package ];
+    xdg.configFile."ssync/config.toml".source = configFile;
 
     # ReadWritePaths requires the paths to exist at unit start.
     systemd.user.tmpfiles.rules = map (d: "d \"${d}\" 0700 - - -") (

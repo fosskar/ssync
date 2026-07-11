@@ -40,11 +40,17 @@ pub struct Config {
 }
 
 impl Config {
-    /// Default config path: `$XDG_CONFIG_HOME/ssync/config.toml`.
+    /// Default config path: `$XDG_CONFIG_HOME/ssync/config.toml`, falling back
+    /// to `/etc/ssync/config.toml` when no user config exists (the NixOS module
+    /// links the generated daemon config there so the CLI finds it).
     pub fn default_path() -> Result<PathBuf> {
-        Ok(dirs::config_dir()
+        let user = dirs::config_dir()
             .ok_or_else(|| anyhow!("no config dir"))?
-            .join("ssync/config.toml"))
+            .join("ssync/config.toml");
+        Ok(resolve_config_path(
+            user,
+            Path::new("/etc/ssync/config.toml"),
+        ))
     }
 
     /// Built-in defaults: every known agent whose watched dir exists on this
@@ -126,9 +132,51 @@ impl Config {
     }
 }
 
+/// Pick the config the CLI should read: the user config wherever it exists,
+/// otherwise a present system-wide config, otherwise the user path (so `init`
+/// still creates it there).
+fn resolve_config_path(user: PathBuf, system: &Path) -> PathBuf {
+    if !user.exists() && system.exists() {
+        system.to_path_buf()
+    } else {
+        user
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_path_prefers_existing_user_config() {
+        let dir = std::env::temp_dir().join(format!("ssync-cfgpath-{}-user", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.toml");
+        let system = dir.join("system.toml");
+        std::fs::write(&user, "").unwrap();
+        std::fs::write(&system, "").unwrap();
+        assert_eq!(resolve_config_path(user.clone(), &system), user);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_path_falls_back_to_system_config() {
+        let dir = std::env::temp_dir().join(format!("ssync-cfgpath-{}-sys", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.toml");
+        let system = dir.join("system.toml");
+        std::fs::write(&system, "").unwrap();
+        assert_eq!(resolve_config_path(user, &system), system);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_path_stays_user_when_neither_exists() {
+        let dir = std::env::temp_dir().join(format!("ssync-cfgpath-{}-none", std::process::id()));
+        let user = dir.join("user.toml");
+        let system = dir.join("system.toml");
+        assert_eq!(resolve_config_path(user.clone(), &system), user);
+    }
 
     #[test]
     fn config_round_trips_with_peers() {
