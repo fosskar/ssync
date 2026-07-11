@@ -300,6 +300,23 @@ shaped `<ts>_<id>` like a main-file stem): same session id, same creation time, 
 read from the sibling main file — so cleanup selects a session and its artifacts
 together. Plain pi has no artifact dirs; nothing changes for it.
 
+**Amended (0.13.0):** omp also stores pasted images **out-of-line** in a global
+content-addressed blob store (`~/.omp/agent/blobs`: flat, each blob a `<sha256>` file
+plus a hardlinked `<sha256>.<ext>` alias). Session lines reference them as
+`blob:sha256:<hash>` and omp re-inlines the bytes on resume — a missing blob breaks the
+session on another machine (the reference goes out as literal image data, API 400). Blobs
+are session content, so they sync: the `omp-blobs` agent (`BlobStoreAdapter`) treats the
+store as a flat dir of opaque immutable files — identity is the hash filename, no
+project, and conflicts are structurally impossible (content-addressing means concurrent
+writers produce identical bytes; newest-wins is a no-op). `created_at` and `title` stay
+`None` so `cleanup --before`/`--unnamed` never select blobs: a blob's file age says
+nothing about whether a *newer* session still references it, and ssync never parses
+transcripts to find out (§2) — orphan collection is the agent's job. The general rule
+this encodes: **an agent's session content must either be self-contained in its session
+files or live in a watchable store ssync can be pointed at.** Out-of-line references to
+arbitrary unwatched paths (e.g. codex attaching an image by local file path) cannot sync
+and are out of scope. pi inlines images base64 into the JSONL; nothing changes for it.
+
 ---
 
 ## 10. Architecture: watch-and-import, never sync-in-place

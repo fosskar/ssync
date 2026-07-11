@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ssync_adapters::Adapter;
+use ssync_adapters::blob_store::BlobStoreAdapter;
 use ssync_adapters::pi::PiAdapter;
 use ssync_core::Engine;
 use ssync_crypto::AgeIdentity;
@@ -629,6 +630,56 @@ async fn pi_and_omp_sessions_sync_side_by_side() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(ok, "pi+omp sessions did not both sync to node B");
+}
+#[tokio::test]
+async fn omp_blob_store_syncs_binary_blobs() {
+    let base = scratch("blobstore");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+
+    // node A: one blob as omp writes it — bare hash plus a `.png` alias,
+    // identical binary (non-UTF8) content.
+    let blob_root_a = base.join("a/blobs");
+    std::fs::create_dir_all(&blob_root_a).unwrap();
+    let hash = "a2a7f46769739a24d0d13eb5544a6041f830ac69395805c2da51d8de11b62711";
+    let contents: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe";
+    std::fs::write(blob_root_a.join(hash), contents).unwrap();
+    std::fs::write(blob_root_a.join(format!("{hash}.png")), contents).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut engine_a = Engine::new(
+        BlobStoreAdapter::new("omp-blobs", &blob_root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.tick_once().await;
+
+    // node B: empty blob store, joins A's namespace
+    let blob_root_b = base.join("b/blobs");
+    std::fs::create_dir_all(&blob_root_b).unwrap();
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket).await.unwrap();
+    let mut engine_b = Engine::new(
+        BlobStoreAdapter::new("omp-blobs", &blob_root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+
+    // both blob files must land on B, byte-identical
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if std::fs::read(blob_root_b.join(hash)).is_ok_and(|got| got == contents)
+            && std::fs::read(blob_root_b.join(format!("{hash}.png")))
+                .is_ok_and(|got| got == contents)
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "blob files did not sync to node B within timeout");
 }
 
 #[tokio::test]

@@ -112,11 +112,11 @@ in
           options = {
             agent = lib.mkOption {
               type = lib.types.str;
-              description = "Agent name (pi or omp).";
+              description = "Agent name (see `adapter_for` for the supported set).";
             };
             sessionDir = lib.mkOption {
               type = lib.types.str;
-              description = "The agent's session directory to watch (absolute path).";
+              description = "The agent's watched directory (absolute path).";
             };
           };
         }
@@ -130,8 +130,14 @@ in
           agent = "omp";
           sessionDir = "${config.users.users.${cfg.user}.home}/.omp/agent/sessions";
         }
+        {
+          # omp stores pasted images out-of-line in a content-addressed blob
+          # store; sessions reference them, so blobs sync alongside.
+          agent = "omp-blobs";
+          sessionDir = "${config.users.users.${cfg.user}.home}/.omp/agent/blobs";
+        }
       ];
-      defaultText = lib.literalExpression "pi and omp at the user's home";
+      defaultText = lib.literalExpression "pi and omp (sessions + blob store) at the user's home";
       description = "Agents to sync side by side; the default covers every supported agent.";
     };
 
