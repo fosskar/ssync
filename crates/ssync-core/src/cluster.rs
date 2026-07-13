@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 /// One machine in the cluster: its age recipient (identity for encryption and
 /// for `add`/`rm` addressing) and optionally its iroh node-id (seeds resync).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// unknown keys are a hard error — see Config's deny_unknown_fields (config.rs:20-24).
+#[serde(deny_unknown_fields)]
 pub struct Machine {
     pub recipient: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -21,6 +23,7 @@ pub struct Machine {
 /// The parsed artifact. Field invariants (valid hex secret, unique non-empty
 /// recipients) hold from construction: `parse` validates, edits preserve.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterFile {
     version: u32,
     /// Hex-encoded 32-byte iroh-docs namespace secret; rotated on `remove`.
@@ -231,6 +234,26 @@ mod tests {
         let c = three_machines();
         assert_eq!(c.peer_node_ids("node-a"), ["node-c"]);
         assert_eq!(c.peer_node_ids("elsewhere"), ["node-a", "node-c"]);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_top_level_key() {
+        // typoing the rename target ("machines" vs "machine") must be a hard
+        // error, not a silently-empty member list.
+        let text = format!(
+            "version = 1\nnamespace_secret = \"{}\"\nmachines = []\n",
+            hex_encode(&SECRET)
+        );
+        assert!(ClusterFile::parse(&text).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_machine_key() {
+        let text = format!(
+            "version = 1\nnamespace_secret = \"{}\"\n[[machine]]\nrecipient = \"age1x\"\nnodeid = \"abc\"\n",
+            hex_encode(&SECRET)
+        );
+        assert!(ClusterFile::parse(&text).is_err());
     }
 
     #[test]
