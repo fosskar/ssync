@@ -10,9 +10,10 @@ leaderless: every machine runs the same daemon as an equal peer.
   machine and `~/code/foo` on another are, to pi, different sessions. See
   `identity.md`.
 - Age keys, one of two modes:
-  - **Per-machine keypairs** (recommended): each machine keeps its own age key and
-    lists the other machines' recipients in the config's `recipients`. Enables
-    per-device revocation. The clan service sets this up automatically.
+  - **Per-machine keypairs** (recommended): each machine keeps its own age key;
+    the other machines learn its recipient from the cluster file (or, in ticket
+    mode, from the config's `recipients`). Enables per-device revocation. The
+    clan service sets this up automatically.
   - **Shared identity**: the same private key on every machine (`recipients`
     empty). Provision it out of band (e.g. sops-nix or a manual secure copy).
 
@@ -163,8 +164,8 @@ session_dir = "~/.pi/agent/sessions"
 agent = "omp"
 session_dir = "~/.omp/agent/sessions"
 
-# optional: Claude Code and Codex (newest-wins on conflict until their
-# formats are verified append-only; see docs/*-format-notes.md)
+# optional: Claude Code and Codex (newest-wins on conflict by policy; see
+# docs/*-format-notes.md)
 [[agents]]
 agent = "claude-code"
 session_dir = "~/.claude/projects"

@@ -12,8 +12,8 @@ and writes incoming sessions back so the agent can `--resume` them anywhere.
 ## Status
 
 Early. Supports the **pi** and **omp** agents (lossless merge) plus **Claude Code**
-and **Codex** (newest-wins until their formats are verified append-only), under
-active construction. See [docs/DECISIONS.md](docs/DECISIONS.md) for the design rationale.
+and **Codex** (newest-wins by policy, DECISIONS §8), under active construction. See
+[docs/DECISIONS.md](docs/DECISIONS.md) for the design rationale.
 
 ## What it is / isn't
 
@@ -33,9 +33,10 @@ session directory, encrypts changed sessions with age, and publishes them into a
 self-converging index ([iroh-docs](https://github.com/n0-computer/iroh-docs)) with the file
 contents moved as content-addressed blobs ([iroh-blobs](https://github.com/n0-computer/iroh-blobs)).
 Sessions are identified by the agent's own session id, so "the same session" is coherent on
-every machine. Peers connect either from a one-off pairing ticket (standalone) or
-automatically when managed by [clan](https://clan.lol) (which distributes a shared
-namespace secret and each machine's node-id), then sync directly via iroh discovery and NAT
+every machine. Peers connect from a shared cluster file (recommended mode) or a
+one-off pairing ticket (ad-hoc alternative); [clan](https://clan.lol) assembles the
+cluster file automatically (distributing the namespace secret and each machine's
+age recipient and node-id), then sync happens directly via iroh discovery and NAT
 hole-punching.
 
 ```mermaid
@@ -77,40 +78,53 @@ The same daemon, three ways to get it:
 
 2. **NixOS or home-manager module** (flake input, as above) — the same binary as
    a hardened systemd service; the module writes the config from nix options,
-   you pair once with a ticket.
+   you pair once with a cluster file (recommended) or a one-off ticket.
 3. **[clan](https://clan.lol) service** — wraps the NixOS module and additionally
-   generates and distributes every key via clan.vars: no tickets, no manual
-   pairing, just a peer list.
+   generates and distributes every key via clan.vars, assembling the cluster file
+   on each machine automatically: no tickets, no manual pairing, just a peer list.
 
 Step-by-step instructions for all three: **[docs/setup.md](docs/setup.md)**.
 
 ## Quick start
 
 ssync encrypts with age keys: either one **shared key** on all your machines, or a
-**key per machine** with each peer's recipient listed in `recipients` (enables
+**key per machine** with each peer's recipient listed in the cluster file (enables
 per-device revocation). Each synced project must live at the **same absolute path**
 everywhere (see [docs/identity.md](docs/identity.md)).
 
-**With [clan](https://clan.lol):** just list the peer machines — the clan service generates
-a per-machine age key (peers encrypt to each other's recipients), a shared namespace secret
-and each machine's node-id, so peers auto-connect with no `ticket`/`join`.
+**With [clan](https://clan.lol):** just list the peer machines — the clan service
+generates a per-machine age key (peers encrypt to each other's recipients), a shared
+namespace secret, and each machine's node-id, then assembles the cluster file
+automatically, so peers auto-connect with no manual pairing.
 
-**Standalone** (from source / NixOS / home-manager), pair once with a ticket:
+**Standalone** (from source / NixOS / home-manager), pair with a cluster file
+(recommended mode):
 
 ```bash
-# first machine
-ssync init          # writes config.toml, generates the age key
-ssync daemon        # creates a namespace and starts syncing
-ssync ticket        # prints this machine's pairing ticket
+# machine A
+ssync init          # writes config.toml, generates the age key, prints recipient + node-id
+ssync cluster init  # creates the cluster file, points the config at it
+ssync daemon
 
-# second machine (same age key copied over, or its recipient added to `recipients`)
-ssync init
-ssync join '<ticket-from-first-machine>'
-ssync daemon        # joins the namespace and syncs
+# machine B
+ssync init          # prints this machine's recipient and node-id
+
+# back on machine A: add machine B and redistribute the file
+ssync cluster add <recipient-from-B> --node-id <node-id-from-B>
+scp ~/.config/ssync/cluster.toml machineB:...   # your secret channel
+
+# machine B
+ssync cluster join cluster.toml
+ssync daemon
 ```
 
-Run `ssync daemon` on each machine (the Nix modules do this as a hardened systemd service).
 Full instructions: [docs/setup.md](docs/setup.md). Pairing details: [docs/pairing.md](docs/pairing.md).
+
+**Ad-hoc alternative: tickets.** Without a cluster file, `ssync ticket` on a running
+daemon prints a pairing ticket and `ssync join '<ticket>'` + `ssync daemon` on the other
+machine joins it — tickets carry no recipient list, so either copy one shared age key
+everywhere or maintain each machine's `recipients` by hand (see
+[docs/pairing.md](docs/pairing.md)).
 
 ```bash
 ssync status        # namespace, session count, conflicts
