@@ -19,6 +19,7 @@ pub mod cleanup;
 pub mod cluster;
 mod config;
 mod divergence;
+mod exclude;
 mod reconcile;
 mod status;
 pub use config::{AgentConfig, Config, insert_cluster_path};
@@ -72,6 +73,9 @@ pub struct Engine {
     rotation_pending: bool,
     /// Import failures in the current pass; a rotation only settles at zero.
     import_errors: usize,
+    /// Per-agent session exclusion patterns (issue #14); a matching key is
+    /// invisible to reconcile from both sides, freezing it everywhere.
+    excludes: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Engine {
@@ -100,6 +104,7 @@ impl Engine {
             recipients_fp,
             rotation_pending: false,
             import_errors: 0,
+            excludes: Default::default(),
         }
     }
 
@@ -116,6 +121,11 @@ impl Engine {
     /// Override the peer re-sync cadence (tests).
     pub fn set_resync_interval(&mut self, interval: std::time::Duration) {
         self.resync_interval = interval;
+    }
+
+    /// Per-agent `exclude` patterns from config (`[[agents]]` tables).
+    pub fn set_excludes(&mut self, excludes: std::collections::HashMap<String, Vec<String>>) {
+        self.excludes = excludes;
     }
 
     /// Shut down the underlying node (flushes the blob store).
@@ -209,6 +219,9 @@ impl Engine {
                 continue; // deleted — never resurrect from stale live entries
             };
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            if self.excluded_key(&key) {
+                continue; // frozen keys neither count nor report conflicts
+            }
             match self
                 .dest_of(&key)
                 .and_then(|dest| self.adapter_of_key(&key)?.identify(&dest).ok())
@@ -292,6 +305,20 @@ impl Engine {
         key.strip_prefix(adapter.agent())?.strip_prefix('/')
     }
 
+    /// Whether a key falls under its agent's `exclude` patterns (issue #14).
+    /// Filtered out of BOTH reconcile inputs, so the key is frozen: never
+    /// imported, exported, tombstoned, or merged — here or on write-back.
+    fn excluded_key(&self, key: &str) -> bool {
+        let Some(adapter) = self.adapter_of_key(key) else {
+            return false;
+        };
+        let Some(patterns) = self.excludes.get(adapter.agent()) else {
+            return false;
+        };
+        self.relative_of(key)
+            .is_some_and(|rel| exclude::is_excluded(patterns, rel))
+    }
+
     /// The absolute session-dir path an index key maps to on this machine, or
     /// `None` when no configured adapter owns the key.
     fn dest_of(&self, key: &str) -> Option<PathBuf> {
@@ -341,11 +368,11 @@ impl Engine {
                     continue;
                 }
             };
-            out.push(LocalFile {
-                key: self.index_key(&id),
-                path,
-                stamp,
-            });
+            let key = self.index_key(&id);
+            if self.excluded_key(&key) {
+                continue;
+            }
+            out.push(LocalFile { key, path, stamp });
         }
         out
     }
@@ -356,6 +383,12 @@ impl Engine {
         let mut out = std::collections::HashMap::new();
         for rec in self.node.index_records().await? {
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
+            // No adapter = frozen, exactly like an excluded key: a dropped
+            // `[[agents]]` entry must never tombstone peers' sessions (the
+            // key would read as "materialised here, now gone").
+            if self.adapter_of_key(&key).is_none() || self.excluded_key(&key) {
+                continue;
+            }
             let merge_allowed = self.adapter_of_key(&key).is_some_and(|a| a.append_only());
             out.insert(
                 key,

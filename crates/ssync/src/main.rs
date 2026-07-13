@@ -438,6 +438,14 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         .map(|a| adapter_for(&a.agent, &a.session_dir))
         .collect::<Result<Vec<_>>>()?;
     let mut engine = Engine::with_adapters(adapters, identity, node);
+    engine.set_excludes(
+        config
+            .agents
+            .iter()
+            .filter(|a| !a.exclude.is_empty())
+            .map(|a| (a.agent.clone(), a.exclude.clone()))
+            .collect(),
+    );
     engine.persist_state(&config.data_dir.join("state.toml"));
     for a in &config.agents {
         println!(

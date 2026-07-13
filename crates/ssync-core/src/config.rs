@@ -14,6 +14,12 @@ pub struct AgentConfig {
     /// Agent name (see `ssync_adapters::adapter_for` for the supported set).
     pub agent: String,
     pub session_dir: PathBuf,
+    /// Session paths to withhold from sync (issue #14): `*`-glob patterns
+    /// against the session-dir-relative path (project dir + file name). A
+    /// matching session is frozen on every machine — never published,
+    /// never materialized, never deleted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 /// On-disk daemon configuration (`$XDG_CONFIG_HOME/ssync/config.toml`).
@@ -77,12 +83,14 @@ impl Config {
             .map(|(agent, dir)| AgentConfig {
                 agent: agent.to_string(),
                 session_dir: dir.clone(),
+                exclude: Vec::new(),
             })
             .collect();
         if agents.is_empty() {
             agents.push(AgentConfig {
                 agent: "pi".to_string(),
                 session_dir: home.join(".pi/agent/sessions"),
+                exclude: Vec::new(),
             });
         }
         Ok(Self {
@@ -240,6 +248,24 @@ mod tests {
         "#;
         let err = Config::parse(toml_str).unwrap_err().to_string();
         assert!(err.contains("cluster_path"), "{err}");
+    }
+
+    #[test]
+    fn agent_exclude_parses_and_defaults_empty() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+            exclude = ["*client-x*"]
+            [[agents]]
+            agent = "omp"
+            session_dir = "/o"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        assert_eq!(cfg.agents[0].exclude, ["*client-x*"]);
+        assert!(cfg.agents[1].exclude.is_empty());
     }
 
     #[test]

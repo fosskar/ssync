@@ -832,3 +832,193 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;
     assert!(ok, "issuer never learned the joiner as a fetch peer");
 }
+
+/// Issue #14: an excluded project is frozen from both sides — never
+/// published from the machine that excludes it, and never materialized
+/// there when a peer publishes it. Non-excluded traffic flows normally.
+#[tokio::test]
+async fn excluded_projects_neither_publish_nor_materialize() {
+    let base = scratch("exclude");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+
+    let rel_normal =
+        "--home-x-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+    let rel_secret =
+        "--home-x-client-x--/2026-05-23T07-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
+    let contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"hi\"}\n".to_vec();
+
+    // --- node A: excludes *client-x*, has one normal and one excluded session ---
+    let root_a = base.join("a/sessions");
+    for rel in [rel_normal, rel_secret] {
+        let p = root_a.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &contents).unwrap();
+    }
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut engine_a = pi_engine(&root_a, &secret, node_a);
+    engine_a.set_excludes([("pi".to_string(), vec!["*client-x*".to_string()])].into());
+    engine_a.tick_once().await;
+
+    // --- node B: no excludes ---
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket).await.unwrap();
+    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+
+    // the normal session reaches B ...
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if std::fs::read(root_b.join(rel_normal)).is_ok_and(|g| g == contents) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "non-excluded session did not sync to B");
+    // ... and the excluded one was never published (sync is live, so its
+    // absence on B proves A withheld it).
+    assert!(
+        !root_b.join(rel_secret).exists(),
+        "excluded session leaked to B"
+    );
+
+    // --- reverse: B creates a session in a project A excludes ---
+    let rel_secret_b =
+        "--home-x-client-x--/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4c.jsonl";
+    let rel_normal_b =
+        "--home-x-other--/2026-05-23T08-05-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4d.jsonl";
+    for rel in [rel_secret_b, rel_normal_b] {
+        let p = root_b.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &contents).unwrap();
+    }
+    engine_b.tick_once().await;
+
+    // when B's normal session lands on A, sync has round-tripped; the
+    // excluded key must not have materialized on A.
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        if std::fs::read(root_a.join(rel_normal_b)).is_ok_and(|g| g == contents) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "B's non-excluded session did not sync to A");
+    assert!(
+        !root_a.join(rel_secret_b).exists(),
+        "A materialized a session from an excluded project"
+    );
+    // B keeps its own excluded file untouched (freeze, not delete)
+    assert!(root_b.join(rel_secret_b).exists());
+}
+
+/// Removing an agent's `[[agents]]` entry must FREEZE its sessions, not
+/// tombstone them: the dropped agent's index keys look like "materialised
+/// here, now gone" (state still holds the import stamp), which without a
+/// guard propagates deletion to every peer.
+#[tokio::test]
+async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
+    let base = scratch("agent-drop");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let two_adapters = |root_pi: &Path, root_omp: &Path| -> Vec<Box<dyn Adapter>> {
+        vec![
+            Box::new(PiAdapter::new("pi", root_pi)),
+            Box::new(PiAdapter::new("omp", root_omp)),
+        ]
+    };
+
+    let rel = "--home-x-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+    let contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"omp\"}\n".to_vec();
+
+    // --- node A: pi + omp configured, one omp session, persisted state ---
+    let (root_pi_a, root_omp_a) = (base.join("a/pi"), base.join("a/omp"));
+    let src = root_omp_a.join(rel);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, &contents).unwrap();
+
+    let key_a = SecretKey::generate();
+    let mut node_a = Node::spawn(&base.join("a/data"), key_a.clone())
+        .await
+        .unwrap();
+    let ns = node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut engine_a = Engine::with_adapters(
+        two_adapters(&root_pi_a, &root_omp_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    let state_a = base.join("a/state.toml");
+    engine_a.persist_state(&state_a);
+    engine_a.tick_once().await;
+
+    // --- node B: same two agents, receives the omp session ---
+    let (root_pi_b, root_omp_b) = (base.join("b/pi"), base.join("b/omp"));
+    std::fs::create_dir_all(&root_pi_b).unwrap();
+    std::fs::create_dir_all(&root_omp_b).unwrap();
+    let mut node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
+        .await
+        .unwrap();
+    node_b.join(ticket).await.unwrap();
+    let b_addr = node_b.endpoint_addr();
+    let mut engine_b = Engine::with_adapters(
+        two_adapters(&root_pi_b, &root_omp_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    let dest = root_omp_b.join(rel);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if std::fs::read(&dest).is_ok_and(|g| g == contents) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "omp session did not sync to B");
+
+    // --- restart A with omp dropped from the config ---
+    engine_a.shutdown().await.unwrap();
+    let mut node_a2 = Node::spawn(&base.join("a/data"), key_a).await.unwrap();
+    node_a2.open_namespace(ns).await.unwrap();
+    node_a2.sync_with(vec![b_addr]).await.unwrap();
+    let mut engine_a2 = Engine::with_adapters(
+        vec![Box::new(PiAdapter::new("pi", &root_pi_a))],
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a2,
+    );
+    engine_a2.persist_state(&state_a);
+    engine_a2.tick_once().await;
+
+    // sentinel: a new pi session on A round-trips to B, proving sync is live
+    let rel_pi =
+        "--home-x-demo--/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
+    let p = root_pi_a.join(rel_pi);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, &contents).unwrap();
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a2.tick_once().await;
+        engine_b.tick_once().await;
+        if std::fs::read(root_pi_b.join(rel_pi)).is_ok_and(|g| g == contents) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "pi sentinel did not sync after restart");
+
+    // the dropped agent's session survives on B (frozen, not tombstoned) ...
+    assert!(
+        std::fs::read(&dest).is_ok_and(|g| g == contents),
+        "B lost the omp session after A dropped the agent"
+    );
+    // ... and A's own copy on disk is untouched
+    assert!(std::fs::read(&src).is_ok_and(|g| g == contents));
+}
