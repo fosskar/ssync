@@ -84,6 +84,12 @@ pub fn node_id_of(key_bytes: &[u8; 32]) -> String {
     SecretKey::from_bytes(key_bytes).public().to_string()
 }
 
+/// The namespace id a shared 32-byte secret derives (`ssync cluster show`
+/// prints it so machines can confirm they agree without starting the daemon).
+pub fn namespace_id_of(secret: &[u8; 32]) -> String {
+    NamespaceSecret::from_bytes(secret).id().to_string()
+}
+
 /// Parse peer node-id strings into addresses, tolerating surrounding whitespace
 /// (e.g. a trailing newline from a generated file) and skipping blank or
 /// malformed entries rather than failing the whole daemon.

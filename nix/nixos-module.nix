@@ -15,14 +15,11 @@ let
       age_identity_path = "${cfg.ageIdentityFile}"
       data_dir = "${cfg.dataDir}"
     ''
-    + lib.optionalString (cfg.namespaceSecretFile != null) ''
-      namespace_secret_path = "${cfg.namespaceSecretFile}"
+    + lib.optionalString (cfg.clusterFile != null) ''
+      cluster_path = "${cfg.clusterFile}"
     ''
     + lib.optionalString (cfg.nodeKeyFile != null) ''
       node_key_path = "${cfg.nodeKeyFile}"
-    ''
-    + lib.optionalString (cfg.peers != [ ]) ''
-      peers = [ ${lib.concatMapStringsSep ", " (p: "\"${lib.removeSuffix "\n" p}\"") cfg.peers} ]
     ''
     + lib.optionalString (cfg.recipients != [ ]) ''
       recipients = [ ${
@@ -161,13 +158,15 @@ in
       description = "ssync's own managed state (node key, blobs, docs, index).";
     };
 
-    namespaceSecretFile = lib.mkOption {
+    clusterFile = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = ''
-        Shared namespace secret file (same on every peer). When set, peers join
-        one deterministic namespace with no ticket exchange. The clan service
-        sets this via clan.vars.
+        Cluster membership artifact (same file on every peer): shared
+        namespace secret, every machine's age recipient, and node-ids.
+        Manage it with `ssync cluster`, or let the clan service generate it
+        via clan.vars. When set, peers join one deterministic namespace with
+        no ticket exchange; mutually exclusive with `recipients`.
       '';
     };
 
@@ -177,19 +176,13 @@ in
       description = "Override the iroh node key path (default: dataDir/node.key).";
     };
 
-    peers = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ ];
-      description = "Peer node-ids to sync with (the clan service fills these in).";
-    };
-
     recipients = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
       description = ''
         The other machines' age recipients (per-machine keys, multi-recipient
         encryption; this machine's own recipient is always included). Empty =
-        shared-identity mode. The clan service fills these in.
+        shared-identity mode. Not for cluster mode (the artifact carries them).
       '';
     };
 
@@ -233,6 +226,10 @@ in
       {
         assertion = !cfg.autoCleanup.enable || cfg.autoCleanup.keep != null || cfg.autoCleanup.unnamed;
         message = "services.ssync.autoCleanup selects nothing: set keep or unnamed";
+      }
+      {
+        assertion = cfg.clusterFile == null || cfg.recipients == [ ];
+        message = "services.ssync.clusterFile replaces recipients — the artifact carries them";
       }
     ];
 

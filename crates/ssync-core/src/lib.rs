@@ -16,6 +16,7 @@ use ssync_net::iroh_docs::engine::LiveEvent;
 use ssync_net::iroh_blobs::Hash;
 
 pub mod cleanup;
+pub mod cluster;
 mod config;
 mod divergence;
 mod reconcile;

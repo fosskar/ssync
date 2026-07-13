@@ -16,6 +16,9 @@ let
       age_identity_path = "${cfg.ageIdentityFile}"
       data_dir = "${cfg.dataDir}"
     ''
+    + lib.optionalString (cfg.clusterFile != null) ''
+      cluster_path = "${cfg.clusterFile}"
+    ''
     + lib.optionalString (cfg.recipients != [ ]) ''
       recipients = [ ${
         lib.concatMapStringsSep ", " (r: "\"${lib.removeSuffix "\n" r}\"") cfg.recipients
@@ -148,6 +151,17 @@ in
       '';
     };
 
+    clusterFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Cluster membership artifact (same file on every peer): shared
+        namespace secret, every machine's age recipient, and node-ids.
+        Manage it with `ssync cluster`; mutually exclusive with `recipients`
+        (the artifact carries them). Must be readable by the user.
+      '';
+    };
+
     dataDir = lib.mkOption {
       type = lib.types.str;
       default = "${config.xdg.dataHome}/ssync";
@@ -195,6 +209,10 @@ in
       {
         assertion = !cfg.autoCleanup.enable || cfg.autoCleanup.keep != null || cfg.autoCleanup.unnamed;
         message = "services.ssync.autoCleanup selects nothing: set keep or unnamed";
+      }
+      {
+        assertion = cfg.clusterFile == null || cfg.recipients == [ ];
+        message = "services.ssync.clusterFile replaces recipients — the artifact carries them";
       }
     ];
 

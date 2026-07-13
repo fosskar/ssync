@@ -34,11 +34,14 @@ Impure shell around pure decision cores:
   newest-wins. The merge verdict is all-or-skip: a partial version set never merges.
 - Per-key errors are logged (`eprintln!("ssync: …")`) and retried next tick; one bad key
   never kills the daemon.
-- Pairing is two modes: ticket exchange (`ssync ticket`/`join`; the ticket embeds direct
-  addresses) or shared-namespace mode (clan: `namespace_secret_path` derives the same
-  namespace on every peer, `peers` node-ids resolve via iroh discovery — no ticket).
-  `recipients` set = per-machine age identities with multi-recipient encryption; empty =
-  one shared identity. Recipient-set or namespace changes re-publish/evict (issue #22).
+- Pairing is two mechanisms: the cluster artifact (`ssync cluster
+  init/join/add/rm/show`; one secret file = namespace secret + recipients + node-ids,
+  `cluster_path` in config — the recommended mode; clan assembles the same file at
+  service start via `ssync cluster render`) and ad-hoc ticket exchange (`ssync
+  ticket`/`join`; the ticket embeds direct addresses).
+  `recipients` set (ticket mode only) = per-machine age identities with
+  multi-recipient encryption; empty = one shared identity. Recipient-set or namespace
+  changes re-publish/evict (issue #22).
 
 ### Hard rules (pointers into docs/DECISIONS.md — don't re-litigate)
 
@@ -55,9 +58,9 @@ Impure shell around pure decision cores:
 
 ## Key Directories
 
-- `crates/ssync/` — binary: clap CLI (`init/daemon/ticket/join/status/conflicts/cleanup/`
-  `service/keygen-node/keygen-namespace`) + daemon wiring; `src/main.rs` dispatches, pure
-  decision cores live in submodules (`service.rs`).
+- `crates/ssync/` — binary: clap CLI (`init/daemon/cluster/ticket/join/status/conflicts/`
+  `cleanup/service/keygen-node`) + daemon wiring; `src/main.rs` dispatches, pure
+  decision cores live in submodules (`service.rs`, `cluster.rs`).
 - `crates/ssync-core/` — `Config`, `Engine`, `StatusReport`; pure decision cores live in
   their own submodules.
 - `crates/ssync-net/` — iroh endpoint/router/docs/blobs/gossip setup, `Node`,
