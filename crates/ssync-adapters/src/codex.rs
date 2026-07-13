@@ -70,10 +70,10 @@ impl Adapter for CodexAdapter {
         })
     }
 
-    /// Codex source opens rollouts with `OpenOptions::append(true)` and
-    /// compaction appends rather than rewrites — but this has not been
-    /// verified against a real session file yet, so the merge path stays
-    /// gated off until then (issue #7).
+    /// Newest-wins permanently by policy (DECISIONS §8 amendment, #25):
+    /// codex source opens rollouts with `OpenOptions::append(true)`, but a
+    /// wrong `true` scrambles content on conflict, and per-version
+    /// re-verification is a treadmill this project refuses.
     fn append_only(&self) -> bool {
         false
     }
@@ -145,9 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_stays_gated_until_append_only_is_verified() {
-        // source shows OpenOptions::append, but no real session file has
-        // confirmed it; a conflict must take newest-wins for now (issue #7).
+    fn merge_stays_off_by_policy() {
+        // newest-wins permanently (DECISIONS §8 amendment, #25) — a conflict
+        // must never take the line-union merge.
         assert!(!CodexAdapter::new("/r").append_only());
     }
 

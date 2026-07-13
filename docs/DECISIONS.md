@@ -245,6 +245,17 @@ over a partially-downloaded version set would transiently drop a fork's lines. A
 non-append-only adapter falls back to detect + keep-both + newest-wins (the
 `Adapter::append_only` flag gates the merge action in `reconcile`).
 
+**Amended (2026-07, #25 closed wontfix):** merge stays pi/omp-only, permanently. Flipping
+`append_only()` requires verifying real session files per agent *and per agent version* —
+a treadmill that grows with every adapter — and a wrong `true` corrupts content on
+conflict, which is worse than losing a fork. Policy: new adapters are newest-wins,
+full stop; `append_only()` flips only if the format's author documents the guarantee.
+Be honest about what newest-wins costs: the losing fork's blob survives only until the
+losing author next touches that session (re-import republishes and orphans it → GC), and
+no CLI extracts a losing fork — divergence under newest-wins is effective line loss.
+That asymmetry (loss vs corruption) is the whole policy: merge where verified, plain
+newest-wins everywhere else, no in-between.
+
 **Blob GC:** every blob referenced by any author's *current* index entry (any
 replica) is protected — iroh-docs feeds those hashes to iroh-blobs' GC protect
 callback — and everything else is swept periodically. Only superseded content
@@ -283,7 +294,8 @@ pi/omp format is known (verified from source): per-session append-only JSONL at
 `<root>/<encoded-cwd>/<ts>_<id>.jsonl`, session id = uuidv7 in the filename, append-only
 confirmed (so merge is safe — §8). The cwd-encoding differs between pi and omp but identity
 never decodes it (the dir name is opaque). claude-code and codex adapters have since
-shipped (newest-wins until append-only is verified — #25, history in #6/#7); remaining
+shipped (newest-wins permanently by policy — §8 amendment, #25; verification history in
+#6/#7); remaining
 agents are tracked in the issue tracker (#8, #20). See
 docs/pi-format-notes.md.
 

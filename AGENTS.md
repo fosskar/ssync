@@ -66,7 +66,7 @@ Impure shell around pure decision cores:
   Rust `age`-crate backend disabled behind feature `rust-age` until it gains ML-KEM.
 - `crates/ssync-adapters/` — `Adapter` trait + `adapter_for` factory. New agent = one
   `impl Adapter` + one `adapter_for` arm (`"pi" | "omp"` share `PiAdapter`; claude-code
-  and codex have their own impls, merge gated off until append-only is verified).
+  and codex have their own impls, newest-wins permanently by policy — DECISIONS §8, #25).
 - `nix/` — package, devshell, treefmt, checks (incl. three NixOS VM tests), NixOS/HM/clan
   modules, nixbot effects.
 - `docs/` — DECISIONS.md, identity.md, pairing.md, setup.md, threat-model.md,
