@@ -70,10 +70,8 @@ impl Adapter for CodexAdapter {
         })
     }
 
-    /// Newest-wins permanently by policy (DECISIONS §8 amendment, #25):
-    /// codex source opens rollouts with `OpenOptions::append(true)`, but a
-    /// wrong `true` scrambles content on conflict, and per-version
-    /// re-verification is a treadmill this project refuses.
+    /// Newest-wins permanently by policy (DECISIONS §8 amendment, #25), even
+    /// though codex source opens rollouts with `OpenOptions::append(true)`.
     fn append_only(&self) -> bool {
         false
     }

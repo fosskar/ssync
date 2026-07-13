@@ -58,10 +58,8 @@ impl Adapter for ClaudeCodeAdapter {
         })
     }
 
-    /// Newest-wins permanently by policy (DECISIONS §8 amendment, #25):
-    /// upstream docs describe the transcript as append-only, but a wrong
-    /// `true` scrambles content on conflict, and per-version re-verification
-    /// is a treadmill this project refuses.
+    /// Newest-wins permanently by policy (DECISIONS §8 amendment, #25), even
+    /// though upstream docs describe the transcript as append-only.
     fn append_only(&self) -> bool {
         false
     }
