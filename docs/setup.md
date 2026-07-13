@@ -158,6 +158,11 @@ data_dir = "~/.local/share/ssync"
 [[agents]]
 agent = "pi"
 session_dir = "~/.pi/agent/sessions"
+# optional: withhold matching sessions from sync (`*`-glob against the
+# path under session_dir, so a project dir name works). A matching
+# session is frozen on every machine: never published, never
+# materialized, never deleted.
+exclude = ["*client-x*"]
 
 # optional: sync omp (oh-my-pi) sessions side by side
 [[agents]]
@@ -175,9 +180,17 @@ agent = "codex"
 session_dir = "~/.codex/sessions"
 ```
 
-The Nix modules generate this file for you from their options. `ssync init`
-writes a default config listing every known agent whose session directory
-exists on the machine (pi, omp, claude-code, codex).
+The Nix modules generate this file for you from their options (`exclude` is
+per agent entry there too). `ssync init` writes a default config listing every
+known agent whose session directory exists on the machine (pi, omp,
+claude-code, codex).
+
+**Disabling an agent** needs no switch: an agent syncs only while it has an
+`[[agents]]` entry, so remove the entry (nix: drop it from
+`services.ssync.agents`) and restart. Already-synced sessions freeze — peers
+keep their copies, nothing is deleted — and the daemon ignores index entries
+for agents it has no adapter for. Machines that never had the agent installed
+simply materialize its sessions if it is configured, or skip them if not.
 
 ## First machine
 

@@ -24,11 +24,17 @@ let
         lib.concatMapStringsSep ", " (r: "\"${lib.removeSuffix "\n" r}\"") cfg.recipients
       } ]
     ''
-    + lib.concatMapStrings (a: ''
-      [[agents]]
-      agent = "${a.agent}"
-      session_dir = "${a.sessionDir}"
-    '') cfg.agents
+    + lib.concatMapStrings (
+      a:
+      ''
+        [[agents]]
+        agent = "${a.agent}"
+        session_dir = "${a.sessionDir}"
+      ''
+      + lib.optionalString (a.exclude != [ ]) ''
+        exclude = [ ${lib.concatMapStringsSep ", " (p: "\"${p}\"") a.exclude} ]
+      ''
+    ) cfg.agents
   );
   cleanupArgs = lib.concatStringsSep " " (
     lib.optionals (cfg.autoCleanup.keep != null) [
@@ -102,6 +108,16 @@ in
             sessionDir = lib.mkOption {
               type = lib.types.str;
               description = "The agent's watched directory (absolute path).";
+            };
+            exclude = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "*client-x*" ];
+              description = ''
+                `*`-glob patterns against the session-dir-relative path;
+                matching sessions are withheld from sync on this machine and
+                frozen everywhere (never published, materialized, or deleted).
+              '';
             };
           };
         }
