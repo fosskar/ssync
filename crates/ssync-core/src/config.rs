@@ -130,13 +130,37 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Atomic overwrite (temp + rename), mirroring `SyncState::save`
+    /// (reconcile.rs) — a crash mid-write must never leave a truncated config.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)
-            .with_context(|| format!("writing config {}", path.display()))
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, toml::to_string_pretty(self)?)
+            .with_context(|| format!("writing config {}", path.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing config {}", path.display()))
     }
+
+    /// The node key path to use: `node_key_path` when set, else
+    /// `data_dir/node.key`.
+    pub fn node_key_file(&self) -> PathBuf {
+        self.node_key_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("node.key"))
+    }
+}
+
+/// Prepend a top-level `cluster_path = "…"` key to existing config text.
+/// Prepend, not append: a bare key must precede every table header
+/// (`[[agents]]` etc.), and prepending is the only placement that reparses
+/// correctly no matter where the caller's tables start. Textual, not
+/// parse-mutate-reserialize: `parse`'s cross-machine promise (above) rests on
+/// this file's comments and portable `~/` paths surviving untouched, and only
+/// leaving every other line byte-for-byte alone guarantees that.
+pub fn insert_cluster_path(text: &str, path: &Path) -> String {
+    let escaped = toml::Value::String(path.display().to_string()).to_string();
+    format!("cluster_path = {escaped}\n{text}")
 }
 
 /// Pick the config the CLI should read: the user config wherever it exists,
@@ -340,5 +364,58 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.cluster_path, None);
         assert_eq!(cfg.node_key_path, None);
+    }
+
+    #[test]
+    fn save_writes_no_tmp_sibling_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("ssync-cfgsave-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = Config::defaults().unwrap();
+        cfg.save(&path).unwrap();
+        assert!(!path.with_extension("tmp").exists(), "tmp sibling leaked");
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.data_dir, cfg.data_dir);
+        assert_eq!(loaded.agents.len(), cfg.agents.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn node_key_file_defaults_under_data_dir() {
+        let mut cfg = Config::defaults().unwrap();
+        cfg.data_dir = PathBuf::from("/d");
+        cfg.node_key_path = None;
+        assert_eq!(cfg.node_key_file(), PathBuf::from("/d/node.key"));
+        cfg.node_key_path = Some(PathBuf::from("/custom/key"));
+        assert_eq!(cfg.node_key_file(), PathBuf::from("/custom/key"));
+    }
+
+    #[test]
+    fn insert_cluster_path_prepends_before_tables_and_keeps_comments() {
+        let text = "# my config\nage_identity_path = \"/k\"\ndata_dir = \"/d\"\n# per-agent list\n[[agents]]\nagent = \"pi\"\nsession_dir = \"/s\"\n";
+        let out = insert_cluster_path(text, Path::new("/c/cluster.toml"));
+        assert!(
+            out.starts_with("cluster_path = "),
+            "must be a top-level key, before any table: {out}"
+        );
+        for line in text.lines() {
+            assert!(out.contains(line), "line lost by rewrite: {line}\n{out}");
+        }
+        let cfg = Config::parse(&out).unwrap();
+        assert_eq!(
+            cfg.cluster_path.as_deref(),
+            Some(Path::new("/c/cluster.toml"))
+        );
+        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.data_dir, Path::new("/d"));
+    }
+
+    #[test]
+    fn insert_cluster_path_escapes_quotes_and_backslashes() {
+        let text = "age_identity_path = \"/k\"\ndata_dir = \"/d\"\n[[agents]]\nagent = \"pi\"\nsession_dir = \"/s\"\n";
+        let path = Path::new("C:\\weird \"name\"\\cluster.toml");
+        let out = insert_cluster_path(text, path);
+        let cfg = Config::parse(&out).unwrap();
+        assert_eq!(cfg.cluster_path.as_deref(), Some(path));
     }
 }

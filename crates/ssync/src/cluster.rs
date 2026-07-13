@@ -5,12 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use ssync_core::Config;
 use ssync_core::cluster::ClusterFile;
-use ssync_crypto::AgeIdentity;
 
-use crate::{read_secret_text, write_secret};
+use crate::{
+    ensure_no_recipients, load_or_bootstrap_config, load_or_generate_identity, read_secret_text,
+    write_secret,
+};
 
 /// Default artifact location: `cluster.toml` next to the config file.
 fn default_artifact_path(config_path: &Path) -> PathBuf {
@@ -35,43 +37,34 @@ fn print_distribute_hint(path: &Path) {
     println!("(new machines adopt it with `ssync cluster join <file>`)");
 }
 
+/// Top-level key insert only (F3): preserves the config's comments and
+/// portable `~/` paths — see `ssync_core::insert_cluster_path` — and needs no
+/// second `Config::save` reserialize on top of whatever wrote the file.
+fn insert_cluster_path_on_disk(config_path: &Path, cluster_path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading config {}", config_path.display()))?;
+    let new_text = ssync_core::insert_cluster_path(&text, cluster_path);
+    let tmp = config_path.with_extension("tmp");
+    std::fs::write(&tmp, &new_text)
+        .with_context(|| format!("writing config {}", config_path.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .with_context(|| format!("writing config {}", config_path.display()))
+}
+
 /// Create the artifact with this machine as first member and point the config
 /// at it. Generates the age identity and node key if missing.
 pub async fn cmd_init(config_path: &Path, path: Option<PathBuf>) -> Result<()> {
-    let config = if config_path.exists() {
-        Config::load(config_path)?
-    } else {
-        let c = Config::defaults()?;
-        c.save(config_path)?;
-        println!("wrote config {}", config_path.display());
-        c
-    };
+    let (config, _pre_existed) = load_or_bootstrap_config(config_path)?;
     if let Some(existing) = &config.cluster_path {
         return Err(anyhow!(
             "config already points at cluster file {} — use `ssync cluster add/rm`",
             existing.display()
         ));
     }
-    ensure!(
-        config.recipients.is_empty(),
-        "config sets recipients — the cluster file replaces them, remove them first"
-    );
+    ensure_no_recipients(&config)?;
 
-    let identity = if config.age_identity_path.exists() {
-        crate::load_identity(&config.age_identity_path)?
-    } else {
-        let id = AgeIdentity::generate()?;
-        write_secret(&config.age_identity_path, &id.to_secret_string())?;
-        println!(
-            "generated age identity {}",
-            config.age_identity_path.display()
-        );
-        id
-    };
-    let node_key_path = config
-        .node_key_path
-        .clone()
-        .unwrap_or_else(|| config.data_dir.join("node.key"));
+    let identity = load_or_generate_identity(&config)?;
+    let node_key_path = config.node_key_file();
     let secret = ssync_net::load_or_create_secret_key(&node_key_path).await?;
     let node_id = secret.public().to_string();
 
@@ -80,10 +73,7 @@ pub async fn cmd_init(config_path: &Path, path: Option<PathBuf>) -> Result<()> {
 
     let artifact_path = path.unwrap_or_else(|| default_artifact_path(config_path));
     write_secret(&artifact_path, &cluster.to_toml()?)?;
-
-    let mut config = config;
-    config.cluster_path = Some(artifact_path.clone());
-    config.save(config_path)?;
+    insert_cluster_path_on_disk(config_path, &artifact_path)?;
 
     println!("cluster initialized at {}", artifact_path.display());
     println!(
@@ -103,32 +93,25 @@ pub async fn cmd_init(config_path: &Path, path: Option<PathBuf>) -> Result<()> {
 /// Adopt a received cluster file on this machine: copy it to the default
 /// location (0600) and point the config at it.
 pub fn cmd_join(config_path: &Path, file: &Path) -> Result<()> {
-    let config = if config_path.exists() {
-        Config::load(config_path)?
-    } else {
-        let c = Config::defaults()?;
-        c.save(config_path)?;
-        println!("wrote config {}", config_path.display());
-        c
-    };
-    ensure!(
-        config.recipients.is_empty(),
-        "config sets recipients — the cluster file replaces them, remove them first"
-    );
+    let (config, _pre_existed) = load_or_bootstrap_config(config_path)?;
+    ensure_no_recipients(&config)?;
     let text = std::fs::read_to_string(file)
         .with_context(|| format!("reading cluster file {}", file.display()))?;
     let cluster =
         ClusterFile::parse(&text).with_context(|| format!("cluster file {}", file.display()))?;
 
+    let had_cluster_path = config.cluster_path.is_some();
     let dest = config
         .cluster_path
         .clone()
         .unwrap_or_else(|| default_artifact_path(config_path));
     write_secret(&dest, &text)?;
 
-    let mut config = config;
-    config.cluster_path = Some(dest.clone());
-    config.save(config_path)?;
+    // config.cluster_path already pointed here — nothing changed, so skip
+    // rewriting the config entirely (F3).
+    if !had_cluster_path {
+        insert_cluster_path_on_disk(config_path, &dest)?;
+    }
 
     println!("adopted cluster file at {}", dest.display());
     println!(
@@ -298,6 +281,58 @@ mod tests {
         assert_eq!(dest, dir.join("cluster.toml"));
         let adopted = ClusterFile::parse(&read_secret_text(&dest).unwrap()).unwrap();
         assert_eq!(adopted.namespace_secret(), [3; 32]);
+    }
+
+    #[test]
+    fn join_preserves_config_text_when_cluster_path_already_set() {
+        // F3: `dest` is already `config.cluster_path`, so re-adopting must
+        // not touch the config file at all — only the artifact changes.
+        let (config_path, artifact) = scratch("join-noop");
+        let before = std::fs::read_to_string(&config_path).unwrap();
+
+        let received = config_path.with_file_name("received.toml");
+        std::fs::write(&received, ClusterFile::new([9; 32]).to_toml().unwrap()).unwrap();
+        cmd_join(&config_path, &received).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "config text must be byte-identical when cluster_path was already set"
+        );
+        let adopted = ClusterFile::parse(&read_secret_text(&artifact).unwrap()).unwrap();
+        assert_eq!(adopted.namespace_secret(), [9; 32], "artifact must update");
+    }
+
+    #[tokio::test]
+    async fn init_keeps_config_comments_and_agents_when_pre_existing() {
+        // F3: cmd_init must textually insert cluster_path, not reserialize —
+        // a pre-existing config's comments and tables survive verbatim.
+        let dir =
+            std::env::temp_dir().join(format!("ssync-cluster-{}-init-text", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let identity = ssync_crypto::AgeIdentity::generate().unwrap();
+        write_secret(&dir.join("age.key"), &identity.to_secret_string()).unwrap();
+        let original = format!(
+            "# hand-written config, keep me\nage_identity_path = \"{}\"\ndata_dir = \"{}\"\n# agents to sync\n[[agents]]\nagent = \"pi\"\nsession_dir = \"{}\"\n",
+            dir.join("age.key").display(),
+            dir.join("data").display(),
+            dir.join("sessions").display(),
+        );
+        std::fs::write(&config_path, &original).unwrap();
+
+        cmd_init(&config_path, None).await.unwrap();
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        for line in original.lines() {
+            assert!(
+                after.contains(line),
+                "line lost by cmd_init: {line}\n{after}"
+            );
+        }
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.cluster_path, Some(dir.join("cluster.toml")));
+        assert_eq!(config.agents.len(), 1);
     }
 
     #[test]

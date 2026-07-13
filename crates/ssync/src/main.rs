@@ -4,9 +4,10 @@ mod cleanup_timer;
 mod cluster;
 mod service;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use ssync_adapters::adapter_for;
 use ssync_core::{Config, Engine, StatusReport};
@@ -312,34 +313,20 @@ fn cmd_cleanup(
 }
 
 async fn cmd_init(config_path: &Path) -> Result<()> {
-    let config = if config_path.exists() {
-        Config::load(config_path)?
-    } else {
-        let c = Config::defaults()?;
-        c.save(config_path)?;
-        println!("wrote config {}", config_path.display());
-        c
-    };
-
-    if config.age_identity_path.exists() {
-        let id = load_identity(&config.age_identity_path)?;
-        println!("age recipient: {}", id.recipient_string());
-    } else {
-        let id = AgeIdentity::generate()?;
-        write_secret(&config.age_identity_path, &id.to_secret_string())?;
+    let (config, _pre_existed) = load_or_bootstrap_config(config_path)?;
+    let already_had_identity = config.age_identity_path.exists();
+    let id = load_or_generate_identity(&config)?;
+    println!("age recipient: {}", id.recipient_string());
+    if !already_had_identity {
         println!(
-            "generated age identity {}",
-            config.age_identity_path.display()
+            "run `ssync cluster init` here, then `ssync cluster add <recipient>` for each machine (recommended),"
         );
-        println!("age recipient: {}", id.recipient_string());
-        println!("either copy this age key to your other machines (same key everywhere),");
-        println!("or keep one key per machine and list the peers' recipients in `recipients`.");
+        println!(
+            "or for ticket mode: copy this key everywhere, or list peers' recipients in `recipients`."
+        );
     }
     // the node-id pairs with the recipient in `ssync cluster add`
-    let node_key_path = config
-        .node_key_path
-        .clone()
-        .unwrap_or_else(|| config.data_dir.join("node.key"));
+    let node_key_path = config.node_key_file();
     let secret = load_or_create_secret_key(&node_key_path).await?;
     println!("node-id: {}", secret.public());
     Ok(())
@@ -362,16 +349,22 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     if !config.age_identity_path.exists() {
         let id = AgeIdentity::generate()?;
         write_secret(&config.age_identity_path, &id.to_secret_string())?;
-        if config.recipients.is_empty() {
-            eprintln!(
-                "ssync: generated age identity {}; other machines must use this same key",
-                config.age_identity_path.display()
-            );
+        if config.cluster_path.is_none() {
+            if config.recipients.is_empty() {
+                eprintln!(
+                    "ssync: generated age identity {}; other machines must use this same key",
+                    config.age_identity_path.display()
+                );
+            } else {
+                eprintln!(
+                    "ssync: generated age identity {}; add this recipient via `ssync cluster add` (recommended) or to the peers' `recipients`",
+                    config.age_identity_path.display()
+                );
+            }
         } else {
             eprintln!(
-                "ssync: generated age identity {}; add recipient {} to the peers' config",
-                config.age_identity_path.display(),
-                id.recipient_string()
+                "ssync: generated age identity {}",
+                config.age_identity_path.display()
             );
         }
     }
@@ -395,10 +388,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         }
     }
 
-    let node_key_path = config
-        .node_key_path
-        .clone()
-        .unwrap_or_else(|| config.data_dir.join("node.key"));
+    let node_key_path = config.node_key_file();
     let secret = load_or_create_secret_key(&node_key_path).await?;
     let mut node = Node::spawn(&config.data_dir, secret).await?;
     node.enable_mdns();
@@ -552,6 +542,43 @@ fn load_identity(path: &Path) -> Result<AgeIdentity> {
     AgeIdentity::from_secret_string(text.trim())
 }
 
+/// Load the config if present, else write built-in defaults; returns whether
+/// the file pre-existed (`ssync cluster init`/`join` need that — F3).
+fn load_or_bootstrap_config(config_path: &Path) -> Result<(Config, bool)> {
+    if config_path.exists() {
+        Ok((Config::load(config_path)?, true))
+    } else {
+        let c = Config::defaults()?;
+        c.save(config_path)?;
+        println!("wrote config {}", config_path.display());
+        Ok((c, false))
+    }
+}
+
+/// Load the shared age identity, generating and persisting one on first run.
+fn load_or_generate_identity(config: &Config) -> Result<AgeIdentity> {
+    if config.age_identity_path.exists() {
+        load_identity(&config.age_identity_path)
+    } else {
+        let id = AgeIdentity::generate()?;
+        write_secret(&config.age_identity_path, &id.to_secret_string())?;
+        println!(
+            "generated age identity {}",
+            config.age_identity_path.display()
+        );
+        Ok(id)
+    }
+}
+
+/// The cluster file replaces `recipients` — reject an ambiguous config.
+fn ensure_no_recipients(config: &Config) -> Result<()> {
+    ensure!(
+        config.recipients.is_empty(),
+        "config sets recipients — the cluster file replaces them, remove them first"
+    );
+    Ok(())
+}
+
 /// Write a secret string with `0600` permissions.
 fn write_secret(path: &Path, contents: &str) -> Result<()> {
     write_secret_bytes(path, contents.as_bytes())
@@ -559,11 +586,39 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 
 /// Write secret bytes with `0600` permissions.
 fn write_secret_bytes(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_secret_bytes_persists_0600_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ssync-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        write_secret_bytes(&path, b"top secret").unwrap();
+        assert!(!path.with_extension("tmp").exists(), "tmp sibling leaked");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"top secret");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

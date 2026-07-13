@@ -21,7 +21,7 @@ mod config;
 mod divergence;
 mod reconcile;
 mod status;
-pub use config::{AgentConfig, Config};
+pub use config::{AgentConfig, Config, insert_cluster_path};
 use divergence::{Divergence, Verdict};
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 pub use status::{PeerStatus, StatusReport};
