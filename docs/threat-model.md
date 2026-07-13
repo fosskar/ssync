@@ -29,23 +29,29 @@ What ssync protects, what it exposes, and the assumptions it makes.
 - **Your machines are trusted.** ssync is designed for one user's own set of
   machines. Every machine in the recipient set can decrypt every synced session —
   multi-recipient encryption is about *revocation*, not compartmentalization.
-  With per-machine keypairs (the recommended mode), removing a machine's
-  recipient from the remaining machines' `recipients` makes every daemon
-  re-encrypt and re-publish all sessions under the new recipient set (the
-  recipient set is fingerprinted in the sync state; superseded ciphertext is
-  garbage-collected). Recipients gate *content*; the namespace secret gates
-  *index write access and metadata*, and the removed machine still holds it —
-  full eviction also rotates the namespace (automatic with the clan service;
-  manual setups re-pair or distribute a new shared secret, and the daemon
-  drops abandoned replicas on start; see issue #22). Revocation is
-  forward-only: blobs the removed machine already fetched stay readable.
+  With the cluster file (the recommended mode), removing a machine —
+  `ssync cluster rm <recipient>` — rotates the namespace secret inside the
+  artifact; the removed machine still knows the old secret (= index write
+  access), so that rotation is what actually evicts it (automatic with the
+  clan service on the next deploy). Every remaining machine also detects the
+  changed recipient set and re-encrypts/re-publishes all sessions under it
+  (the recipient set is fingerprinted in the sync state; superseded
+  ciphertext is garbage-collected; see issue #22), then opens the new
+  namespace and drops the abandoned replica. In ticket mode (the ad-hoc
+  alternative, no cluster file), eviction means editing each machine's
+  `recipients` by hand and distributing a new shared secret manually.
+  Revocation is forward-only either way: blobs the removed machine already
+  fetched stay readable.
 - **Age keys are the crown jewels.** Any key in the recipient set decrypts all
   synced sessions. Store keys `0600` (the daemon refuses to run on a
   group/world-readable key). In shared mode, provision the one key over a
   trusted channel and manage it with your existing secret tooling (e.g.
   sops-nix); in per-machine mode keys never leave their machine.
-- **Pairing tickets are secrets.** A ticket grants write access to your index.
-  Share it only with your own machines over a channel you trust.
+- **Pairing tickets and the cluster file are secrets.** A ticket grants write
+  access to your index; the cluster file additionally holds the namespace
+  secret (same index write access) alongside recipients — public keys — but
+  the secret inside makes the whole file secret. Share either only with your
+  own machines, over a channel you trust.
 
 ## Non-goals
 

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// One agent to sync: its name and the session directory to watch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Agent name (see `ssync_adapters::adapter_for` for the supported set).
     pub agent: String,
@@ -16,26 +17,28 @@ pub struct AgentConfig {
 }
 
 /// On-disk daemon configuration (`$XDG_CONFIG_HOME/ssync/config.toml`).
+/// Unknown keys are hard errors so removed fields (pre-0.14
+/// `namespace_secret_path`/`peers`) and typos fail loudly instead of
+/// silently changing the pairing mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Agents to sync side by side (`[[agents]]` tables).
     pub agents: Vec<AgentConfig>,
     /// Shared age identity file (same key on every machine).
     pub age_identity_path: PathBuf,
     pub data_dir: PathBuf,
-    /// Shared namespace secret (same on every peer). When set, peers auto-join
-    /// this one namespace with no ticket exchange (clan provides it).
+    /// Cluster membership artifact (`ssync cluster`, clan.vars): shared
+    /// namespace secret, recipients, and peer node-ids in one distributable
+    /// file. Mutually exclusive with `recipients`.
     #[serde(default)]
-    pub namespace_secret_path: Option<PathBuf>,
+    pub cluster_path: Option<PathBuf>,
     /// Override the node key path (default: `data_dir/node.key`).
     #[serde(default)]
     pub node_key_path: Option<PathBuf>,
-    /// Peer node-ids to sync with (clan fills this from the other machines).
-    #[serde(default)]
-    pub peers: Vec<String>,
     /// Peer machines' age recipients (multi-recipient encryption; own recipient
     /// is always included). Empty = shared-identity mode.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipients: Vec<String>,
 }
 
@@ -86,9 +89,8 @@ impl Config {
             agents,
             age_identity_path: config.join("ssync/age.key"),
             data_dir: data.join("ssync"),
-            namespace_secret_path: None,
+            cluster_path: None,
             node_key_path: None,
-            peers: Vec::new(),
             recipients: Vec::new(),
         })
     }
@@ -114,22 +116,51 @@ impl Config {
         }
         expand(&mut cfg.age_identity_path);
         expand(&mut cfg.data_dir);
-        if let Some(p) = &mut cfg.namespace_secret_path {
+        if let Some(p) = &mut cfg.cluster_path {
             expand(p);
         }
         if let Some(p) = &mut cfg.node_key_path {
             expand(p);
         }
+        if cfg.cluster_path.is_some() && !cfg.recipients.is_empty() {
+            return Err(anyhow!(
+                "cluster_path replaces recipients — remove them from the config"
+            ));
+        }
         Ok(cfg)
     }
 
+    /// Atomic overwrite (temp + rename), mirroring `SyncState::save`
+    /// (reconcile.rs) — a crash mid-write must never leave a truncated config.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)
-            .with_context(|| format!("writing config {}", path.display()))
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, toml::to_string_pretty(self)?)
+            .with_context(|| format!("writing config {}", path.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing config {}", path.display()))
     }
+
+    /// The node key path to use: `node_key_path` when set, else
+    /// `data_dir/node.key`.
+    pub fn node_key_file(&self) -> PathBuf {
+        self.node_key_path
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("node.key"))
+    }
+}
+
+/// Prepend a top-level `cluster_path = "…"` key to existing config text.
+/// Prepend, not append: a bare key must precede every table header
+/// (`[[agents]]` etc.), and prepending is the only placement that reparses
+/// correctly no matter where the caller's tables start. Textual, not
+/// parse-mutate-reserialize: `parse`'s cross-machine promise (above) rests on
+/// this file's comments and portable `~/` paths surviving untouched, and only
+/// leaving every other line byte-for-byte alone guarantees that.
+pub fn insert_cluster_path(text: &str, path: &Path) -> String {
+    let escaped = toml::Value::String(path.display().to_string()).to_string();
+    format!("cluster_path = {escaped}\n{text}")
 }
 
 /// Pick the config the CLI should read: the user config wherever it exists,
@@ -179,15 +210,69 @@ mod tests {
     }
 
     #[test]
-    fn config_round_trips_with_peers() {
+    fn cluster_path_parses_and_expands_tilde() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            cluster_path = "~/cluster.toml"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        let p = cfg.cluster_path.unwrap();
+        assert!(!p.starts_with("~"), "tilde must expand: {}", p.display());
+        assert!(p.ends_with("cluster.toml"));
+    }
+
+    #[test]
+    fn cluster_path_excludes_recipients() {
+        // the artifact is the single source of truth for membership; a config
+        // that also sets recipients is ambiguous.
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            cluster_path = "/c/cluster.toml"
+            recipients = ["age1x"]
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let err = Config::parse(toml_str).unwrap_err().to_string();
+        assert!(err.contains("cluster_path"), "{err}");
+    }
+
+    #[test]
+    fn removed_membership_fields_fail_loudly() {
+        // pre-0.14 shared-namespace configs (clan-rendered) must not silently
+        // degrade to ticket mode — an unknown key is a hard parse error.
+        for legacy in ["namespace_secret_path = \"/n\"", "peers = [\"aaa\"]"] {
+            let toml_str = format!(
+                r#"
+                age_identity_path = "/k"
+                data_dir = "/d"
+                {legacy}
+                [[agents]]
+                agent = "pi"
+                session_dir = "/s"
+            "#
+            );
+            assert!(
+                Config::parse(&toml_str).is_err(),
+                "{legacy} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn config_round_trips_nix_module_fields() {
         // mirrors the daemon config the nix modules render, including the
-        // shared-namespace fields and a multi-element peers array.
+        // cluster artifact path.
         let toml_str = r#"
             age_identity_path = "/run/secrets/age/key"
             data_dir = "/var/lib/ssync"
-            namespace_secret_path = "/run/secrets/ns/secret"
+            cluster_path = "/run/secrets/cluster/cluster.toml"
             node_key_path = "/run/secrets/node/key"
-            peers = [ "aaa", "bbb" ]
 
             [[agents]]
             agent = "pi"
@@ -200,10 +285,9 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.agents.len(), 2);
         assert_eq!(cfg.agents[1].agent, "omp");
-        assert_eq!(cfg.peers, vec!["aaa".to_string(), "bbb".to_string()]);
         assert_eq!(
-            cfg.namespace_secret_path.as_deref(),
-            Some(Path::new("/run/secrets/ns/secret"))
+            cfg.cluster_path.as_deref(),
+            Some(Path::new("/run/secrets/cluster/cluster.toml"))
         );
         assert_eq!(
             cfg.node_key_path.as_deref(),
@@ -212,8 +296,7 @@ mod tests {
         // render back out and reparse: the fields survive a full round-trip.
         let rendered = toml::to_string(&cfg).unwrap();
         let cfg2: Config = toml::from_str(&rendered).unwrap();
-        assert_eq!(cfg.peers, cfg2.peers);
-        assert_eq!(cfg.namespace_secret_path, cfg2.namespace_secret_path);
+        assert_eq!(cfg.cluster_path, cfg2.cluster_path);
         assert_eq!(cfg.agents.len(), cfg2.agents.len());
     }
 
@@ -222,7 +305,7 @@ mod tests {
         let toml_str = r#"
             age_identity_path = "~/.config/ssync/age.key"
             data_dir = "~/.local/share/ssync"
-            namespace_secret_path = "/run/secrets/ns"
+            cluster_path = "/run/secrets/cluster.toml"
 
             [[agents]]
             agent = "pi"
@@ -235,8 +318,8 @@ mod tests {
         assert_eq!(cfg.data_dir, home.join(".local/share/ssync"));
         // absolute paths stay untouched
         assert_eq!(
-            cfg.namespace_secret_path.as_deref(),
-            Some(Path::new("/run/secrets/ns"))
+            cfg.cluster_path.as_deref(),
+            Some(Path::new("/run/secrets/cluster.toml"))
         );
     }
 
@@ -268,8 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_when_shared_fields_absent() {
-        // a pre-shared-namespace config (ticket flow) still parses.
+    fn config_defaults_when_cluster_fields_absent() {
+        // a plain ticket-flow config still parses.
         let toml_str = r#"
             age_identity_path = "/a"
             data_dir = "/d"
@@ -279,8 +362,60 @@ mod tests {
             session_dir = "/s"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.peers.is_empty());
-        assert_eq!(cfg.namespace_secret_path, None);
+        assert_eq!(cfg.cluster_path, None);
         assert_eq!(cfg.node_key_path, None);
+    }
+
+    #[test]
+    fn save_writes_no_tmp_sibling_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("ssync-cfgsave-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = Config::defaults().unwrap();
+        cfg.save(&path).unwrap();
+        assert!(!path.with_extension("tmp").exists(), "tmp sibling leaked");
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.data_dir, cfg.data_dir);
+        assert_eq!(loaded.agents.len(), cfg.agents.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn node_key_file_defaults_under_data_dir() {
+        let mut cfg = Config::defaults().unwrap();
+        cfg.data_dir = PathBuf::from("/d");
+        cfg.node_key_path = None;
+        assert_eq!(cfg.node_key_file(), PathBuf::from("/d/node.key"));
+        cfg.node_key_path = Some(PathBuf::from("/custom/key"));
+        assert_eq!(cfg.node_key_file(), PathBuf::from("/custom/key"));
+    }
+
+    #[test]
+    fn insert_cluster_path_prepends_before_tables_and_keeps_comments() {
+        let text = "# my config\nage_identity_path = \"/k\"\ndata_dir = \"/d\"\n# per-agent list\n[[agents]]\nagent = \"pi\"\nsession_dir = \"/s\"\n";
+        let out = insert_cluster_path(text, Path::new("/c/cluster.toml"));
+        assert!(
+            out.starts_with("cluster_path = "),
+            "must be a top-level key, before any table: {out}"
+        );
+        for line in text.lines() {
+            assert!(out.contains(line), "line lost by rewrite: {line}\n{out}");
+        }
+        let cfg = Config::parse(&out).unwrap();
+        assert_eq!(
+            cfg.cluster_path.as_deref(),
+            Some(Path::new("/c/cluster.toml"))
+        );
+        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.data_dir, Path::new("/d"));
+    }
+
+    #[test]
+    fn insert_cluster_path_escapes_quotes_and_backslashes() {
+        let text = "age_identity_path = \"/k\"\ndata_dir = \"/d\"\n[[agents]]\nagent = \"pi\"\nsession_dir = \"/s\"\n";
+        let path = Path::new("C:\\weird \"name\"\\cluster.toml");
+        let out = insert_cluster_path(text, path);
+        let cfg = Config::parse(&out).unwrap();
+        assert_eq!(cfg.cluster_path.as_deref(), Some(path));
     }
 }

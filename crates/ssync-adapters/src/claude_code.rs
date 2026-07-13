@@ -58,10 +58,8 @@ impl Adapter for ClaudeCodeAdapter {
         })
     }
 
-    /// Upstream docs describe the transcript as append-only (compaction and
-    /// resume append entries, never rewrite), but this has not been verified
-    /// against a real session file yet — a wrong `true` would scramble content
-    /// on conflict, so the merge path stays gated off until then (issue #6).
+    /// Newest-wins permanently by policy (DECISIONS §8 amendment, #25), even
+    /// though upstream docs describe the transcript as append-only.
     fn append_only(&self) -> bool {
         false
     }
@@ -109,9 +107,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_stays_gated_until_append_only_is_verified() {
-        // docs claim append-only; no real session file has confirmed it, so a
-        // conflict must take newest-wins, never the line-union merge (issue #6).
+    fn merge_stays_off_by_policy() {
+        // newest-wins permanently (DECISIONS §8 amendment, #25) — a conflict
+        // must never take the line-union merge.
         assert!(!ClaudeCodeAdapter::new("/r").append_only());
     }
 

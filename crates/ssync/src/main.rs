@@ -1,11 +1,13 @@
 // ssync — p2p sync of coding-agent session files. See docs/DECISIONS.md.
 
 mod cleanup_timer;
+mod cluster;
 mod service;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use ssync_adapters::adapter_for;
 use ssync_core::{Config, Engine, StatusReport};
@@ -39,6 +41,12 @@ enum Command {
     Join {
         /// The ticket string from `ssync ticket` on another machine.
         ticket: String,
+    },
+    /// Manage cluster membership: one secret artifact (shared namespace
+    /// secret + recipients + node-ids) distributed to every machine.
+    Cluster {
+        #[command(subcommand)]
+        action: ClusterAction,
     },
     /// Show sync status (namespace, session count, conflicts).
     Status,
@@ -75,7 +83,8 @@ enum Command {
     },
     /// Generate an iroh node key at PATH; print its node-id (for clan.vars).
     KeygenNode { path: PathBuf },
-    /// Generate a shared namespace secret at PATH (for clan.vars).
+    /// Generate a shared namespace secret at PATH (for clan.vars; the cluster
+    /// artifact embeds it via `ssync cluster render --secret-file`).
     KeygenNamespace { path: PathBuf },
 }
 
@@ -89,6 +98,43 @@ enum ServiceAction {
     },
     /// Disable the unit, delete it, and reload systemd.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ClusterAction {
+    /// Create the cluster artifact with this machine as the first member.
+    Init {
+        /// Artifact path (default: cluster.toml next to the config).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Adopt a received cluster file on this machine.
+    Join { file: PathBuf },
+    /// Add a machine by its age recipient (printed by `ssync init` there).
+    Add {
+        recipient: String,
+        /// The machine's iroh node-id (also printed by `ssync init`).
+        #[arg(long)]
+        node_id: Option<String>,
+    },
+    /// Remove a machine and rotate the namespace secret.
+    Rm { recipient: String },
+    /// List members and the namespace the current secret derives.
+    Show,
+    /// Assemble a cluster file non-interactively (clan.vars plumbing): the
+    /// given (or a fresh) namespace secret plus the given members.
+    Render {
+        /// Output path (written 0600).
+        #[arg(long)]
+        out: PathBuf,
+        /// 32-byte namespace secret file (`ssync keygen-namespace`); a fresh
+        /// secret is generated when absent.
+        #[arg(long)]
+        secret_file: Option<PathBuf>,
+        /// Members as `recipient[:node-id]`, at least one.
+        #[arg(required = true)]
+        members: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -127,10 +173,24 @@ async fn main() -> Result<()> {
         None => Config::default_path()?,
     };
     match cli.command {
-        Command::Init => cmd_init(&config_path),
+        Command::Init => cmd_init(&config_path).await,
         Command::Daemon => cmd_daemon(&config_path).await,
         Command::Ticket => cmd_ticket(&config_path),
         Command::Join { ticket } => cmd_join(&config_path, &ticket),
+        Command::Cluster { action } => match action {
+            ClusterAction::Init { path } => cluster::cmd_init(&config_path, path).await,
+            ClusterAction::Join { file } => cluster::cmd_join(&config_path, &file),
+            ClusterAction::Add { recipient, node_id } => {
+                cluster::cmd_add(&config_path, &recipient, node_id)
+            }
+            ClusterAction::Rm { recipient } => cluster::cmd_rm(&config_path, &recipient),
+            ClusterAction::Show => cluster::cmd_show(&config_path),
+            ClusterAction::Render {
+                out,
+                secret_file,
+                members,
+            } => cluster::cmd_render(&out, secret_file.as_deref(), &members),
+        },
         Command::Status => cmd_status(&config_path),
         Command::Conflicts => cmd_conflicts(&config_path),
         Command::Cleanup {
@@ -252,30 +312,23 @@ fn cmd_cleanup(
     Ok(())
 }
 
-fn cmd_init(config_path: &Path) -> Result<()> {
-    let config = if config_path.exists() {
-        Config::load(config_path)?
-    } else {
-        let c = Config::defaults()?;
-        c.save(config_path)?;
-        println!("wrote config {}", config_path.display());
-        c
-    };
-
-    if config.age_identity_path.exists() {
-        let id = load_identity(&config.age_identity_path)?;
-        println!("age recipient: {}", id.recipient_string());
-    } else {
-        let id = AgeIdentity::generate()?;
-        write_secret(&config.age_identity_path, &id.to_secret_string())?;
+async fn cmd_init(config_path: &Path) -> Result<()> {
+    let (config, _pre_existed) = load_or_bootstrap_config(config_path)?;
+    let already_had_identity = config.age_identity_path.exists();
+    let id = load_or_generate_identity(&config)?;
+    println!("age recipient: {}", id.recipient_string());
+    if !already_had_identity {
         println!(
-            "generated age identity {}",
-            config.age_identity_path.display()
+            "run `ssync cluster init` here, then `ssync cluster add <recipient>` for each machine (recommended),"
         );
-        println!("age recipient: {}", id.recipient_string());
-        println!("either copy this age key to your other machines (same key everywhere),");
-        println!("or keep one key per machine and list the peers' recipients in `recipients`.");
+        println!(
+            "or for ticket mode: copy this key everywhere, or list peers' recipients in `recipients`."
+        );
     }
+    // the node-id pairs with the recipient in `ssync cluster add`
+    let node_key_path = config.node_key_file();
+    let secret = load_or_create_secret_key(&node_key_path).await?;
+    println!("node-id: {}", secret.public());
     Ok(())
 }
 
@@ -296,44 +349,59 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     if !config.age_identity_path.exists() {
         let id = AgeIdentity::generate()?;
         write_secret(&config.age_identity_path, &id.to_secret_string())?;
-        if config.recipients.is_empty() {
-            eprintln!(
-                "ssync: generated age identity {}; other machines must use this same key",
-                config.age_identity_path.display()
-            );
+        if config.cluster_path.is_none() {
+            if config.recipients.is_empty() {
+                eprintln!(
+                    "ssync: generated age identity {}; other machines must use this same key",
+                    config.age_identity_path.display()
+                );
+            } else {
+                eprintln!(
+                    "ssync: generated age identity {}; add this recipient via `ssync cluster add` (recommended) or to the peers' `recipients`",
+                    config.age_identity_path.display()
+                );
+            }
         } else {
             eprintln!(
-                "ssync: generated age identity {}; add recipient {} to the peers' config",
-                config.age_identity_path.display(),
-                id.recipient_string()
+                "ssync: generated age identity {}",
+                config.age_identity_path.display()
             );
         }
     }
+    let cluster = match &config.cluster_path {
+        Some(p) => Some(
+            ssync_core::cluster::ClusterFile::parse(&read_secret_text(p)?)
+                .with_context(|| format!("cluster file {}", p.display()))?,
+        ),
+        None => None,
+    };
     let mut identity = load_identity(&config.age_identity_path)?;
-    identity.add_recipients(config.recipients.iter().cloned());
-    if config.recipients.is_empty() {
-        eprintln!(
-            "ssync: shared-identity mode (`recipients` empty); per-machine keys enable revocation, see docs/setup.md"
-        );
+    match &cluster {
+        Some(c) => identity.add_recipients(c.recipients()),
+        None => {
+            identity.add_recipients(config.recipients.iter().cloned());
+            if config.recipients.is_empty() {
+                eprintln!(
+                    "ssync: shared-identity mode (`recipients` empty); per-machine keys enable revocation, see docs/setup.md"
+                );
+            }
+        }
     }
 
-    let node_key_path = config
-        .node_key_path
-        .clone()
-        .unwrap_or_else(|| config.data_dir.join("node.key"));
+    let node_key_path = config.node_key_file();
     let secret = load_or_create_secret_key(&node_key_path).await?;
     let mut node = Node::spawn(&config.data_dir, secret).await?;
     node.enable_mdns();
 
-    if let Some(ns_path) = &config.namespace_secret_path {
-        // shared-namespace mode (clan): one deterministic namespace on every peer
-        // plus direct peer node-ids — no ticket exchange.
-        let bytes = read_key_bytes(ns_path)?;
-        let id = node.open_shared_namespace(bytes).await?;
-        node.sync_with_peers(&config.peers).await?;
+    if let Some(c) = &cluster {
+        // cluster-artifact mode (issue #23): the file is the whole peer set.
+        let own = node.endpoint_id().to_string();
+        let id = node.open_shared_namespace(c.namespace_secret()).await?;
+        let peers = c.peer_node_ids(&own);
+        node.sync_with_peers(&peers).await?;
         println!(
-            "ssync: shared namespace {id}, syncing with {} peer(s)",
-            config.peers.len()
+            "ssync: cluster namespace {id}, syncing with {} peer(s)",
+            peers.len()
         );
     } else {
         // ticket-based pairing: reopen persisted, else join a staged ticket,
@@ -454,19 +522,61 @@ fn cmd_join(config_path: &Path, ticket: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_identity(path: &Path) -> Result<AgeIdentity> {
+/// Read a secret file, refusing group/world-readable permissions.
+fn read_secret_text(path: &Path) -> Result<String> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("reading age identity {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("reading secret {}", path.display()))?;
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(anyhow!(
-            "age identity {} is group/world-accessible; run `chmod 600` on it",
+            "secret {} is group/world-accessible; run `chmod 600` on it",
             path.display()
         ));
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading age identity {}", path.display()))?;
+    std::fs::read_to_string(path).with_context(|| format!("reading secret {}", path.display()))
+}
+
+fn load_identity(path: &Path) -> Result<AgeIdentity> {
+    let text =
+        read_secret_text(path).with_context(|| format!("age identity {}", path.display()))?;
     AgeIdentity::from_secret_string(text.trim())
+}
+
+/// Load the config if present, else write built-in defaults; returns whether
+/// the file pre-existed (`ssync cluster init`/`join` need that — F3).
+fn load_or_bootstrap_config(config_path: &Path) -> Result<(Config, bool)> {
+    if config_path.exists() {
+        Ok((Config::load(config_path)?, true))
+    } else {
+        let c = Config::defaults()?;
+        c.save(config_path)?;
+        println!("wrote config {}", config_path.display());
+        Ok((c, false))
+    }
+}
+
+/// Load the shared age identity, generating and persisting one on first run.
+fn load_or_generate_identity(config: &Config) -> Result<AgeIdentity> {
+    if config.age_identity_path.exists() {
+        load_identity(&config.age_identity_path)
+    } else {
+        let id = AgeIdentity::generate()?;
+        write_secret(&config.age_identity_path, &id.to_secret_string())?;
+        println!(
+            "generated age identity {}",
+            config.age_identity_path.display()
+        );
+        Ok(id)
+    }
+}
+
+/// The cluster file replaces `recipients` — reject an ambiguous config.
+fn ensure_no_recipients(config: &Config) -> Result<()> {
+    ensure!(
+        config.recipients.is_empty(),
+        "config sets recipients — the cluster file replaces them, remove them first"
+    );
+    Ok(())
 }
 
 /// Write a secret string with `0600` permissions.
@@ -476,20 +586,39 @@ fn write_secret(path: &Path, contents: &str) -> Result<()> {
 
 /// Write secret bytes with `0600` permissions.
 fn write_secret_bytes(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Read a 32-byte key/secret file.
-fn read_key_bytes(path: &Path) -> Result<[u8; 32]> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading key {}", path.display()))?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("{} must be exactly 32 bytes", path.display()))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_secret_bytes_persists_0600_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ssync-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        write_secret_bytes(&path, b"top secret").unwrap();
+        assert!(!path.with_extension("tmp").exists(), "tmp sibling leaked");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"top secret");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

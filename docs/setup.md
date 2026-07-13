@@ -10,9 +10,10 @@ leaderless: every machine runs the same daemon as an equal peer.
   machine and `~/code/foo` on another are, to pi, different sessions. See
   `identity.md`.
 - Age keys, one of two modes:
-  - **Per-machine keypairs** (recommended): each machine keeps its own age key and
-    lists the other machines' recipients in the config's `recipients`. Enables
-    per-device revocation. The clan service sets this up automatically.
+  - **Per-machine keypairs** (recommended): each machine keeps its own age key;
+    the other machines learn its recipient from the cluster file (or, in ticket
+    mode, from the config's `recipients`). Enables per-device revocation. The
+    clan service sets this up automatically.
   - **Shared identity**: the same private key on every machine (`recipients`
     empty). Provision it out of band (e.g. sops-nix or a manual secure copy).
 
@@ -117,10 +118,10 @@ machine (see `identity.md`).
 ### clan service
 
 A clan service (`clan.modules.ssync`, single `peer` role) is exposed for clan
-users. It wraps the NixOS module and uses `clan.vars` to generate and distribute
-**everything** — a per-machine age key (peers encrypt to each other's recipients),
-a shared namespace secret, and each machine's
-node-id — so peers **auto-connect with no manual pairing** and you configure
+users. It wraps the NixOS module: `clan.vars` generates a per-machine age key
+(peers encrypt to each other's recipients), a shared namespace secret, and each
+machine's node-id; every machine then assembles the same `cluster.toml` at
+service start. Peers **auto-connect with no manual pairing** and you configure
 nothing but the peer list:
 
 ```nix
@@ -137,8 +138,12 @@ instances.ssync = {
 };
 ```
 
-That's the whole setup for clan — no `ssync ticket` / `ssync join`. The manual
-pairing below is only for the non-clan (standalone) modules.
+That's the whole setup for clan — no `ssync ticket` / `ssync join`. Machines
+outside the clan can join too: list them in `roles.peer.settings.extraMembers`
+(`"recipient:node-id"`), copy `/run/ssync/cluster.toml` from any clan machine
+to them, and run `ssync cluster join` there (re-copy after clan membership
+changes — they rotate the namespace secret). The manual pairing below is for
+fully standalone setups.
 
 ## Configuration
 
@@ -159,8 +164,8 @@ session_dir = "~/.pi/agent/sessions"
 agent = "omp"
 session_dir = "~/.omp/agent/sessions"
 
-# optional: Claude Code and Codex (newest-wins on conflict until their
-# formats are verified append-only; see docs/*-format-notes.md)
+# optional: Claude Code and Codex (newest-wins on conflict by policy; see
+# docs/*-format-notes.md)
 [[agents]]
 agent = "claude-code"
 session_dir = "~/.claude/projects"
@@ -177,56 +182,67 @@ exists on the machine (pi, omp, claude-code, codex).
 ## First machine
 
 ```bash
-ssync init          # writes config.toml and generates the age key if missing
-ssync daemon        # creates a sync namespace and starts syncing
-```
-
-Either copy the generated age key (`age_identity_path`) to your other machines
-(shared mode), or keep one key per machine and add each peer's recipient (printed
-by `ssync init`) to every other machine's `recipients` list.
-
-## Pairing a second machine
-
-On the second machine, install the same age key (shared mode) or exchange
-recipients (per-machine mode), then:
-
-```bash
-ssync init
-```
-
-On the **first** machine (daemon running), print its pairing ticket:
-
-```bash
-ssync ticket
-```
-
-On the second machine, stage that ticket and start the daemon:
-
-```bash
-ssync join '<ticket-from-first-machine>'
+ssync init          # writes config.toml, generates the age key, prints recipient + node-id
+ssync cluster init  # creates the cluster file and points the config at it
 ssync daemon
 ```
 
-The second machine joins the first machine's namespace and begins syncing. See
-`pairing.md` for what the ticket contains.
+The cluster file (`cluster.toml` next to the config, 0600) is the whole
+membership: the shared namespace secret, every machine's age recipient, and
+optionally its node-id. Treat it like a key — distribute it only over a channel
+you already trust for secrets (scp, sops-nix, USB).
+
+## Adding a machine
+
+On the new machine:
+
+```bash
+ssync init          # prints this machine's recipient and node-id
+```
+
+On any existing machine, add it and redistribute:
+
+```bash
+ssync cluster add <recipient> --node-id <node-id>
+scp ~/.config/ssync/cluster.toml newmachine:...   # your secret channel
+```
+
+On the new machine, adopt the file and start:
+
+```bash
+ssync cluster join <file>
+ssync daemon
+```
+
+Restart the daemons on the other machines so they encrypt to the new recipient.
+`ssync cluster show` prints the members and the namespace the secret derives —
+the same on every machine means they agree.
 
 ## Removing a machine
 
-Revocation has two layers (see `threat-model.md`):
+```bash
+ssync cluster rm <recipient>
+```
 
-1. **Content:** remove the machine's recipient from every remaining machine's
-   `recipients` and restart the daemons — they detect the changed recipient set
-   and re-encrypt and re-publish everything under the new one.
-2. **Namespace:** the removed machine still holds the namespace secret (index
-   write access), so rotate it: on each remaining machine remove
-   `data_dir/namespace` and re-pair with a fresh `ssync ticket` / `ssync join`
-   (or distribute a new shared namespace secret). The daemon drops abandoned
-   replicas on start.
+This drops the machine and **rotates the namespace secret inside the file** —
+the removed machine still knows the old secret (= index write access), so the
+rotation is what actually evicts it. Distribute the updated file to every
+remaining machine and restart the daemons: they detect the changed recipient
+set (re-encrypt and re-publish everything), open the new namespace, and drop
+the abandoned replica (see `threat-model.md` for the two revocation layers).
 
-The clan service does both automatically when you remove the machine from the
-instance: the peer set is part of the namespace generator's identity, so
-membership changes rotate the shared secret on the next deploy. A comparable
-single-artifact flow for non-clan setups is planned (issue #23).
+The clan service manages all of this automatically via clan.vars: the peer set
+is part of the namespace generator's identity, so membership changes rotate
+the shared secret on the next deploy.
+
+## Ticket pairing (alternative)
+
+Without a cluster file, machines can pair ad hoc: `ssync ticket` on a running
+daemon prints a pairing ticket, `ssync join '<ticket>'` + `ssync daemon` on the
+other machine joins it (see `pairing.md`). Tickets carry no recipient list —
+either copy one shared age key everywhere, or maintain each machine's
+`recipients` in the config by hand. Membership changes are manual per machine;
+the cluster file is the recommended mode.
 
 ## Everyday use
 

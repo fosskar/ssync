@@ -22,6 +22,7 @@ use iroh_docs::{AuthorId, DocTicket, NamespaceId};
 use iroh_docs::{Capability, NamespaceSecret};
 use iroh_gossip::net::Gossip;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
+use tokio::io::AsyncWriteExt;
 pub use {iroh, iroh_blobs, iroh_docs};
 
 /// Map iroh-docs' tombstone sentinel (`Hash::EMPTY` content) to `None`.
@@ -84,6 +85,12 @@ pub fn node_id_of(key_bytes: &[u8; 32]) -> String {
     SecretKey::from_bytes(key_bytes).public().to_string()
 }
 
+/// The namespace id a shared 32-byte secret derives (`ssync cluster show`
+/// prints it so machines can confirm they agree without starting the daemon).
+pub fn namespace_id_of(secret: &[u8; 32]) -> String {
+    NamespaceSecret::from_bytes(secret).id().to_string()
+}
+
 /// Parse peer node-id strings into addresses, tolerating surrounding whitespace
 /// (e.g. a trailing newline from a generated file) and skipping blank or
 /// malformed entries rather than failing the whole daemon.
@@ -116,7 +123,20 @@ pub async fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        tokio::fs::write(path, key.to_bytes())
+        // node key is secret material — 0600 like every CLI-generated key (AGENTS.md Secrets).
+        let tmp = path.with_extension("ssync-tmp");
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await
+            .with_context(|| format!("writing node key {}", tmp.display()))?;
+        file.write_all(&key.to_bytes())
+            .await
+            .with_context(|| format!("writing node key {}", tmp.display()))?;
+        drop(file);
+        tokio::fs::rename(&tmp, path)
             .await
             .with_context(|| format!("writing node key {}", path.display()))?;
         Ok(key)
@@ -586,6 +606,19 @@ mod tests {
         let got: Vec<String> = addrs.iter().map(|a| a.id.to_string()).collect();
         assert!(got.contains(&id1));
         assert!(got.contains(&id2));
+    }
+
+    #[tokio::test]
+    async fn load_or_create_secret_key_persists_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir("secret-key-perm");
+        let path = dir.join("node.key");
+        let key = load_or_create_secret_key(&path).await.unwrap();
+        let meta = tokio::fs::metadata(&path).await.unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // reloading must yield the same key, not silently regenerate.
+        let reloaded = load_or_create_secret_key(&path).await.unwrap();
+        assert_eq!(reloaded.to_bytes(), key.to_bytes());
     }
 
     #[tokio::test]

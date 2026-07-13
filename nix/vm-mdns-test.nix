@@ -1,7 +1,8 @@
-# Shared-namespace pairing with mDNS-only connectivity (issue #10): peers are
-# named by node-id alone — no ticket (so no embedded direct addresses), and the
-# sandbox reaches neither the n0 relays nor DNS. The only way the nodes can
-# find each other is mDNS address lookup on the virtual LAN.
+# Cluster-artifact pairing with mDNS-only connectivity: peers are named by
+# node-id alone — no ticket (so no embedded direct addresses), and the sandbox
+# reaches neither the n0 relays nor DNS. The only way the nodes can find each
+# other is mDNS address lookup on the virtual LAN. Also the e2e test of the
+# `ssync cluster` flow (issue #23): init → add → distribute → join.
 {
   pkgs,
   self,
@@ -17,7 +18,7 @@ let
   };
 in
 pkgs.testers.runNixOSTest {
-  name = "ssync-mdns-shared-namespace";
+  name = "ssync-mdns-cluster";
 
   nodes.node1 = node;
   nodes.node2 = node;
@@ -35,23 +36,11 @@ pkgs.testers.runNixOSTest {
 
     cfg = "--config /root/config.toml"
 
-    # shared namespace secret: generate on node1, copy (binary) to node2
-    node1.succeed("ssync keygen-namespace /root/ns.secret")
-    ns_b64 = node1.succeed("base64 -w0 /root/ns.secret").strip()
-    node2.succeed(f"umask 077; printf '%s' '{ns_b64}' | base64 -d > /root/ns.secret")
-
-    # per-node iroh keys; each config lists only the OTHER node's node-id
-    id1 = node1.succeed("ssync keygen-node /root/node.key").strip()
-    id2 = node2.succeed("ssync keygen-node /root/node.key").strip()
-
-    def write_config(machine, peer_id):
+    def write_config(machine):
         machine.succeed(
             "umask 077; cat > /root/config.toml <<EOF\n"
             'age_identity_path = "/root/age.key"\n'
             'data_dir = "/var/lib/ssync"\n'
-            'namespace_secret_path = "/root/ns.secret"\n'
-            'node_key_path = "/root/node.key"\n'
-            f'peers = [ "{peer_id}" ]\n'
             "\n"
             "[[agents]]\n"
             'agent = "pi"\n'
@@ -59,13 +48,30 @@ pkgs.testers.runNixOSTest {
             "EOF\n"
         )
 
-    write_config(node1, id2)
-    write_config(node2, id1)
+    write_config(node1)
+    write_config(node2)
 
-    # shared age key: generate on node1, copy to node2
-    node1.succeed(f"ssync {cfg} init")
-    key = node1.succeed("cat /root/age.key").strip()
-    node2.succeed(f"umask 077; printf '%s\\n' '{key}' > /root/age.key")
+    # per-machine age keys and node keys; init prints both public halves
+    def init_ids(machine):
+        out = machine.succeed(f"ssync {cfg} init")
+        rec = [l for l in out.splitlines() if l.startswith("age recipient: ")][0].split(": ", 1)[1]
+        nid = [l for l in out.splitlines() if l.startswith("node-id: ")][0].split(": ", 1)[1]
+        return rec, nid
+
+    rec1, id1 = init_ids(node1)
+    rec2, id2 = init_ids(node2)
+
+    # cluster flow: init on node1, add node2, distribute, join on node2
+    node1.succeed(f"ssync {cfg} cluster init")
+    node1.succeed(f"ssync {cfg} cluster add {rec2} --node-id {id2}")
+    cluster_b64 = node1.succeed("base64 -w0 /root/cluster.toml").strip()
+    node2.succeed(f"umask 077; printf '%s' '{cluster_b64}' | base64 -d > /root/cluster-received.toml")
+    node2.succeed(f"ssync {cfg} cluster join /root/cluster-received.toml")
+
+    # both sides must derive the same namespace from the artifact
+    ns1 = node1.succeed(f"ssync {cfg} cluster show | grep '^namespace:'").strip()
+    ns2 = node2.succeed(f"ssync {cfg} cluster show | grep '^namespace:'").strip()
+    assert ns1 == ns2, f"namespace mismatch: {ns1} != {ns2}"
 
     node1.succeed(f"systemd-run --unit ssyncd --collect ssync {cfg} daemon")
     node2.succeed(f"systemd-run --unit ssyncd --collect ssync {cfg} daemon")

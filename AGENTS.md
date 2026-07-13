@@ -34,11 +34,14 @@ Impure shell around pure decision cores:
   newest-wins. The merge verdict is all-or-skip: a partial version set never merges.
 - Per-key errors are logged (`eprintln!("ssync: …")`) and retried next tick; one bad key
   never kills the daemon.
-- Pairing is two modes: ticket exchange (`ssync ticket`/`join`; the ticket embeds direct
-  addresses) or shared-namespace mode (clan: `namespace_secret_path` derives the same
-  namespace on every peer, `peers` node-ids resolve via iroh discovery — no ticket).
-  `recipients` set = per-machine age identities with multi-recipient encryption; empty =
-  one shared identity. Recipient-set or namespace changes re-publish/evict (issue #22).
+- Pairing is two mechanisms: the cluster artifact (`ssync cluster
+  init/join/add/rm/show`; one secret file = namespace secret + recipients + node-ids,
+  `cluster_path` in config — the recommended mode; clan assembles the same file at
+  service start via `ssync cluster render`) and ad-hoc ticket exchange (`ssync
+  ticket`/`join`; the ticket embeds direct addresses).
+  `recipients` set (ticket mode only) = per-machine age identities with
+  multi-recipient encryption; empty = one shared identity. Recipient-set or namespace
+  changes re-publish/evict (issue #22).
 
 ### Hard rules (pointers into docs/DECISIONS.md — don't re-litigate)
 
@@ -55,9 +58,9 @@ Impure shell around pure decision cores:
 
 ## Key Directories
 
-- `crates/ssync/` — binary: clap CLI (`init/daemon/ticket/join/status/conflicts/cleanup/`
-  `service/keygen-node/keygen-namespace`) + daemon wiring; `src/main.rs` dispatches, pure
-  decision cores live in submodules (`service.rs`).
+- `crates/ssync/` — binary: clap CLI (`init/daemon/cluster/ticket/join/status/conflicts/`
+  `cleanup/service/keygen-node/keygen-namespace`) + daemon wiring; `src/main.rs` dispatches,
+  pure decision cores live in submodules (`service.rs`, `cluster.rs`).
 - `crates/ssync-core/` — `Config`, `Engine`, `StatusReport`; pure decision cores live in
   their own submodules.
 - `crates/ssync-net/` — iroh endpoint/router/docs/blobs/gossip setup, `Node`,
@@ -66,7 +69,7 @@ Impure shell around pure decision cores:
   Rust `age`-crate backend disabled behind feature `rust-age` until it gains ML-KEM.
 - `crates/ssync-adapters/` — `Adapter` trait + `adapter_for` factory. New agent = one
   `impl Adapter` + one `adapter_for` arm (`"pi" | "omp"` share `PiAdapter`; claude-code
-  and codex have their own impls, merge gated off until append-only is verified).
+  and codex have their own impls, newest-wins permanently by policy — DECISIONS §8, #25).
 - `nix/` — package, devshell, treefmt, checks (incl. three NixOS VM tests), NixOS/HM/clan
   modules, nixbot effects.
 - `docs/` — DECISIONS.md, identity.md, pairing.md, setup.md, threat-model.md,
