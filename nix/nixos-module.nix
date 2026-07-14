@@ -26,6 +26,14 @@ let
         lib.concatMapStringsSep ", " (r: "\"${lib.removeSuffix "\n" r}\"") cfg.recipients
       } ]
     ''
+    + lib.optionalString (cfg.canonicalHome != null) ''
+      canonical_home = "${cfg.canonicalHome}"
+    ''
+    + lib.concatMapStrings (m: ''
+      [[path_map]]
+      local = "${m.local}"
+      canonical = "${m.canonical}"
+    '') cfg.pathMap
     + lib.concatMapStrings (
       a:
       ''
@@ -190,6 +198,38 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = "Override the iroh node key path (default: dataDir/node.key).";
+    };
+
+    pathMap = lib.mkOption {
+      type = lib.types.listOf (
+        lib.types.submodule {
+          options = {
+            local = lib.mkOption {
+              type = lib.types.str;
+              description = "This machine's path prefix (absolute).";
+            };
+            canonical = lib.mkOption {
+              type = lib.types.str;
+              description = "The mesh-wide canonical prefix (absolute, identical everywhere).";
+            };
+          };
+        }
+      );
+      default = [ ];
+      description = ''
+        Prefix pairs bridging differing absolute paths (docs/setup.md,
+        "Differing absolute paths"). Only machines whose paths differ from
+        the canonical form need entries.
+      '';
+    };
+
+    canonicalHome = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        The home dir canonical paths are relative to; required when an omp
+        pathMap entry's canonical path lies under a home.
+      '';
     };
 
     recipients = lib.mkOption {

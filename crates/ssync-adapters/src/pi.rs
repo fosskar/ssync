@@ -112,6 +112,58 @@ impl Adapter for PiAdapter {
         }
         json_string_field(&line, "title")
     }
+
+    fn maps_paths(&self) -> bool {
+        true
+    }
+
+    /// Scan the leading lines for the `type:session` header record (pi: line
+    /// 1; omp: line 2, after its `type:title` record) and read its cwd.
+    fn header_cwd(&self, bytes: &[u8]) -> Option<String> {
+        let (start, end) = header_line_range(bytes)?;
+        json_string_field(std::str::from_utf8(&bytes[start..end]).ok()?, "cwd")
+    }
+
+    /// Splice a new cwd into the header record; every other byte survives
+    /// verbatim, so canonical→local→canonical reproduces the wire bytes.
+    fn rewrite_header_cwd(&self, bytes: &[u8], cwd: &str) -> Option<Vec<u8>> {
+        let (start, end) = header_line_range(bytes)?;
+        let line = std::str::from_utf8(&bytes[start..end]).ok()?;
+        let (vstart, vend) = json_string_span(line, "cwd")?;
+        let mut escaped = String::with_capacity(cwd.len());
+        for c in cwd.chars() {
+            match c {
+                '"' => escaped.push_str("\\\""),
+                '\\' => escaped.push_str("\\\\"),
+                other => escaped.push(other),
+            }
+        }
+        let mut out = Vec::with_capacity(bytes.len() + escaped.len());
+        out.extend_from_slice(&bytes[..start + vstart]);
+        out.extend_from_slice(escaped.as_bytes());
+        out.extend_from_slice(&bytes[start + vend..]);
+        Some(out)
+    }
+
+    /// pi: absolute lossy form always. omp: home-relative under `home`,
+    /// legacy absolute outside it — and `None` without a home context, since
+    /// the two forms cannot be told apart safely (docs/pi-format-notes.md).
+    fn encode_cwd(&self, cwd: &str, home: Option<&Path>) -> Option<String> {
+        let dashed = |p: &str| p.replace(['/', '\\', ':'], "-");
+        let legacy = |p: &str| format!("--{}--", dashed(p.trim_start_matches(['/', '\\'])));
+        if self.agent == "omp" {
+            let home = home?.to_str()?;
+            if cwd == home {
+                return Some("-".to_string());
+            }
+            match cwd.strip_prefix(home).and_then(|r| r.strip_prefix('/')) {
+                Some(rel) => Some(format!("-{}", dashed(rel))),
+                None => Some(legacy(cwd)),
+            }
+        } else {
+            Some(legacy(cwd))
+        }
+    }
 }
 
 /// `YYYY-MM-DDTHH-MM-SS-mmmZ` (UTC) → SystemTime, no external date crate.
@@ -152,6 +204,44 @@ pub fn parse_pi_timestamp(ts: &str) -> Option<std::time::SystemTime> {
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(secs * 1000 + ms))
 }
 
+/// Locate the `type:session` header record within the first three lines;
+/// returns its byte range (line start..line end, newline excluded).
+fn header_line_range(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut start = 0;
+    for _ in 0..3 {
+        if start >= bytes.len() {
+            return None;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        if let Ok(line) = std::str::from_utf8(&bytes[start..end])
+            && line.contains("\"type\":\"session\"")
+            && line.contains("\"cwd\":\"")
+        {
+            return Some((start, end));
+        }
+        start = end + 1;
+    }
+    None
+}
+
+/// Byte span of the raw (still-escaped) value of `"key":"…"` within `line`.
+fn json_string_span(line: &str, key: &str) -> Option<(usize, usize)> {
+    let vstart = line.find(&format!("\"{key}\":\""))? + key.len() + 4;
+    let bytes = line.as_bytes();
+    let mut i = vstart;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some((vstart, i)),
+            b'\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Extract `"key":"value"` from one JSON line, handling `\"` escapes.
 /// Best-effort: returns the raw string with simple escapes resolved.
 fn json_string_field(line: &str, key: &str) -> Option<String> {
@@ -176,6 +266,92 @@ fn json_string_field(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PI_SESSION: &[u8] = b"{\"type\":\"session\",\"version\":3,\"id\":\"019e\",\"cwd\":\"/srv/work/x\"}\n{\"msg\":\"body /srv/work/x stays\"}\n";
+    const OMP_SESSION: &[u8] = b"{\"type\":\"title\",\"v\":1,\"title\":\"t\"}\n{\"type\":\"session\",\"version\":3,\"id\":\"019e\",\"cwd\":\"/srv/work/x\"}\n{\"msg\":\"body\"}\n";
+
+    #[test]
+    fn header_cwd_reads_pi_line1_and_omp_line2() {
+        let pi = PiAdapter::new("pi", "/r");
+        assert_eq!(pi.header_cwd(PI_SESSION).as_deref(), Some("/srv/work/x"));
+        let omp = PiAdapter::new("omp", "/r");
+        assert_eq!(omp.header_cwd(OMP_SESSION).as_deref(), Some("/srv/work/x"));
+        // no session header at all (e.g. __advisor.jsonl) → None
+        assert_eq!(pi.header_cwd(b"{\"type\":\"other\"}\n"), None);
+    }
+
+    #[test]
+    fn rewrite_header_cwd_touches_only_the_header_record() {
+        let pi = PiAdapter::new("pi", "/r");
+        let out = pi
+            .rewrite_header_cwd(PI_SESSION, "/home/simon/Projects/x")
+            .unwrap();
+        assert_eq!(
+            pi.header_cwd(&out).as_deref(),
+            Some("/home/simon/Projects/x")
+        );
+        // body bytes untouched (#45: stale body paths are inert)
+        assert!(out.ends_with(b"{\"msg\":\"body /srv/work/x stays\"}\n"));
+
+        let omp = PiAdapter::new("omp", "/r");
+        let out = omp
+            .rewrite_header_cwd(OMP_SESSION, "/home/simon/Projects/x")
+            .unwrap();
+        assert_eq!(
+            omp.header_cwd(&out).as_deref(),
+            Some("/home/simon/Projects/x")
+        );
+        // the title record on line 1 survives verbatim
+        assert!(out.starts_with(b"{\"type\":\"title\",\"v\":1,\"title\":\"t\"}\n"));
+    }
+
+    #[test]
+    fn rewrite_round_trips_bytes_exactly() {
+        // canonical→local→canonical must reproduce the wire bytes, or the
+        // write-back re-import would spuriously republish every tick.
+        let pi = PiAdapter::new("pi", "/r");
+        let local = pi.rewrite_header_cwd(PI_SESSION, "/l/x").unwrap();
+        let back = pi.rewrite_header_cwd(&local, "/srv/work/x").unwrap();
+        assert_eq!(back, PI_SESSION);
+    }
+
+    #[test]
+    fn rewrite_escapes_json_special_chars() {
+        let pi = PiAdapter::new("pi", "/r");
+        let out = pi.rewrite_header_cwd(PI_SESSION, "/odd\"path\\x").unwrap();
+        assert_eq!(pi.header_cwd(&out).as_deref(), Some("/odd\"path\\x"));
+    }
+
+    #[test]
+    fn encode_cwd_is_agent_specific() {
+        let pi = PiAdapter::new("pi", "/r");
+        // pi: absolute lossy form, no home context needed
+        assert_eq!(
+            pi.encode_cwd("/home/simon/Projects/x", Some(Path::new("/home/simon"))),
+            Some("--home-simon-Projects-x--".to_string())
+        );
+        assert_eq!(
+            pi.encode_cwd("/srv/work/x", None),
+            Some("--srv-work-x--".to_string())
+        );
+
+        let omp = PiAdapter::new("omp", "/r");
+        // omp: home-relative under the given home
+        assert_eq!(
+            omp.encode_cwd("/home/simon/Projects/x", Some(Path::new("/home/simon"))),
+            Some("-Projects-x".to_string())
+        );
+        // outside the home: legacy absolute form
+        assert_eq!(
+            omp.encode_cwd("/srv/work/x", Some(Path::new("/home/simon"))),
+            Some("--srv-work-x--".to_string())
+        );
+        // no home context: omp cannot decide home-relative vs legacy, so it
+        // refuses entirely (the engine turns this into a per-key skip with a
+        // canonical_home hint) — even for paths outside any plausible home.
+        assert_eq!(omp.encode_cwd("/home/simon/Projects/x", None), None);
+        assert_eq!(omp.encode_cwd("/srv/work/x", None), None);
+    }
 
     #[test]
     fn identifies_pi_session_from_path() {

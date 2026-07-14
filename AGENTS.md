@@ -207,10 +207,13 @@ Layout and patterns:
 ## pi session format (caveat)
 
 pi stores sessions at `~/.pi/agent/sessions/<encoded-cwd>/<ts>_<sessionId>.jsonl`, one
-append-only JSONL file per session, header on line 1 (`version:3`, `id` uuidv7, `cwd`). pi
-keys on the **absolute cwd**, so a synced project must live at the **same absolute path on
-every machine** — a v1 requirement, not a bug. Derive `PiAdapter` identity from the
-path alone; treat `<encoded-cwd>` as opaque (pi and omp encode differently). omp uses the
+append-only JSONL file per session, header record (`version:3`, `id` uuidv7, `cwd`) on
+line 1 (omp: line 2, after a `type:title` record). pi keys on the **absolute cwd**, so by
+default a synced project must live at the **same absolute path on every machine**; the
+opt-in `[[path_map]]` bridges differing paths by rewriting exactly the header `cwd` and
+the encoded dir name (DECISIONS §3 amendment, map #42). Derive `PiAdapter` identity from
+the path alone; treat `<encoded-cwd>` as opaque (pi and omp encode differently — the
+path-map encode/decode in `pi.rs` is the sanctioned exception). omp uses the
 same layout at `~/.omp/agent/sessions` and adds a per-session artifact dir
 (`<encoded-cwd>/<ts>_<sessionId>/`: subagent transcripts, `__advisor.jsonl`) whose files
 are part of the session and sync with it (identity from the artifact dir name — DECISIONS

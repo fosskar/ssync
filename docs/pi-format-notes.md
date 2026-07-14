@@ -23,9 +23,16 @@ encodeCwd(cwd) = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`
 
 e.g. `/home/simon/Projects/nixfiles` → `--home-simon-Projects-nixfiles--`.
 
-**pi keys on the absolute cwd, not on git/repo identity.** This drives the hard v1
-requirement that a project must live at the **same absolute path on every machine**
-(DECISIONS §3). ssync writes blobs back byte-for-byte; it does not rewrite the header.
+**pi keys on the absolute cwd, not on git/repo identity.** By default a project must
+live at the **same absolute path on every machine** (DECISIONS §3); the opt-in
+`[[path_map]]` bridges differing paths by rewriting exactly the header `cwd` and the
+encoded dir name (§3 amendment, map #42). Outside a mapped prefix, ssync writes blobs
+back byte-for-byte and never touches the header.
+
+**omp header caveat:** omp main session files start with a `{"type":"title",…}` record
+on line 1; the `type:session` header carrying `cwd` sits on **line 2**. pi has it on
+line 1. Anything reading "the header" must scan the first lines for the
+`type:session` record, not assume line 1.
 
 ## File shape
 

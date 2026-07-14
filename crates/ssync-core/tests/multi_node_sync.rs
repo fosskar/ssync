@@ -1022,3 +1022,328 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
     // ... and A's own copy on disk is untouched
     assert!(std::fs::read(&src).is_ok_and(|g| g == contents));
 }
+
+/// Issue #13 (map #42): a machine with a `[[path_map]]` converges with an
+/// unmapped machine hosting the project at the canonical path — including the
+/// hard case, omp's home-relative wire keys derived via `canonical_home`.
+#[tokio::test]
+async fn path_mapped_machines_converge() {
+    let base = scratch("pathmap");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let canonical_home = "/canon-home";
+    let canonical_cwd = "/canon-home/Projects/x";
+
+    // --- node A: unmapped, hosts the project at the canonical path. Its
+    // on-disk form IS the wire form: home-relative dir + canonical header.
+    let root_a = base.join("a/sessions");
+    let rel_a = "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+    let src_a = root_a.join(rel_a);
+    std::fs::create_dir_all(src_a.parent().unwrap()).unwrap();
+    let canonical_bytes = format!(
+        "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n{{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4a\",\"cwd\":\"{canonical_cwd}\"}}\n{{\"msg\":\"from A\"}}\n"
+    );
+    std::fs::write(&src_a, &canonical_bytes).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut engine_a = Engine::new(
+        PiAdapter::new("omp", &root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.tick_once().await;
+
+    // --- node B: hosts the project at a different absolute path, bridged by
+    // the map. Its local dir uses B's real-home encoding (outside → legacy).
+    let root_b = base.join("b/sessions");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let local_prefix = base.join("b/work");
+    let local_cwd = local_prefix.join("x");
+    std::fs::create_dir_all(&local_cwd).unwrap();
+    let map = ssync_core::PathMap::new(vec![(
+        local_prefix.to_string_lossy().into_owned(),
+        "/canon-home/Projects".to_string(),
+    )])
+    .unwrap();
+
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket).await.unwrap();
+    let mut engine_b = Engine::new(
+        PiAdapter::new("omp", &root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.set_path_map(map, Some(canonical_home.into()));
+
+    // A's session materializes on B under B's LOCAL encoding, header rewritten
+    // intentional mirror of PiAdapter's legacy `--abs--` encoding (pi.rs
+    // encode_cwd): an independent expectation, not a call into the code
+    // under test — drift here means the encoding changed
+    let local_component = format!(
+        "--{}--",
+        local_cwd
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace(['/', ':'], "-")
+    );
+    let dest_b = root_b
+        .join(&local_component)
+        .join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl");
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if let Ok(got) = std::fs::read_to_string(&dest_b) {
+            assert!(
+                got.contains(&format!("\"cwd\":\"{}\"", local_cwd.display())),
+                "header must carry B's local path: {got}"
+            );
+            assert!(got.ends_with("{\"msg\":\"from A\"}\n"), "body untouched");
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "mapped session did not materialize on B");
+
+    // B appends locally; A must receive the line with its canonical header
+    // intact — proving B republished CANONICAL bytes under the SAME key.
+    let mut appended = std::fs::read_to_string(&dest_b).unwrap();
+    appended.push_str("{\"msg\":\"from B\"}\n");
+    std::fs::write(&dest_b, &appended).unwrap();
+    engine_b.tick_once().await;
+
+    let expect_a = format!("{canonical_bytes}{{\"msg\":\"from B\"}}\n");
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        engine_b.tick_once().await;
+        if std::fs::read_to_string(&src_a).is_ok_and(|g| g == expect_a) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "B's append did not converge canonically on A");
+
+    // wire hygiene: every index key uses the canonical (home-relative) form;
+    // B's machine-local path never leaks into the key space.
+    for rec in engine_a.index_keys().await.expect("index keys readable") {
+        assert!(
+            rec.starts_with("omp/-Projects-x/"),
+            "non-canonical key on the wire: {rec}"
+        );
+    }
+
+    // --- artifact ride-along: a header-less file in the session's artifact
+    // dir (omp: subagent transcripts, __advisor.jsonl) must land under B's
+    // LOCAL project dir via the learned dir translation, bytes untouched.
+    let art_rel =
+        "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/__advisor.jsonl";
+    let art_a = root_a.join(art_rel);
+    std::fs::create_dir_all(art_a.parent().unwrap()).unwrap();
+    let art_bytes = b"{\"type\":\"advisor\",\"note\":\"no session header here\"}\n";
+    std::fs::write(&art_a, art_bytes).unwrap();
+    engine_a.tick_once().await;
+
+    let art_b = root_b
+        .join(&local_component)
+        .join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/__advisor.jsonl");
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        engine_b.tick_once().await;
+        if std::fs::read(&art_b).is_ok_and(|g| g == art_bytes) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "artifact did not ride along into B's local project dir");
+}
+
+/// A path map must not disturb adapters without cwd semantics: omp-blobs
+/// (single-component keys, no header) keeps syncing both ways while a map
+/// is active for another agent.
+#[tokio::test]
+async fn path_map_leaves_cwdless_adapters_alone() {
+    let base = scratch("pathmap-blobs");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let adapters = |root_pi: &Path, root_blobs: &Path| -> Vec<Box<dyn Adapter>> {
+        vec![
+            Box::new(PiAdapter::new("pi", root_pi)),
+            Box::new(BlobStoreAdapter::new("omp-blobs", root_blobs)),
+        ]
+    };
+
+    // --- node A: unmapped, one blob ---
+    let (root_pi_a, root_blobs_a) = (base.join("a/pi"), base.join("a/blobs"));
+    std::fs::create_dir_all(&root_blobs_a).unwrap();
+    std::fs::create_dir_all(&root_pi_a).unwrap();
+    let blob = b"opaque-blob-bytes".to_vec();
+    let hash_a = "a".repeat(64);
+    std::fs::write(root_blobs_a.join(&hash_a), &blob).unwrap();
+
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.create_namespace().await.unwrap();
+    let ticket = node_a.share().await.unwrap();
+    let mut engine_a = Engine::with_adapters(
+        adapters(&root_pi_a, &root_blobs_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    engine_a.tick_once().await;
+
+    // --- node B: pi is path-mapped; blobs must be untouched by that ---
+    let (root_pi_b, root_blobs_b) = (base.join("b/pi"), base.join("b/blobs"));
+    std::fs::create_dir_all(&root_pi_b).unwrap();
+    std::fs::create_dir_all(&root_blobs_b).unwrap();
+    let mut node_b = spawn_node(&base.join("b/data")).await;
+    node_b.join(ticket).await.unwrap();
+    let mut engine_b = Engine::with_adapters(
+        adapters(&root_pi_b, &root_blobs_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    engine_b.set_path_map(
+        ssync_core::PathMap::new(vec![("/srv/elsewhere".into(), "/canon/x".into())]).unwrap(),
+        None,
+    );
+
+    // inbound: A's blob materializes on B despite the active map
+    let dest = root_blobs_b.join(&hash_a);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_b.tick_once().await;
+        if std::fs::read(&dest).is_ok_and(|g| g == blob) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "blob did not materialize on the mapped machine");
+
+    // outbound: B's new blob reaches A
+    let blob2 = b"blob-from-b".to_vec();
+    let hash_b = "b".repeat(64);
+    std::fs::write(root_blobs_b.join(&hash_b), &blob2).unwrap();
+    engine_b.tick_once().await;
+    let dest_a = root_blobs_a.join(&hash_b);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        engine_b.tick_once().await;
+        if std::fs::read(&dest_a).is_ok_and(|g| g == blob2) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "mapped machine did not publish its blob");
+}
+
+/// An unresolvable mapping must FREEZE, never tombstone (#49: skips are
+/// per-key errors, and a skip that reads as deletion propagates mesh-wide).
+/// Here: sessions synced without a map; the machine restarts with a map
+/// that swallows the project but cannot resolve it (omp without
+/// canonical_home) — peers must keep their copies.
+#[tokio::test]
+async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
+    let base = scratch("pathmap-freeze");
+    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+
+    let rel = "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+    // header cwd points INSIDE the prefix B will later map
+    let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4a\",\"cwd\":\"/data/Projects/x\"}\n{\"m\":\"1\"}\n".to_vec();
+
+    // --- node B first: it owns the session and will get the bad map ---
+    let root_b = base.join("b/sessions");
+    let src_b = root_b.join(rel);
+    std::fs::create_dir_all(src_b.parent().unwrap()).unwrap();
+    std::fs::write(&src_b, &bytes).unwrap();
+
+    let key_b = SecretKey::generate();
+    let mut node_b = Node::spawn(&base.join("b/data"), key_b.clone())
+        .await
+        .unwrap();
+    let ns = node_b.create_namespace().await.unwrap();
+    let ticket = node_b.share().await.unwrap();
+    let mut engine_b = Engine::new(
+        PiAdapter::new("omp", &root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b,
+    );
+    let state_b = base.join("b/state.toml");
+    engine_b.persist_state(&state_b);
+    engine_b.tick_once().await;
+
+    // --- node A receives it ---
+    let root_a = base.join("a/sessions");
+    std::fs::create_dir_all(&root_a).unwrap();
+    let mut node_a = spawn_node(&base.join("a/data")).await;
+    node_a.join(ticket).await.unwrap();
+    let a_addr = node_a.endpoint_addr();
+    let mut engine_a = Engine::new(
+        PiAdapter::new("omp", &root_a),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_a,
+    );
+    let dest_a = root_a.join(rel);
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        if std::fs::read(&dest_a).is_ok_and(|g| g == bytes) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "session did not sync to A");
+
+    // --- restart B with a map that swallows the project's cwd but cannot
+    // resolve it: omp home-relative canonical without canonical_home ---
+    engine_b.shutdown().await.unwrap();
+    let mut node_b2 = Node::spawn(&base.join("b/data"), key_b).await.unwrap();
+    node_b2.open_namespace(ns).await.unwrap();
+    node_b2.sync_with(vec![a_addr]).await.unwrap();
+    let mut engine_b2 = Engine::new(
+        PiAdapter::new("omp", &root_b),
+        AgeIdentity::from_secret_string(&secret).unwrap(),
+        node_b2,
+    );
+    engine_b2.set_path_map(
+        ssync_core::PathMap::new(vec![("/data".into(), "/other-canon".into())]).unwrap(),
+        None, // omp cannot encode home-relative canonicals without this
+    );
+    engine_b2.persist_state(&state_b);
+
+    // several passes; then prove sync is otherwise live via A-side traffic
+    for _ in 0..6 {
+        engine_b2.tick_once().await;
+        engine_a.tick_once().await;
+    }
+    let rel2 = "-Projects-y/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
+    let p = root_a.join(rel2);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    // sentinel cwd OUTSIDE B's mapped prefix: pass-through on both sides
+    let sentinel = b"{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4b\",\"cwd\":\"/elsewhere/y\"}\n".to_vec();
+    std::fs::write(&p, &sentinel).unwrap();
+    let mut ok = false;
+    for _ in 0..60 {
+        engine_a.tick_once().await;
+        engine_b2.tick_once().await;
+        if root_b.join(rel2).exists() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(ok, "sentinel did not sync after restart");
+
+    // the frozen session survives everywhere
+    assert!(
+        std::fs::read(&dest_a).is_ok_and(|g| g == bytes),
+        "A lost the session to a tombstone from B's unresolvable map"
+    );
+    assert!(std::fs::read(&src_b).is_ok_and(|g| g == bytes));
+}
