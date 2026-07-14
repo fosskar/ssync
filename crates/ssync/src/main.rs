@@ -446,6 +446,13 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
             .map(|a| (a.agent.clone(), a.exclude.clone()))
             .collect(),
     );
+    if !config.path_map.is_empty() {
+        engine.set_path_map(config.build_path_map()?, config.canonical_home.clone());
+        println!(
+            "ssync: path map active ({} prefix pair(s))",
+            config.path_map.len()
+        );
+    }
     engine.persist_state(&config.data_dir.join("state.toml"));
     for a in &config.agents {
         println!(

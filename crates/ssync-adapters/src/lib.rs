@@ -58,6 +58,35 @@ pub trait Adapter: Send + Sync + std::fmt::Debug {
     fn title(&self, _path: &Path) -> Option<String> {
         None
     }
+
+    /// Whether this adapter has cwd semantics the path map can act on
+    /// (issue #13). `false` = the engine passes its keys and bytes through
+    /// untouched even with an active map.
+    fn maps_paths(&self) -> bool {
+        false
+    }
+
+    /// The session's cwd from its header record — the sanctioned single-
+    /// header-field read (scans the first few lines for the `type:session`
+    /// record; omp keeps a `type:title` record above it). `None` = this
+    /// adapter has no cwd semantics or the bytes carry no header.
+    fn header_cwd(&self, _bytes: &[u8]) -> Option<String> {
+        None
+    }
+
+    /// Rewrite the header record's cwd, leaving every other byte untouched.
+    /// The one sanctioned content rewrite (path map — opt-in crossing of
+    /// store-as-is; DECISIONS §2, map #42). `None` = unsupported.
+    fn rewrite_header_cwd(&self, _bytes: &[u8], _cwd: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Encode a cwd into this agent's project-dir name; `home` is the home
+    /// context for home-relative encodings (omp). `None` = unsupported, or
+    /// undecidable without a home context.
+    fn encode_cwd(&self, _cwd: &str, _home: Option<&Path>) -> Option<String> {
+        None
+    }
 }
 
 /// UTF-8 filename stem — the start of every path-derived identity.

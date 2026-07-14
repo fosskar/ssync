@@ -5,10 +5,11 @@ leaderless: every machine runs the same daemon as an equal peer.
 
 ## Prerequisites
 
-- A synced project must live at the **same absolute path on every machine**. pi
-  keys sessions on the absolute working directory, so `~/projects/foo` on one
-  machine and `~/code/foo` on another are, to pi, different sessions. See
-  `identity.md`.
+- By default a synced project must live at the **same absolute path on every
+  machine** — pi keys sessions on the absolute working directory, so
+  `~/projects/foo` on one machine and `~/code/foo` on another are, to pi,
+  different sessions (see `identity.md`). The opt-in `[[path_map]]` bridges
+  differing paths — see "Differing absolute paths" below.
 - Age keys, one of two modes:
   - **Per-machine keypairs** (recommended): each machine keeps its own age key;
     the other machines learn its recipient from the cluster file (or, in ticket
@@ -191,6 +192,47 @@ claude-code, codex).
 keep their copies, nothing is deleted — and the daemon ignores index entries
 for agents it has no adapter for. Machines that never had the agent installed
 simply materialize its sessions if it is configured, or skip them if not.
+
+## Differing absolute paths (`[[path_map]]`)
+
+A machine hosting projects at different absolute paths joins them to the mesh
+with per-machine prefix pairs (pi and omp; codex needs none — its sessions are
+path-independent by design; claude-code is not supported):
+
+```toml
+# only on the machine whose paths differ; matching machines configure nothing
+[[path_map]]
+local = "/srv/work"                    # this machine's prefix; ~ allowed
+canonical = "/home/simon/Projects"     # the mesh-wide form: absolute literal
+
+# required only when an omp mapping's canonical path lies under a home:
+# the home that canonical paths are relative to (omp encodes home-relative)
+canonical_home = "/home/simon"
+```
+
+The wire — index keys and encrypted content — always carries the **canonical**
+form; import and export translate at the boundary, rewriting exactly two
+things: the session header's `cwd` and the encoded project-dir name. Bodies
+stay byte-identical; unmapped paths sync exactly as without a map. Longest
+prefix wins, matching is component-wise (`/srv/work` never matches
+`/srv/work2`) and case-sensitive.
+
+Rules that keep identities coherent:
+
+- **Canonical agreement is yours to uphold**: every machine must translate a
+  project to the same canonical path (there is no peer validation by design).
+  A per-key round-trip guard refuses any mapping that would flip a session's
+  identity; disagreeing maps degrade to no-sync for that project, never to
+  overwrites.
+- **Enabling** the map is self-cleaning: dead replicas from the
+  differing-path era are tombstoned and the sessions republish under
+  canonical keys. Machines **sharing the same divergent local path must
+  enable the same map together** (stop daemons, add the map on all, restart).
+- **Disabling** is destructive if done naively — the safe sequence is: stop
+  the daemon, delete `data_dir/state.toml`, remove the map, restart.
+- `canonical_home` must equal the real `$HOME` of the machines hosting
+  projects at canonical paths. Paths under the OS temp dir are not mappable
+  for omp.
 
 ## First machine
 

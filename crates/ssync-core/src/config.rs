@@ -21,6 +21,14 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
 }
+/// One `[[path_map]]` prefix pair. `local` may start with `~` (expanded on
+/// this machine); `canonical` is an absolute literal, identical everywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathMapEntry {
+    pub local: PathBuf,
+    pub canonical: PathBuf,
+}
 
 /// On-disk daemon configuration (`$XDG_CONFIG_HOME/ssync/config.toml`).
 /// Unknown keys are hard errors so removed fields (pre-0.14
@@ -46,6 +54,16 @@ pub struct Config {
     /// is always included). Empty = shared-identity mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipients: Vec<String>,
+    /// Prefix map bridging differing absolute paths (issue #13, map #42):
+    /// this machine's `local` prefixes ↔ the mesh-wide `canonical` form.
+    /// Opt-in; empty = every path is its own canonical form (store-as-is).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_map: Vec<PathMapEntry>,
+    /// The home dir canonical paths are relative to — required only for omp's
+    /// home-relative dir encoding of mapped canonical paths (#46 amendment).
+    /// Must equal the real $HOME of the machines hosting canonical paths.
+    #[serde(default)]
+    pub canonical_home: Option<PathBuf>,
 }
 
 impl Config {
@@ -100,6 +118,8 @@ impl Config {
             cluster_path: None,
             node_key_path: None,
             recipients: Vec::new(),
+            path_map: Vec::new(),
+            canonical_home: None,
         })
     }
 
@@ -130,12 +150,54 @@ impl Config {
         if let Some(p) = &mut cfg.node_key_path {
             expand(p);
         }
+        for e in &mut cfg.path_map {
+            expand(&mut e.local);
+            // `~` in canonical would be machine-dependent — refuse before the
+            // absolute check can be fooled by this machine's expansion.
+            if e.canonical.starts_with("~") {
+                return Err(anyhow!(
+                    "path_map canonical {} must be an absolute literal (no ~)",
+                    e.canonical.display()
+                ));
+            }
+        }
+        if let Some(h) = &cfg.canonical_home
+            && !h.is_absolute()
+        {
+            return Err(anyhow!("canonical_home {} must be absolute", h.display()));
+        }
+        cfg.build_path_map()?; // fail loudly at parse, not daemon-time (#46)
+        // omp's wire encoding is home-relative; without the home context
+        // every mapped omp dir would fail at daemon-time instead
+        if !cfg.path_map.is_empty()
+            && cfg.canonical_home.is_none()
+            && cfg.agents.iter().any(|a| a.agent == "omp")
+        {
+            return Err(anyhow!(
+                "path_map with an omp agent requires canonical_home (the home canonical paths are relative to)"
+            ));
+        }
         if cfg.cluster_path.is_some() && !cfg.recipients.is_empty() {
             return Err(anyhow!(
                 "cluster_path replaces recipients — remove them from the config"
             ));
         }
         Ok(cfg)
+    }
+
+    /// The validated [`PathMap`] this config describes (empty = inert).
+    pub fn build_path_map(&self) -> Result<crate::pathmap::PathMap> {
+        crate::pathmap::PathMap::new(
+            self.path_map
+                .iter()
+                .map(|e| {
+                    (
+                        e.local.to_string_lossy().into_owned(),
+                        e.canonical.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Atomic overwrite (temp + rename), mirroring `SyncState::save`
@@ -443,5 +505,124 @@ mod tests {
         let out = insert_cluster_path(text, path);
         let cfg = Config::parse(&out).unwrap();
         assert_eq!(cfg.cluster_path.as_deref(), Some(path));
+    }
+}
+
+#[cfg(test)]
+mod pathmap_config_tests {
+    use super::*;
+
+    #[test]
+    fn path_map_parses_expands_tilde_and_builds() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            canonical_home = "/home/simon"
+            [[path_map]]
+            local = "~/work"
+            canonical = "/home/simon/Projects"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(cfg.path_map[0].local, home.join("work"));
+        assert_eq!(
+            cfg.canonical_home.as_deref(),
+            Some(Path::new("/home/simon"))
+        );
+        let map = cfg.build_path_map().unwrap();
+        let local = home.join("work/x").to_string_lossy().into_owned();
+        assert_eq!(
+            map.canonical_of(&local).unwrap().as_deref(),
+            Some("/home/simon/Projects/x")
+        );
+    }
+
+    #[test]
+    fn path_map_validation_fails_at_parse() {
+        // duplicate canonical prefixes must be a hard parse error, not a
+        // daemon-time surprise (decision #46)
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            [[path_map]]
+            local = "/a"
+            canonical = "/c"
+            [[path_map]]
+            local = "/b"
+            canonical = "/c"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        assert!(Config::parse(toml_str).is_err());
+        // canonical must be absolute — ~ is machine-dependent by design
+        let tilde_canonical = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            [[path_map]]
+            local = "/a"
+            canonical = "~/Projects"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        assert!(Config::parse(tilde_canonical).is_err());
+    }
+
+    #[test]
+    fn canonical_home_must_be_absolute() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            canonical_home = "relative"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        assert!(Config::parse(toml_str).is_err());
+    }
+
+    #[test]
+    fn absent_path_map_defaults_empty() {
+        let cfg = Config::parse(
+            r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.path_map.is_empty());
+        assert!(cfg.canonical_home.is_none());
+        assert!(cfg.build_path_map().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pathmap_omp_tests {
+    use super::*;
+
+    #[test]
+    fn omp_with_path_map_requires_canonical_home() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            [[path_map]]
+            local = "/a"
+            canonical = "/c"
+            [[agents]]
+            agent = "omp"
+            session_dir = "/s"
+        "#;
+        let err = Config::parse(toml_str).unwrap_err().to_string();
+        assert!(err.contains("canonical_home"), "{err}");
+        // pi-only maps need no home context
+        let pi_only = toml_str.replace("agent = \"omp\"", "agent = \"pi\"");
+        assert!(Config::parse(&pi_only).is_ok());
     }
 }

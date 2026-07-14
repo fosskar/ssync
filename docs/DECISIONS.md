@@ -82,9 +82,21 @@ _same_ session id is genuinely written on two machines independently.
 **Verified pi constraint (June 2026, from pi-mono source):** pi stores each session under a
 directory named after the **absolute cwd** and also embeds the absolute `cwd` in the session
 header. It keys purely on absolute path, not git/repo identity. This means **the same
-project must live at the same absolute path on every machine** for sessions to line up — a
-hard v1 requirement (see docs/pi-format-notes.md). Rewriting paths to relax this is possible but
-violates store-as-is, so it is deferred to TODO.
+project must live at the same absolute path on every machine** for sessions to line up —
+the v1 default (see docs/pi-format-notes.md).
+
+**Amended (2026-07, #13/#42):** the opt-in `[[path_map]]` relaxes this. Per-machine
+prefix pairs (`local` ↔ `canonical`) translate at the adapter boundary: the wire — index
+keys and blob plaintext — always carries the canonical form, and only two things are
+ever rewritten (the header `cwd` record and the encoded project-dir name, re-derived
+per agent). This is the one sanctioned crossing of store-as-is (§2): bodies stay
+byte-identical, unmapped paths pass through untouched, and an empty map is exactly v1
+behavior. Guardrails: round-trip validation per key (an identity flip is never
+executed), unmappable headers are per-key skips (a machine-local path never reaches
+the index), and cross-machine canonical agreement is a documented invariant —
+enforcing it would need peer map exchange, a coordination surface we refuse (§4/§6).
+`canonical_home` gives omp's home-relative encoding its wire-side home context.
+Decision record: map #42 and its closed tickets.
 
 ---
 
