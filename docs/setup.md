@@ -309,6 +309,7 @@ them on any machine.
 ```bash
 ssync status      # namespace, session count, conflict count
 ssync conflicts   # list sessions that diverged across machines
+ssync search foo  # find sessions by title or project path (--agent to narrow)
 ```
 
 ## Automatic cleanup
