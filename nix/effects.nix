@@ -37,7 +37,7 @@ in
 
   onSchedule.update-flake-inputs = {
     when = {
-      hour = 5;
+      hour = 1;
       minute = 0;
     };
     outputs.effects.update-flake-inputs =
