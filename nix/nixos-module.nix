@@ -26,6 +26,9 @@ let
         lib.concatMapStringsSep ", " (r: "\"${lib.removeSuffix "\n" r}\"") cfg.recipients
       } ]
     ''
+    + lib.optionalString (cfg.relay != null) ''
+      relay = "${cfg.relay}"
+    ''
     + lib.optionalString (cfg.canonicalHome != null) ''
       canonical_home = "${cfg.canonicalHome}"
     ''
@@ -232,6 +235,16 @@ in
       '';
     };
 
+    relay = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://relay.example.com";
+      description = ''
+        Self-hosted iroh relay URL, replacing the n0 public relays entirely
+        (docs/setup.md "Self-hosted relay"). Every machine must set the same
+        URL. Null = n0 public defaults.
+      '';
+    };
     recipients = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];

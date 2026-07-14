@@ -5,9 +5,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use futures_lite::{Stream, StreamExt};
-use iroh::endpoint::{TransportAddrUsage, presets};
+use iroh::endpoint::{RelayMode, TransportAddrUsage, presets};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use iroh_blobs::api::downloader::Shuffled;
 use iroh_blobs::store::fs::{FsStore, options::Options as FsStoreOptions};
 use iroh_blobs::store::{GcConfig, ProtectCb};
@@ -163,7 +163,20 @@ const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 impl Node {
     /// No index namespace is active until one is created, opened or joined.
     pub async fn spawn(data_dir: &Path, secret_key: SecretKey) -> Result<Self> {
-        Self::spawn_with_gc(data_dir, secret_key, GC_INTERVAL).await
+        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, None).await
+    }
+
+    /// [`spawn`](Self::spawn) with a self-hosted relay replacing the n0
+    /// public relays (DECISIONS §6 — optional, never required; config
+    /// `relay`). Discovery (DNS/pkarr/mDNS) is unaffected: only the relay
+    /// map is swapped, so all machines must point at the same relay to
+    /// rendezvous through it.
+    pub async fn spawn_with_relay(
+        data_dir: &Path,
+        secret_key: SecretKey,
+        relay: RelayUrl,
+    ) -> Result<Self> {
+        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, Some(relay)).await
     }
 
     /// Register mDNS address lookup: LAN peers become dialable by node-id
@@ -192,15 +205,24 @@ impl Node {
         secret_key: SecretKey,
         gc_interval: std::time::Duration,
     ) -> Result<Self> {
+        Self::spawn_inner(data_dir, secret_key, gc_interval, None).await
+    }
+
+    async fn spawn_inner(
+        data_dir: &Path,
+        secret_key: SecretKey,
+        gc_interval: std::time::Duration,
+        relay: Option<RelayUrl>,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(data_dir)
             .await
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await
-            .context("binding iroh endpoint")?;
+        let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+        if let Some(url) = relay {
+            builder = builder.relay_mode(RelayMode::custom([url]));
+        }
+        let endpoint = builder.bind().await.context("binding iroh endpoint")?;
 
         // GC: iroh-docs feeds the protect callback every hash referenced by a
         // current doc entry (any author, any replica); everything else sweeps.
@@ -654,6 +676,25 @@ mod tests {
         assert_eq!(rec.versions, vec![hash]);
         assert!(node.index_record("missing").await.unwrap().is_none());
 
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_with_relay_binds_and_functions() {
+        // a custom relay swaps only the relay map; the node must come up and
+        // its local machinery (blob store, index) must work regardless of
+        // whether the relay is reachable.
+        let dir = tempdir("relay");
+        let url: RelayUrl = "https://relay.invalid".parse().unwrap();
+        let mut node = Node::spawn_with_relay(&dir, SecretKey::generate(), url)
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        let hash = node.publish("pi/p/s", b"c".to_vec()).await.unwrap();
+        assert_eq!(
+            node.index_record("pi/p/s").await.unwrap().unwrap().winner,
+            Some(hash)
+        );
         node.shutdown().await.unwrap();
     }
 

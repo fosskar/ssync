@@ -190,8 +190,9 @@ free public relays is not "running a server"; it's like using public DNS. So thi
 genuinely p2p; the user simply isn't required to operate the introducer.
 
 **Optional, documented, never required:** a power user who distrusts n0's public infra can
-point ssync at their own relay. This is a config option in docs, not a default and not a
-dependency.
+point ssync at their own relay — implemented as the `relay` config option (2026-07, #19):
+it replaces the n0 relay map entirely (same URL on every machine), leaves discovery and
+mDNS untouched, and stays a non-default. See docs/setup.md "Self-hosted relay".
 
 ---
 
