@@ -299,6 +299,39 @@ either copy one shared age key everywhere, or maintain each machine's
 `recipients` in the config by hand. Membership changes are manual per machine;
 the cluster file is the recommended mode.
 
+## Self-hosted relay
+
+By default ssync uses iroh's public relays (run for free by n0) to bootstrap
+NAT traversal and to carry traffic when hole-punching fails — always
+end-to-end encrypted, the relay only ever sees ciphertext (DECISIONS §6,
+`threat-model.md`). If you'd rather not touch n0's relays, run your own and
+point every machine at it:
+
+```toml
+# same URL on every machine — this REPLACES the n0 relays entirely
+relay = "https://relay.example.com"
+```
+
+(nix: `services.ssync.relay`.) The relay server is `iroh-relay`, packaged in
+nixpkgs (`nixpkgs#iroh-relay`, versioned in step with the iroh ssync pins).
+It needs a public address and TLS (own certs or ACME via its config file);
+`iroh-relay --dev` runs plain HTTP on port 3340 for experiments. See the
+[iroh-relay docs](https://github.com/n0-computer/iroh/tree/main/iroh-relay)
+for production configuration.
+
+Honest scope — what the override does and does not cover:
+
+- **Covered:** all relayed *traffic* and the NAT-traversal bootstrap move to
+  your relay; n0's relays are never contacted.
+- **Not covered:** node-address *discovery* still uses n0's public DNS/pkarr
+  service (node-id → current addresses; metadata only, no session data). A
+  fully n0-free deployment is possible on a LAN today (cluster file + mDNS —
+  no relay, no DNS involved); self-hosting discovery across networks would
+  additionally need an `iroh-dns-server`, which ssync does not wire up yet —
+  open an issue if you need it.
+- The relay is still optional infrastructure: direct connections are always
+  preferred, and machines that can hole-punch exchange all data p2p.
+
 ## Everyday use
 
 Run `ssync daemon` on each machine (the Nix modules do this as a service). Work

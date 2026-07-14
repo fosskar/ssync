@@ -64,6 +64,11 @@ pub struct Config {
     /// Must equal the real $HOME of the machines hosting canonical paths.
     #[serde(default)]
     pub canonical_home: Option<PathBuf>,
+    /// Override the iroh relay (self-hosted; docs/setup.md "Self-hosted
+    /// relay"). Replaces the n0 public relays entirely — every machine must
+    /// set the same URL. Absent = n0 defaults (DECISIONS §6).
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 impl Config {
@@ -120,6 +125,7 @@ impl Config {
             recipients: Vec::new(),
             path_map: Vec::new(),
             canonical_home: None,
+            relay: None,
         })
     }
 
@@ -165,6 +171,11 @@ impl Config {
             && !h.is_absolute()
         {
             return Err(anyhow!("canonical_home {} must be absolute", h.display()));
+        }
+        if let Some(r) = &cfg.relay
+            && r.parse::<ssync_net::iroh::RelayUrl>().is_err()
+        {
+            return Err(anyhow!("relay {r:?} is not a valid relay url"));
         }
         cfg.build_path_map()?; // fail loudly at parse, not daemon-time (#46)
         // omp's wire encoding is home-relative; without the home context
@@ -624,5 +635,38 @@ mod pathmap_omp_tests {
         // pi-only maps need no home context
         let pi_only = toml_str.replace("agent = \"omp\"", "agent = \"pi\"");
         assert!(Config::parse(&pi_only).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn relay_parses_and_validates_at_parse_time() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            relay = "https://relay.example.com"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        assert_eq!(cfg.relay.as_deref(), Some("https://relay.example.com"));
+
+        // a malformed url is a hard parse error, not a daemon-time surprise
+        let bad = toml_str.replace("https://relay.example.com", "not a url");
+        assert!(Config::parse(&bad).is_err());
+
+        // absent = n0 public defaults (DECISIONS §6)
+        let none = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        assert!(Config::parse(none).unwrap().relay.is_none());
     }
 }

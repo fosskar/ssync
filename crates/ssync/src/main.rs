@@ -437,7 +437,15 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
 
     let node_key_path = config.node_key_file();
     let secret = load_or_create_secret_key(&node_key_path).await?;
-    let mut node = Node::spawn(&config.data_dir, secret).await?;
+    let mut node = match &config.relay {
+        Some(url) => {
+            let relay = url.parse().map_err(|e| anyhow!("relay {url:?}: {e}"))?;
+            let node = Node::spawn_with_relay(&config.data_dir, secret, relay).await?;
+            println!("ssync: self-hosted relay {url} (n0 public relays disabled)");
+            node
+        }
+        None => Node::spawn(&config.data_dir, secret).await?,
+    };
     node.enable_mdns();
 
     if let Some(c) = &cluster {
