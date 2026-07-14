@@ -59,8 +59,8 @@ Impure shell around pure decision cores:
 ## Key Directories
 
 - `crates/ssync/` — binary: clap CLI (`init/daemon/cluster/ticket/join/status/conflicts/`
-  `cleanup/service/keygen-node/keygen-namespace`) + daemon wiring; `src/main.rs` dispatches,
-  pure decision cores live in submodules (`service.rs`, `cluster.rs`).
+  `search/cleanup/service/keygen-node/keygen-namespace`) + daemon wiring; `src/main.rs`
+  dispatches, pure decision cores live in submodules (`service.rs`, `cluster.rs`).
 - `crates/ssync-core/` — `Config`, `Engine`, `StatusReport`; pure decision cores live in
   their own submodules.
 - `crates/ssync-net/` — iroh endpoint/router/docs/blobs/gossip setup, `Node`,

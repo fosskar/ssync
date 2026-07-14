@@ -22,6 +22,7 @@ mod divergence;
 mod exclude;
 mod pathmap;
 mod reconcile;
+pub mod search;
 mod status;
 pub use config::{AgentConfig, Config, insert_cluster_path};
 use divergence::{Divergence, Verdict};

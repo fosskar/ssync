@@ -52,6 +52,13 @@ enum Command {
     Status,
     /// List sessions that have diverged across machines.
     Conflicts,
+    /// Find sessions by title or project path (case-insensitive substring).
+    Search {
+        query: String,
+        /// Only this agent's sessions (default: all configured agents).
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Delete old/unnamed local sessions; the daemon propagates the deletions.
     Cleanup {
         /// Only this agent's sessions (default: all configured agents).
@@ -193,6 +200,7 @@ async fn main() -> Result<()> {
         },
         Command::Status => cmd_status(&config_path),
         Command::Conflicts => cmd_conflicts(&config_path),
+        Command::Search { query, agent } => cmd_search(&config_path, &query, agent.as_deref()),
         Command::Cleanup {
             agent,
             keep,
@@ -237,6 +245,45 @@ async fn main() -> Result<()> {
             write_secret_bytes(&path, &ssync_net::generate_key_bytes())
         }
     }
+}
+
+/// Title/project search over the local session files — read-only, never
+/// touches the daemon or the index (issue #18).
+fn cmd_search(config_path: &Path, query: &str, agent: Option<&str>) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let adapters = config
+        .agents
+        .iter()
+        .map(|a| adapter_for(&a.agent, &a.session_dir))
+        .collect::<Result<Vec<_>>>()?;
+    let hits = ssync_core::search::search(&adapters, query, agent)?;
+    if hits.is_empty() {
+        println!("no sessions match {query:?}");
+        return Ok(());
+    }
+    let home = dirs::home_dir();
+    for h in &hits {
+        let date = h
+            .created_at
+            .map(ssync_core::search::date_of)
+            .unwrap_or_else(|| "????-??-??".into());
+        let title = match h.title.as_deref() {
+            Some("") | None => "(untitled)".to_string(),
+            Some(t) => format!("{t:?}"),
+        };
+        // ~-shorten the project path for display
+        let project = match &home {
+            Some(home) => std::path::Path::new(&h.project)
+                .strip_prefix(home)
+                .map(|r| format!("~/{}", r.display()))
+                .unwrap_or_else(|_| h.project.clone()),
+            None => h.project.clone(),
+        };
+        println!("{:5} {date}  {:40} {title}", h.agent, project);
+        println!("      {}", h.session_id);
+    }
+    println!("{} session(s)", hits.len());
+    Ok(())
 }
 
 fn cmd_cleanup(
