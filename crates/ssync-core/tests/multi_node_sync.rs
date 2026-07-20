@@ -6,152 +6,84 @@
 //! per-machine age identities. All mutation goes through `tick_once`/`run` — the
 //! production path. Uses poll loops because sync is asynchronous over the network.
 
-use std::path::{Path, PathBuf};
+mod harness;
+
+use std::path::Path;
 use std::time::Duration;
 
+use harness::*;
 use ssync_adapters::Adapter;
 use ssync_adapters::blob_store::BlobStoreAdapter;
 use ssync_adapters::pi::PiAdapter;
-use ssync_core::Engine;
 use ssync_crypto::AgeIdentity;
-use ssync_net::Node;
 use ssync_net::iroh::SecretKey;
-
-fn scratch(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("ssync-two-node-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    base
-}
-
-async fn spawn_node(data_dir: &Path) -> Node {
-    Node::spawn(data_dir, SecretKey::generate()).await.unwrap()
-}
-
-fn pi_engine(root: &Path, age_secret: &str, node: Node) -> Engine {
-    Engine::new(
-        PiAdapter::new("pi", root),
-        AgeIdentity::from_secret_string(age_secret).unwrap(),
-        node,
-    )
-}
-
-/// Poll `cond` every 500ms until it holds or ~30s elapse.
-async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
-    for _ in 0..60 {
-        if cond() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    false
-}
 
 #[tokio::test]
 async fn session_created_on_a_appears_on_b() {
-    let base = scratch("base");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("base");
 
     // --- node A: has a real session file ---
-    let root_a = base.join("a/sessions");
     let rel = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
-    let src = root_a.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"hello from A\"}\n";
-    std::fs::write(&src, contents).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
-    engine_a.tick_once().await;
+    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    peer_a.write(rel, contents);
+    peer_a.tick().await;
 
     // --- node B: empty session dir, joins A's namespace ---
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+    let mut peer_b = sim.pi_peer("b", "pi", node_b);
 
     // sync is async: tick B until the file materializes, byte-identical.
-    let dest = root_b.join(rel);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if let Ok(got) = std::fs::read(&dest)
-            && got == contents
-        {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest = peer_b.path(rel);
+    let ok = converge(&mut [&mut peer_b], || file_eq(&dest, contents)).await;
     assert!(ok, "session did not sync to node B within timeout");
 }
 
 #[tokio::test]
 async fn per_machine_identities_sync_both_directions() {
-    let base = scratch("permachine");
+    let sim = Sim::new("permachine");
     let id_a = AgeIdentity::generate().unwrap();
     let id_b = AgeIdentity::generate().unwrap();
 
     // --- node A: own key, B listed as recipient, has a session ---
-    let root_a = base.join("a/sessions");
     let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
-    let src = root_a.join(rel_a);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents_a = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from A\"}\n";
-    std::fs::write(&src, contents_a).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
     let mut ident_a = AgeIdentity::from_secret_string(&id_a.to_secret_string()).unwrap();
     ident_a.add_recipients([id_b.recipient_string()]);
-    let mut engine_a = Engine::new(PiAdapter::new("pi", &root_a), ident_a, node_a);
-    engine_a.tick_once().await;
+    let mut peer_a = sim.pi_peer_as("a", "pi", ident_a, node_a);
+    peer_a.write(rel_a, contents_a);
+    peer_a.tick().await;
 
     // --- node B: own key, A listed as recipient ---
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
     let mut ident_b = AgeIdentity::from_secret_string(&id_b.to_secret_string()).unwrap();
     ident_b.add_recipients([id_a.recipient_string()]);
-    let mut engine_b = Engine::new(PiAdapter::new("pi", &root_b), ident_b, node_b);
+    let mut peer_b = sim.pi_peer_as("b", "pi", ident_b, node_b);
 
     // A → B: B decrypts A's blob with its own key.
-    let dest_a = root_b.join(rel_a);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if let Ok(got) = std::fs::read(&dest_a)
-            && got == contents_a
-        {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest_a = peer_b.path(rel_a);
+    let ok = converge(&mut [&mut peer_b], || file_eq(&dest_a, contents_a)).await;
     assert!(ok, "A's session did not reach B under per-machine keys");
 
     // B → A: symmetric direction.
     let rel_b = "--home-simon-Projects-demo--/2026-05-23T07-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4c.jsonl";
     let contents_b = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from B\"}\n";
-    std::fs::write(root_b.join(rel_b), contents_b).unwrap();
-    let dest_b = root_a.join(rel_b);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        engine_a.tick_once().await;
-        if let Ok(got) = std::fs::read(&dest_b)
-            && got == contents_b
-        {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    peer_b.write(rel_b, contents_b);
+    let dest_b = peer_a.path(rel_b);
+    let ok = converge(&mut [&mut peer_b, &mut peer_a], || {
+        file_eq(&dest_b, contents_b)
+    })
+    .await;
     assert!(ok, "B's session did not reach A under per-machine keys");
 }
 
@@ -161,7 +93,7 @@ async fn per_machine_identities_reach_a_third_machine() {
     // every machine must encrypt to *all* peers. three nodes, full recipient
     // mesh, one shared namespace — a session from A must land on B and C, and
     // one from C must land on A and B.
-    let base = scratch("threenode");
+    let sim = Sim::new("threenode");
     let ids: Vec<AgeIdentity> = (0..3).map(|_| AgeIdentity::generate().unwrap()).collect();
     let recipients: Vec<String> = ids.iter().map(|i| i.recipient_string()).collect();
     let ident = |n: usize| {
@@ -172,113 +104,80 @@ async fn per_machine_identities_reach_a_third_machine() {
 
     let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4d.jsonl";
     let contents_a = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from A\"}\n";
-    let root_a = base.join("a/sessions");
-    let src = root_a.join(rel_a);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-    std::fs::write(&src, contents_a).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket_b = node_a.share().await.unwrap();
     let ticket_c = node_a.share().await.unwrap();
-    let mut engine_a = Engine::new(PiAdapter::new("pi", &root_a), ident(0), node_a);
-    engine_a.tick_once().await;
+    let mut peer_a = sim.pi_peer_as("a", "pi", ident(0), node_a);
+    peer_a.write(rel_a, contents_a);
+    peer_a.tick().await;
 
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket_b).await.unwrap();
-    let mut engine_b = Engine::new(PiAdapter::new("pi", &root_b), ident(1), node_b);
+    let mut peer_b = sim.pi_peer_as("b", "pi", ident(1), node_b);
 
-    let root_c = base.join("c/sessions");
-    std::fs::create_dir_all(&root_c).unwrap();
-    let mut node_c = spawn_node(&base.join("c/data")).await;
+    let mut node_c = sim.node("c").await;
     node_c.join(ticket_c).await.unwrap();
-    let mut engine_c = Engine::new(PiAdapter::new("pi", &root_c), ident(2), node_c);
+    let mut peer_c = sim.pi_peer_as("c", "pi", ident(2), node_c);
 
     // A → B and A → C: both peers decrypt A's blob with their own keys.
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        engine_c.tick_once().await;
-        let on = |root: &Path| std::fs::read(root.join(rel_a)).is_ok_and(|got| got == contents_a);
-        if on(&root_b) && on(&root_c) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest_b = peer_b.path(rel_a);
+    let dest_c = peer_c.path(rel_a);
+    let ok = converge(&mut [&mut peer_b, &mut peer_c], || {
+        file_eq(&dest_b, contents_a) && file_eq(&dest_c, contents_a)
+    })
+    .await;
     assert!(ok, "A's session did not reach both B and C");
 
     // C → A and C → B: the reverse direction from a joined (non-author) node.
     let rel_c = "--home-simon-Projects-demo--/2026-05-23T07-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4e.jsonl";
     let contents_c = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from C\"}\n";
-    std::fs::write(root_c.join(rel_c), contents_c).unwrap();
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_a.tick_once().await;
-        engine_b.tick_once().await;
-        engine_c.tick_once().await;
-        let on = |root: &Path| std::fs::read(root.join(rel_c)).is_ok_and(|got| got == contents_c);
-        if on(&root_a) && on(&root_b) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    peer_c.write(rel_c, contents_c);
+    let dest_a2 = peer_a.path(rel_c);
+    let dest_b2 = peer_b.path(rel_c);
+    let ok = converge(&mut [&mut peer_a, &mut peer_b, &mut peer_c], || {
+        file_eq(&dest_a2, contents_c) && file_eq(&dest_b2, contents_c)
+    })
+    .await;
     assert!(ok, "C's session did not reach both A and B");
 }
 
 #[tokio::test]
 async fn live_write_propagates_without_restart() {
-    let base = scratch("live");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
-    let root_a = base.join("a/sessions");
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_a).unwrap();
-    std::fs::create_dir_all(&root_b).unwrap();
+    let sim = Sim::new("live");
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a);
 
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b);
 
     // start both daemons and let them enter their loops
-    let sa = base.join("a/status.toml");
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let root_a = peer_a.run();
+    let root_b = peer_b.run();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // write a NEW session on A *after* startup (also a brand-new project dir)
     let rel = "--proj--/2026-07-01T00-00-00-000Z_019e9999-eeee-71ac-be20-livewrite00001.jsonl";
-    let src = root_a.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents = b"live write after start\n";
-    std::fs::write(&src, contents).unwrap();
+    write_file(&root_a.join(rel), contents);
 
     let dest = root_b.join(rel);
-    let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;
+    let ok = eventually(|| file_eq(&dest, contents)).await;
     assert!(ok, "live write after startup did not propagate to node B");
 }
 
 #[tokio::test]
 async fn shared_namespace_auto_connects_without_ticket() {
-    let base = scratch("shared");
+    let sim = Sim::new("shared");
     let ns_secret = ssync_net::generate_key_bytes();
-    let age = AgeIdentity::generate().unwrap().to_secret_string();
 
-    let root_a = base.join("a/sessions");
-    std::fs::create_dir_all(&root_a).unwrap();
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-
-    let mut node_a = spawn_node(&base.join("a/data")).await;
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_a = sim.node("a").await;
+    let mut node_b = sim.node("b").await;
 
     // the same secret must yield the same namespace on both — no ticket exchange
     let id_a = node_a.open_shared_namespace(ns_secret).await.unwrap();
@@ -291,27 +190,21 @@ async fn shared_namespace_auto_connects_without_ticket() {
     node_a.sync_with(vec![addr_b]).await.unwrap();
     node_b.sync_with(vec![addr_a]).await.unwrap();
 
-    let mut engine_a = pi_engine(&root_a, &age, node_a);
-    let mut engine_b = pi_engine(&root_b, &age, node_b);
+    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let peer_b = sim.pi_peer("b", "pi", node_b);
 
-    let sa = base.join("a/status.toml");
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let root_a = peer_a.run();
+    let root_b = peer_b.run();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019eshared0001eeee71acbe20shared01.jsonl";
-    let src = root_a.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents = b"shared namespace session\n";
-    std::fs::write(&src, contents).unwrap();
+    write_file(&root_a.join(rel), contents);
 
     let dest = root_b.join(rel);
     let mut ok = false;
     for _ in 0..80 {
-        if let Ok(got) = std::fs::read(&dest)
-            && got == contents
-        {
+        if file_eq(&dest, contents) {
             ok = true;
             break;
         }
@@ -322,42 +215,32 @@ async fn shared_namespace_auto_connects_without_ticket() {
 
 #[tokio::test]
 async fn deletion_propagates_and_does_not_resurrect() {
-    let base = scratch("del");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("del");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019edddd0001eeee71acbe20delete001.jsonl";
 
-    let root_a = base.join("a/sessions");
-    std::fs::create_dir_all(root_a.join("--proj--")).unwrap();
-    // keep a second unrelated session so the dir is never empty (deletion guard)
-    std::fs::write(
-        root_a.join("--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl"),
-        b"keep\n",
-    )
-    .unwrap();
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a);
+    // keep a second unrelated session so the dir is never empty (deletion guard)
+    peer_a.write(
+        "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl",
+        b"keep\n",
+    );
 
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b);
 
-    std::fs::write(root_a.join(rel), b"header\nto-be-deleted\n").unwrap();
+    peer_a.write(rel, b"header\nto-be-deleted\n");
     // the session's artifact dir (omp subagent transcript) syncs and must be
     // swept on B once the deletion empties it.
     let artifact_dir_rel = rel.strip_suffix(".jsonl").unwrap();
     let artifact_rel = format!("{artifact_dir_rel}/Sub.jsonl");
-    std::fs::create_dir_all(root_a.join(artifact_dir_rel)).unwrap();
-    std::fs::write(root_a.join(&artifact_rel), b"header\nsub\n").unwrap();
+    peer_a.write(&artifact_rel, b"header\nsub\n");
 
-    let sa = base.join("a/status.toml");
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let root_a = peer_a.run();
+    let root_b = peer_b.run();
 
     // both files appear on B
     let dest = root_b.join(rel);
@@ -389,35 +272,26 @@ async fn deletion_propagates_and_does_not_resurrect() {
 async fn deletion_by_non_author_propagates_back() {
     // a session created on A, deleted on B, must disappear on A (and stay gone)
     // even though A authored the index entry (TODO "deletion by any participant").
-    let base = scratch("xdel");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("xdel");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019exdel0001eeee71acbe20xdele001.jsonl";
 
-    let root_a = base.join("a/sessions");
-    std::fs::create_dir_all(root_a.join("--proj--")).unwrap();
-    // second session so neither dir ever goes empty (deletion guard)
-    std::fs::write(
-        root_a.join("--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl"),
-        b"keep\n",
-    )
-    .unwrap();
-    std::fs::write(root_a.join(rel), b"header\nauthored on A\n").unwrap();
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a);
+    // second session so neither dir ever goes empty (deletion guard)
+    peer_a.write(
+        "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl",
+        b"keep\n",
+    );
+    peer_a.write(rel, b"header\nauthored on A\n");
 
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b);
 
-    let sa = base.join("a/status.toml");
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let root_a = peer_a.run();
+    let root_b = peer_b.run();
 
     // both sessions reach B (the keep session too, so B's dir never goes
     // empty after the delete — the empty-dir guard would swallow the tombstone)
@@ -446,68 +320,57 @@ async fn deletion_while_daemon_down_is_not_reimported() {
     // engine 1 imports two sessions and persists its state; one file is
     // deleted "while the daemon is down"; engine 2 (same state file, same
     // node dir) must tombstone the deleted session instead of re-importing it.
-    let base = scratch("down-del");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
-    let root = base.join("sessions");
-    let state_path = base.join("state.toml");
+    let sim = Sim::new("down-del");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019edown0001eeee71acbe20downdel01.jsonl";
     let keep = "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl";
-    std::fs::create_dir_all(root.join("--proj--")).unwrap();
-    std::fs::write(root.join(rel), b"header\ndelete me\n").unwrap();
-    std::fs::write(root.join(keep), b"keep\n").unwrap();
+    let state_path = sim.base.join("state.toml");
 
     let ns = {
-        let mut node = spawn_node(&base.join("data")).await;
+        let mut node = sim.node("n").await;
         let ns = node.create_namespace().await.unwrap();
-        let mut engine = pi_engine(&root, &secret, node);
-        engine.persist_state(&state_path);
-        engine.tick_once().await;
-        engine.shutdown().await.unwrap();
+        let mut peer = sim.pi_peer("n", "pi", node);
+        peer.write(rel, b"header\ndelete me\n");
+        peer.write(keep, b"keep\n");
+        peer.engine.persist_state(&state_path);
+        peer.tick().await;
+        peer.shutdown().await.unwrap();
         ns
     };
 
     // daemon down: the session file disappears
-    std::fs::remove_file(root.join(rel)).unwrap();
+    std::fs::remove_file(sim.root("n").join(rel)).unwrap();
 
-    let mut node = spawn_node(&base.join("data")).await;
+    let mut node = sim.node("n").await;
     node.open_namespace(ns).await.unwrap();
-    let mut engine = pi_engine(&root, &secret, node);
-    engine.persist_state(&state_path);
-    engine.tick_once().await;
+    let mut peer = sim.pi_peer("n", "pi", node);
+    peer.engine.persist_state(&state_path);
+    peer.tick().await;
 
     // the key must now be a tombstone (deleted), not a live re-import
-    let report = engine.status_report().await.unwrap();
+    let report = peer.engine.status_report().await.unwrap();
     assert_eq!(report.sessions, 1, "deleted session was re-imported");
 }
 
 #[tokio::test]
 async fn divergent_sessions_merge_and_converge() {
-    let base = scratch("merge");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("merge");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019eccccdddd71acbe20merge0000001.jsonl";
 
-    let root_a = base.join("a/sessions");
-    std::fs::create_dir_all(root_a.join("--proj--")).unwrap();
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(root_b.join("--proj--")).unwrap();
-
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a);
 
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b);
 
     // each machine has its own divergent version of the same session
-    std::fs::write(root_a.join(rel), b"header\ncommon\nonly-on-a\n").unwrap();
-    std::fs::write(root_b.join(rel), b"header\ncommon\nonly-on-b\n").unwrap();
+    peer_a.write(rel, b"header\ncommon\nonly-on-a\n");
+    peer_b.write(rel, b"header\ncommon\nonly-on-b\n");
 
-    let sa = base.join("a/status.toml");
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let root_a = peer_a.run();
+    let root_b = peer_b.run();
 
     // both files must converge to the lossless union (nothing dropped)
     let want_lines = ["header", "common", "only-on-a", "only-on-b"];
@@ -528,36 +391,36 @@ async fn divergent_sessions_merge_and_converge() {
 
 #[tokio::test]
 async fn divergent_writes_are_detected_as_conflict() {
-    let base = scratch("conflict");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("conflict");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
 
     // node A publishes its version of the session
-    let root_a = base.join("a/sessions");
-    let src_a = root_a.join(rel);
-    std::fs::create_dir_all(src_a.parent().unwrap()).unwrap();
-    std::fs::write(&src_a, b"version from A\n").unwrap();
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
-    engine_a.tick_once().await;
+    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    peer_a.write(rel, b"version from A\n");
+    peer_a.tick().await;
 
     // node B joins, then publishes its OWN divergent version of the same session
-    let root_b = base.join("b/sessions");
-    let src_b = root_b.join(rel);
-    std::fs::create_dir_all(src_b.parent().unwrap()).unwrap();
-    std::fs::write(&src_b, b"different version from B\n").unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
-    engine_b.tick_once().await;
+    let mut peer_b = sim.pi_peer("b", "pi", node_b);
+    peer_b.write(rel, b"different version from B\n");
+    peer_b.tick().await;
 
     // once A's entry and blob sync in, B sees two authors whose contents do
     // not collapse into the winner: a conflict in the status report.
     let mut ok = false;
     for _ in 0..60 {
-        if !engine_b.status_report().await.unwrap().conflicts.is_empty() {
+        if !peer_b
+            .engine
+            .status_report()
+            .await
+            .unwrap()
+            .conflicts
+            .is_empty()
+        {
             ok = true;
             break;
         }
@@ -568,137 +431,116 @@ async fn divergent_writes_are_detected_as_conflict() {
 
 #[tokio::test]
 async fn pi_and_omp_sessions_sync_side_by_side() {
-    let base = scratch("multiagent");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("multiagent");
 
     // node A: one pi session and one omp session in their own roots
-    let pi_root_a = base.join("a/pi-sessions");
-    let omp_root_a = base.join("a/omp-sessions");
+    let pi_root_a = sim.base.join("a/pi-sessions");
+    let omp_root_a = sim.base.join("a/omp-sessions");
     let pi_rel = "--home-simon-Projects-demo--/2026-07-02T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
     let omp_rel =
         "-Projects-demo/2026-07-02T08-01-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
-    let pi_src = pi_root_a.join(pi_rel);
-    let omp_src = omp_root_a.join(omp_rel);
-    std::fs::create_dir_all(pi_src.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(omp_src.parent().unwrap()).unwrap();
     let pi_contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from pi\"}\n";
     let omp_contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from omp\"}\n";
-    std::fs::write(&pi_src, pi_contents).unwrap();
-    std::fs::write(&omp_src, omp_contents).unwrap();
+    write_file(&pi_root_a.join(pi_rel), pi_contents);
+    write_file(&omp_root_a.join(omp_rel), omp_contents);
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = Engine::with_adapters(
+    let mut peer_a = sim.peer(
+        "a",
         vec![
             Box::new(PiAdapter::new("pi", &pi_root_a)) as Box<dyn Adapter>,
             Box::new(PiAdapter::new("omp", &omp_root_a)),
         ],
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+        sim.identity(),
         node_a,
     );
-    engine_a.tick_once().await;
+    peer_a.tick().await;
 
     // node B: both agents configured, empty roots
-    let pi_root_b = base.join("b/pi-sessions");
-    let omp_root_b = base.join("b/omp-sessions");
+    let pi_root_b = sim.base.join("b/pi-sessions");
+    let omp_root_b = sim.base.join("b/omp-sessions");
     std::fs::create_dir_all(&pi_root_b).unwrap();
     std::fs::create_dir_all(&omp_root_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = Engine::with_adapters(
+    let mut peer_b = sim.peer(
+        "b",
         vec![
             Box::new(PiAdapter::new("pi", &pi_root_b)) as Box<dyn Adapter>,
             Box::new(PiAdapter::new("omp", &omp_root_b)),
         ],
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+        sim.identity(),
         node_b,
     );
 
     // both sessions must land on B, each under its own agent's root
     let pi_dest = pi_root_b.join(pi_rel);
     let omp_dest = omp_root_b.join(omp_rel);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if std::fs::read(&pi_dest).is_ok_and(|got| got == pi_contents)
-            && std::fs::read(&omp_dest).is_ok_and(|got| got == omp_contents)
-        {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let ok = converge(&mut [&mut peer_b], || {
+        file_eq(&pi_dest, pi_contents) && file_eq(&omp_dest, omp_contents)
+    })
+    .await;
     assert!(ok, "pi+omp sessions did not both sync to node B");
 }
+
 #[tokio::test]
 async fn omp_blob_store_syncs_binary_blobs() {
-    let base = scratch("blobstore");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("blobstore");
 
     // node A: one blob as omp writes it — bare hash plus a `.png` alias,
     // identical binary (non-UTF8) content.
-    let blob_root_a = base.join("a/blobs");
+    let blob_root_a = sim.base.join("a/blobs");
     std::fs::create_dir_all(&blob_root_a).unwrap();
     let hash = "a2a7f46769739a24d0d13eb5544a6041f830ac69395805c2da51d8de11b62711";
     let contents: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe";
     std::fs::write(blob_root_a.join(hash), contents).unwrap();
     std::fs::write(blob_root_a.join(format!("{hash}.png")), contents).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = Engine::new(
-        BlobStoreAdapter::new("omp-blobs", &blob_root_a),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+    let mut peer_a = sim.peer(
+        "a",
+        vec![Box::new(BlobStoreAdapter::new("omp-blobs", &blob_root_a)) as Box<dyn Adapter>],
+        sim.identity(),
         node_a,
     );
-    engine_a.tick_once().await;
+    peer_a.tick().await;
 
     // node B: empty blob store, joins A's namespace
-    let blob_root_b = base.join("b/blobs");
+    let blob_root_b = sim.base.join("b/blobs");
     std::fs::create_dir_all(&blob_root_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = Engine::new(
-        BlobStoreAdapter::new("omp-blobs", &blob_root_b),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+    let mut peer_b = sim.peer(
+        "b",
+        vec![Box::new(BlobStoreAdapter::new("omp-blobs", &blob_root_b)) as Box<dyn Adapter>],
+        sim.identity(),
         node_b,
     );
 
     // both blob files must land on B, byte-identical
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if std::fs::read(blob_root_b.join(hash)).is_ok_and(|got| got == contents)
-            && std::fs::read(blob_root_b.join(format!("{hash}.png")))
-                .is_ok_and(|got| got == contents)
-        {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest1 = blob_root_b.join(hash);
+    let dest2 = blob_root_b.join(format!("{hash}.png"));
+    let ok = converge(&mut [&mut peer_b], || {
+        file_eq(&dest1, contents) && file_eq(&dest2, contents)
+    })
+    .await;
     assert!(ok, "blob files did not sync to node B within timeout");
 }
 
 #[tokio::test]
 async fn missed_content_download_is_fetched_on_write() {
-    let base = scratch("fetch");
+    let sim = Sim::new("fetch");
     let ns_secret = ssync_net::generate_key_bytes();
-    let age = AgeIdentity::generate().unwrap().to_secret_string();
 
-    let root_a = base.join("a/sessions");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019efeeed0001eee71acbe20fetch0001.jsonl";
-    let src = root_a.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents = b"content the live engine failed to download\n";
-    std::fs::write(&src, contents).unwrap();
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_a = sim.node("a").await;
+    let mut node_b = sim.node("b").await;
     node_a.open_shared_namespace(ns_secret).await.unwrap();
     node_b.open_shared_namespace(ns_secret).await.unwrap();
     // B syncs index entries but never auto-downloads content — the prod
@@ -709,53 +551,37 @@ async fn missed_content_download_is_fetched_on_write() {
     node_a.sync_with(vec![addr_b]).await.unwrap();
     node_b.sync_with(vec![addr_a]).await.unwrap();
 
-    let mut engine_a = pi_engine(&root_a, &age, node_a);
-    engine_a.tick_once().await;
-    let mut engine_b = pi_engine(&root_b, &age, node_b);
+    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    peer_a.write(rel, contents);
+    peer_a.tick().await;
+    let mut peer_b = sim.pi_peer("b", "pi", node_b);
 
     // the file can only materialize via the explicit peer fetch
-    let dest = root_b.join(rel);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if let Ok(got) = std::fs::read(&dest)
-            && got == contents
-        {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest = peer_b.path(rel);
+    let ok = converge(&mut [&mut peer_b], || file_eq(&dest, contents)).await;
     assert!(ok, "missed content was never fetched from the peer");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_recovers_when_peer_comes_up_late() {
-    let base = scratch("resync");
+    let sim = Sim::new("resync");
     let ns_secret = ssync_net::generate_key_bytes();
-    let age = AgeIdentity::generate().unwrap().to_secret_string();
 
-    let root_a = base.join("a/sessions");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019eresync001eee71acbe20resync001.jsonl";
-    let src = root_a.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents = b"written while the peer was unavailable\n";
-    std::fs::write(&src, contents).unwrap();
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_a = sim.node("a").await;
+    let mut node_b = sim.node("b").await;
     node_a.open_shared_namespace(ns_secret).await.unwrap();
     let addr_b = node_b.endpoint_addr();
     // B's namespace is not open yet: A's startup sync goes nowhere, like
     // dialing a peer that is down. B never learns about A on its own.
     node_a.sync_with(vec![addr_b]).await.unwrap();
 
-    let mut engine_a = pi_engine(&root_a, &age, node_a);
-    engine_a.set_resync_interval(Duration::from_secs(2));
-    let sa = base.join("a/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
+    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    peer_a.write(rel, contents);
+    peer_a.engine.set_resync_interval(Duration::from_secs(2));
+    peer_a.run();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // B comes up late, like a restarted peer: it opens the namespace and
@@ -768,12 +594,11 @@ async fn sync_recovers_when_peer_comes_up_late() {
         .sync_with(vec![ssync_net::iroh::EndpointAddr::from(bogus)])
         .await
         .unwrap();
-    let mut engine_b = pi_engine(&root_b, &age, node_b);
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let root_b = peer_b.run();
 
     let dest = root_b.join(rel);
-    let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;
+    let ok = eventually(|| file_eq(&dest, contents)).await;
     assert!(
         ok,
         "session never reached the late peer (no periodic re-sync)"
@@ -785,20 +610,13 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     // The ticket issuer starts with an empty peer list (`join` only records
     // peers on the joining side), so a missed content download on the issuer
     // is unrecoverable unless it learns the joiner from live sync events.
-    let base = scratch("learn-peer");
-    let age = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("learn-peer");
 
-    let root_a = base.join("a/sessions");
-    std::fs::create_dir_all(&root_a).unwrap();
-    let root_b = base.join("b/sessions");
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019efeeed0001eee71acbe20learn0001.jsonl";
-    let src = root_b.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
     let contents = b"content the issuer failed to auto-download\n";
-    std::fs::write(&src, contents).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_a = sim.node("a").await;
+    let mut node_b = sim.node("b").await;
     node_a.create_namespace().await.unwrap();
     // The issuer misses every live content download — the prod failure mode
     // (iroh-docs never retries), made deterministic.
@@ -806,9 +624,9 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     let ticket = node_a.share().await.unwrap();
     node_b.join(ticket).await.unwrap();
 
-    let mut engine_b = pi_engine(&root_b, &age, node_b);
-    let sb = base.join("b/status.toml");
-    tokio::spawn(async move { engine_b.run(&sb).await });
+    let peer_b = sim.pi_peer("b", "pi", node_b);
+    peer_b.write(rel, contents);
+    peer_b.run();
 
     // Deterministic ordering: wait until the joiner's entry reached the
     // issuer's index *before* the issuer's engine (and thus its event
@@ -824,12 +642,11 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     }
     assert!(synced, "joiner's entry never reached the issuer's index");
 
-    let mut engine_a = pi_engine(&root_a, &age, node_a);
-    let sa = base.join("a/status.toml");
-    tokio::spawn(async move { engine_a.run(&sa).await });
+    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let root_a = peer_a.run();
 
     let dest = root_a.join(rel);
-    let ok = eventually(|| std::fs::read(&dest).is_ok_and(|got| got == contents)).await;
+    let ok = eventually(|| file_eq(&dest, contents)).await;
     assert!(ok, "issuer never learned the joiner as a fetch peer");
 }
 
@@ -838,8 +655,7 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
 /// there when a peer publishes it. Non-excluded traffic flows normally.
 #[tokio::test]
 async fn excluded_projects_neither_publish_nor_materialize() {
-    let base = scratch("exclude");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("exclude");
 
     let rel_normal =
         "--home-x-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
@@ -848,41 +664,31 @@ async fn excluded_projects_neither_publish_nor_materialize() {
     let contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"hi\"}\n".to_vec();
 
     // --- node A: excludes *client-x*, has one normal and one excluded session ---
-    let root_a = base.join("a/sessions");
-    for rel in [rel_normal, rel_secret] {
-        let p = root_a.join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, &contents).unwrap();
-    }
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = pi_engine(&root_a, &secret, node_a);
-    engine_a.set_excludes([("pi".to_string(), vec!["*client-x*".to_string()])].into());
-    engine_a.tick_once().await;
+    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    for rel in [rel_normal, rel_secret] {
+        peer_a.write(rel, &contents);
+    }
+    peer_a
+        .engine
+        .set_excludes([("pi".to_string(), vec!["*client-x*".to_string()])].into());
+    peer_a.tick().await;
 
     // --- node B: no excludes ---
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = pi_engine(&root_b, &secret, node_b);
+    let mut peer_b = sim.pi_peer("b", "pi", node_b);
 
     // the normal session reaches B ...
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if std::fs::read(root_b.join(rel_normal)).is_ok_and(|g| g == contents) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest_normal = peer_b.path(rel_normal);
+    let ok = converge(&mut [&mut peer_b], || file_eq(&dest_normal, &contents)).await;
     assert!(ok, "non-excluded session did not sync to B");
     // ... and the excluded one was never published (sync is live, so its
     // absence on B proves A withheld it).
     assert!(
-        !root_b.join(rel_secret).exists(),
+        !peer_b.path(rel_secret).exists(),
         "excluded session leaked to B"
     );
 
@@ -892,30 +698,21 @@ async fn excluded_projects_neither_publish_nor_materialize() {
     let rel_normal_b =
         "--home-x-other--/2026-05-23T08-05-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4d.jsonl";
     for rel in [rel_secret_b, rel_normal_b] {
-        let p = root_b.join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, &contents).unwrap();
+        peer_b.write(rel, &contents);
     }
-    engine_b.tick_once().await;
+    peer_b.tick().await;
 
     // when B's normal session lands on A, sync has round-tripped; the
     // excluded key must not have materialized on A.
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_a.tick_once().await;
-        if std::fs::read(root_a.join(rel_normal_b)).is_ok_and(|g| g == contents) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let dest_normal_b = peer_a.path(rel_normal_b);
+    let ok = converge(&mut [&mut peer_a], || file_eq(&dest_normal_b, &contents)).await;
     assert!(ok, "B's non-excluded session did not sync to A");
     assert!(
-        !root_a.join(rel_secret_b).exists(),
+        !peer_a.path(rel_secret_b).exists(),
         "A materialized a session from an excluded project"
     );
     // B keeps its own excluded file untouched (freeze, not delete)
-    assert!(root_b.join(rel_secret_b).exists());
+    assert!(peer_b.path(rel_secret_b).exists());
 }
 
 /// Removing an agent's `[[agents]]` entry must FREEZE its sessions, not
@@ -924,8 +721,7 @@ async fn excluded_projects_neither_publish_nor_materialize() {
 /// guard propagates deletion to every peer.
 #[tokio::test]
 async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
-    let base = scratch("agent-drop");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("agent-drop");
     let two_adapters = |root_pi: &Path, root_omp: &Path| -> Vec<Box<dyn Adapter>> {
         vec![
             Box::new(PiAdapter::new("pi", root_pi)),
@@ -937,90 +733,72 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
     let contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"omp\"}\n".to_vec();
 
     // --- node A: pi + omp configured, one omp session, persisted state ---
-    let (root_pi_a, root_omp_a) = (base.join("a/pi"), base.join("a/omp"));
+    let (root_pi_a, root_omp_a) = (sim.base.join("a/pi"), sim.base.join("a/omp"));
     let src = root_omp_a.join(rel);
-    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-    std::fs::write(&src, &contents).unwrap();
+    write_file(&src, &contents);
 
     let key_a = SecretKey::generate();
-    let mut node_a = Node::spawn(&base.join("a/data"), key_a.clone())
-        .await
-        .unwrap();
+    let mut node_a = sim.node_with_key("a", key_a.clone()).await;
     let ns = node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = Engine::with_adapters(
+    let mut peer_a = sim.peer(
+        "a",
         two_adapters(&root_pi_a, &root_omp_a),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+        sim.identity(),
         node_a,
     );
-    let state_a = base.join("a/state.toml");
-    engine_a.persist_state(&state_a);
-    engine_a.tick_once().await;
+    peer_a.persist();
+    peer_a.tick().await;
 
     // --- node B: same two agents, receives the omp session ---
-    let (root_pi_b, root_omp_b) = (base.join("b/pi"), base.join("b/omp"));
+    let (root_pi_b, root_omp_b) = (sim.base.join("b/pi"), sim.base.join("b/omp"));
     std::fs::create_dir_all(&root_pi_b).unwrap();
     std::fs::create_dir_all(&root_omp_b).unwrap();
-    let mut node_b = Node::spawn(&base.join("b/data"), SecretKey::generate())
-        .await
-        .unwrap();
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
     let b_addr = node_b.endpoint_addr();
-    let mut engine_b = Engine::with_adapters(
+    let mut peer_b = sim.peer(
+        "b",
         two_adapters(&root_pi_b, &root_omp_b),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+        sim.identity(),
         node_b,
     );
     let dest = root_omp_b.join(rel);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if std::fs::read(&dest).is_ok_and(|g| g == contents) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let ok = converge(&mut [&mut peer_b], || file_eq(&dest, &contents)).await;
     assert!(ok, "omp session did not sync to B");
 
     // --- restart A with omp dropped from the config ---
-    engine_a.shutdown().await.unwrap();
-    let mut node_a2 = Node::spawn(&base.join("a/data"), key_a).await.unwrap();
+    peer_a.shutdown().await.unwrap();
+    let mut node_a2 = sim.node_with_key("a", key_a).await;
     node_a2.open_namespace(ns).await.unwrap();
     node_a2.sync_with(vec![b_addr]).await.unwrap();
-    let mut engine_a2 = Engine::with_adapters(
-        vec![Box::new(PiAdapter::new("pi", &root_pi_a))],
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+    let mut peer_a2 = sim.peer(
+        "a",
+        vec![Box::new(PiAdapter::new("pi", &root_pi_a)) as Box<dyn Adapter>],
+        sim.identity(),
         node_a2,
     );
-    engine_a2.persist_state(&state_a);
-    engine_a2.tick_once().await;
+    peer_a2.persist();
+    peer_a2.tick().await;
 
     // sentinel: a new pi session on A round-trips to B, proving sync is live
     let rel_pi =
         "--home-x-demo--/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
-    let p = root_pi_a.join(rel_pi);
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(&p, &contents).unwrap();
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_a2.tick_once().await;
-        engine_b.tick_once().await;
-        if std::fs::read(root_pi_b.join(rel_pi)).is_ok_and(|g| g == contents) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    write_file(&root_pi_a.join(rel_pi), &contents);
+    let dest_pi_b = root_pi_b.join(rel_pi);
+    let ok = converge(&mut [&mut peer_a2, &mut peer_b], || {
+        file_eq(&dest_pi_b, &contents)
+    })
+    .await;
     assert!(ok, "pi sentinel did not sync after restart");
 
     // the dropped agent's session survives on B (frozen, not tombstoned) ...
     assert!(
-        std::fs::read(&dest).is_ok_and(|g| g == contents),
+        file_eq(&dest, &contents),
         "B lost the omp session after A dropped the agent"
     );
     // ... and A's own copy on disk is untouched
-    assert!(std::fs::read(&src).is_ok_and(|g| g == contents));
+    assert!(file_eq(&src, &contents));
 }
 
 /// Issue #13 (map #42): a machine with a `[[path_map]]` converges with an
@@ -1028,37 +806,28 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
 /// hard case, omp's home-relative wire keys derived via `canonical_home`.
 #[tokio::test]
 async fn path_mapped_machines_converge() {
-    let base = scratch("pathmap");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("pathmap");
     let canonical_home = "/canon-home";
     let canonical_cwd = "/canon-home/Projects/x";
 
     // --- node A: unmapped, hosts the project at the canonical path. Its
     // on-disk form IS the wire form: home-relative dir + canonical header.
-    let root_a = base.join("a/sessions");
     let rel_a = "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
-    let src_a = root_a.join(rel_a);
-    std::fs::create_dir_all(src_a.parent().unwrap()).unwrap();
     let canonical_bytes = format!(
         "{{\"type\":\"title\",\"v\":1,\"title\":\"t\"}}\n{{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4a\",\"cwd\":\"{canonical_cwd}\"}}\n{{\"msg\":\"from A\"}}\n"
     );
-    std::fs::write(&src_a, &canonical_bytes).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = Engine::new(
-        PiAdapter::new("omp", &root_a),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
-        node_a,
-    );
-    engine_a.tick_once().await;
+    let mut peer_a = sim.pi_peer("a", "omp", node_a);
+    peer_a.write(rel_a, &canonical_bytes);
+    peer_a.tick().await;
+    let src_a = peer_a.path(rel_a);
 
     // --- node B: hosts the project at a different absolute path, bridged by
     // the map. Its local dir uses B's real-home encoding (outside → legacy).
-    let root_b = base.join("b/sessions");
-    std::fs::create_dir_all(&root_b).unwrap();
-    let local_prefix = base.join("b/work");
+    let local_prefix = sim.base.join("b/work");
     let local_cwd = local_prefix.join("x");
     std::fs::create_dir_all(&local_cwd).unwrap();
     let map = ssync_core::PathMap::new(vec![(
@@ -1067,14 +836,11 @@ async fn path_mapped_machines_converge() {
     )])
     .unwrap();
 
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = Engine::new(
-        PiAdapter::new("omp", &root_b),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
-        node_b,
-    );
-    engine_b.set_path_map(map, Some(canonical_home.into()));
+    let mut peer_b = sim.pi_peer("b", "omp", node_b);
+    peer_b.engine.set_path_map(map, Some(canonical_home.into()));
+    let root_b = peer_b.root.clone();
 
     // A's session materializes on B under B's LOCAL encoding, header rewritten
     // intentional mirror of PiAdapter's legacy `--abs--` encoding (pi.rs
@@ -1092,7 +858,7 @@ async fn path_mapped_machines_converge() {
         .join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl");
     let mut ok = false;
     for _ in 0..60 {
-        engine_b.tick_once().await;
+        peer_b.tick().await;
         if let Ok(got) = std::fs::read_to_string(&dest_b) {
             assert!(
                 got.contains(&format!("\"cwd\":\"{}\"", local_cwd.display())),
@@ -1111,13 +877,13 @@ async fn path_mapped_machines_converge() {
     let mut appended = std::fs::read_to_string(&dest_b).unwrap();
     appended.push_str("{\"msg\":\"from B\"}\n");
     std::fs::write(&dest_b, &appended).unwrap();
-    engine_b.tick_once().await;
+    peer_b.tick().await;
 
     let expect_a = format!("{canonical_bytes}{{\"msg\":\"from B\"}}\n");
     let mut ok = false;
     for _ in 0..60 {
-        engine_a.tick_once().await;
-        engine_b.tick_once().await;
+        peer_a.tick().await;
+        peer_b.tick().await;
         if std::fs::read_to_string(&src_a).is_ok_and(|g| g == expect_a) {
             ok = true;
             break;
@@ -1128,7 +894,12 @@ async fn path_mapped_machines_converge() {
 
     // wire hygiene: every index key uses the canonical (home-relative) form;
     // B's machine-local path never leaks into the key space.
-    for rec in engine_a.index_keys().await.expect("index keys readable") {
+    for rec in peer_a
+        .engine
+        .index_keys()
+        .await
+        .expect("index keys readable")
+    {
         assert!(
             rec.starts_with("omp/-Projects-x/"),
             "non-canonical key on the wire: {rec}"
@@ -1140,19 +911,17 @@ async fn path_mapped_machines_converge() {
     // LOCAL project dir via the learned dir translation, bytes untouched.
     let art_rel =
         "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/__advisor.jsonl";
-    let art_a = root_a.join(art_rel);
-    std::fs::create_dir_all(art_a.parent().unwrap()).unwrap();
     let art_bytes = b"{\"type\":\"advisor\",\"note\":\"no session header here\"}\n";
-    std::fs::write(&art_a, art_bytes).unwrap();
-    engine_a.tick_once().await;
+    peer_a.write(art_rel, art_bytes);
+    peer_a.tick().await;
 
     let art_b = root_b
         .join(&local_component)
         .join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/__advisor.jsonl");
     let mut ok = false;
     for _ in 0..60 {
-        engine_a.tick_once().await;
-        engine_b.tick_once().await;
+        peer_a.tick().await;
+        peer_b.tick().await;
         if std::fs::read(&art_b).is_ok_and(|g| g == art_bytes) {
             ok = true;
             break;
@@ -1167,8 +936,7 @@ async fn path_mapped_machines_converge() {
 /// is active for another agent.
 #[tokio::test]
 async fn path_map_leaves_cwdless_adapters_alone() {
-    let base = scratch("pathmap-blobs");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("pathmap-blobs");
     let adapters = |root_pi: &Path, root_blobs: &Path| -> Vec<Box<dyn Adapter>> {
         vec![
             Box::new(PiAdapter::new("pi", root_pi)),
@@ -1177,68 +945,53 @@ async fn path_map_leaves_cwdless_adapters_alone() {
     };
 
     // --- node A: unmapped, one blob ---
-    let (root_pi_a, root_blobs_a) = (base.join("a/pi"), base.join("a/blobs"));
+    let (root_pi_a, root_blobs_a) = (sim.base.join("a/pi"), sim.base.join("a/blobs"));
     std::fs::create_dir_all(&root_blobs_a).unwrap();
     std::fs::create_dir_all(&root_pi_a).unwrap();
     let blob = b"opaque-blob-bytes".to_vec();
     let hash_a = "a".repeat(64);
     std::fs::write(root_blobs_a.join(&hash_a), &blob).unwrap();
 
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut engine_a = Engine::with_adapters(
+    let mut peer_a = sim.peer(
+        "a",
         adapters(&root_pi_a, &root_blobs_a),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+        sim.identity(),
         node_a,
     );
-    engine_a.tick_once().await;
+    peer_a.tick().await;
 
     // --- node B: pi is path-mapped; blobs must be untouched by that ---
-    let (root_pi_b, root_blobs_b) = (base.join("b/pi"), base.join("b/blobs"));
+    let (root_pi_b, root_blobs_b) = (sim.base.join("b/pi"), sim.base.join("b/blobs"));
     std::fs::create_dir_all(&root_pi_b).unwrap();
     std::fs::create_dir_all(&root_blobs_b).unwrap();
-    let mut node_b = spawn_node(&base.join("b/data")).await;
+    let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut engine_b = Engine::with_adapters(
+    let mut peer_b = sim.peer(
+        "b",
         adapters(&root_pi_b, &root_blobs_b),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
+        sim.identity(),
         node_b,
     );
-    engine_b.set_path_map(
+    peer_b.engine.set_path_map(
         ssync_core::PathMap::new(vec![("/srv/elsewhere".into(), "/canon/x".into())]).unwrap(),
         None,
     );
 
     // inbound: A's blob materializes on B despite the active map
     let dest = root_blobs_b.join(&hash_a);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_b.tick_once().await;
-        if std::fs::read(&dest).is_ok_and(|g| g == blob) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let ok = converge(&mut [&mut peer_b], || file_eq(&dest, &blob)).await;
     assert!(ok, "blob did not materialize on the mapped machine");
 
     // outbound: B's new blob reaches A
     let blob2 = b"blob-from-b".to_vec();
     let hash_b = "b".repeat(64);
     std::fs::write(root_blobs_b.join(&hash_b), &blob2).unwrap();
-    engine_b.tick_once().await;
+    peer_b.tick().await;
     let dest_a = root_blobs_a.join(&hash_b);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_a.tick_once().await;
-        engine_b.tick_once().await;
-        if std::fs::read(&dest_a).is_ok_and(|g| g == blob2) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let ok = converge(&mut [&mut peer_a, &mut peer_b], || file_eq(&dest_a, &blob2)).await;
     assert!(ok, "mapped machine did not publish its blob");
 }
 
@@ -1249,101 +1002,62 @@ async fn path_map_leaves_cwdless_adapters_alone() {
 /// canonical_home) — peers must keep their copies.
 #[tokio::test]
 async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
-    let base = scratch("pathmap-freeze");
-    let secret = AgeIdentity::generate().unwrap().to_secret_string();
+    let sim = Sim::new("pathmap-freeze");
 
     let rel = "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
     // header cwd points INSIDE the prefix B will later map
     let bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4a\",\"cwd\":\"/data/Projects/x\"}\n{\"m\":\"1\"}\n".to_vec();
 
     // --- node B first: it owns the session and will get the bad map ---
-    let root_b = base.join("b/sessions");
-    let src_b = root_b.join(rel);
-    std::fs::create_dir_all(src_b.parent().unwrap()).unwrap();
-    std::fs::write(&src_b, &bytes).unwrap();
-
     let key_b = SecretKey::generate();
-    let mut node_b = Node::spawn(&base.join("b/data"), key_b.clone())
-        .await
-        .unwrap();
+    let mut node_b = sim.node_with_key("b", key_b.clone()).await;
     let ns = node_b.create_namespace().await.unwrap();
     let ticket = node_b.share().await.unwrap();
-    let mut engine_b = Engine::new(
-        PiAdapter::new("omp", &root_b),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
-        node_b,
-    );
-    let state_b = base.join("b/state.toml");
-    engine_b.persist_state(&state_b);
-    engine_b.tick_once().await;
+    let mut peer_b = sim.pi_peer("b", "omp", node_b);
+    peer_b.write(rel, &bytes);
+    let src_b = peer_b.path(rel);
+    peer_b.persist();
+    peer_b.tick().await;
 
     // --- node A receives it ---
-    let root_a = base.join("a/sessions");
-    std::fs::create_dir_all(&root_a).unwrap();
-    let mut node_a = spawn_node(&base.join("a/data")).await;
+    let mut node_a = sim.node("a").await;
     node_a.join(ticket).await.unwrap();
     let a_addr = node_a.endpoint_addr();
-    let mut engine_a = Engine::new(
-        PiAdapter::new("omp", &root_a),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
-        node_a,
-    );
-    let dest_a = root_a.join(rel);
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_a.tick_once().await;
-        if std::fs::read(&dest_a).is_ok_and(|g| g == bytes) {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let mut peer_a = sim.pi_peer("a", "omp", node_a);
+    let dest_a = peer_a.path(rel);
+    let ok = converge(&mut [&mut peer_a], || file_eq(&dest_a, &bytes)).await;
     assert!(ok, "session did not sync to A");
 
     // --- restart B with a map that swallows the project's cwd but cannot
     // resolve it: omp home-relative canonical without canonical_home ---
-    engine_b.shutdown().await.unwrap();
-    let mut node_b2 = Node::spawn(&base.join("b/data"), key_b).await.unwrap();
+    peer_b.shutdown().await.unwrap();
+    let mut node_b2 = sim.node_with_key("b", key_b).await;
     node_b2.open_namespace(ns).await.unwrap();
     node_b2.sync_with(vec![a_addr]).await.unwrap();
-    let mut engine_b2 = Engine::new(
-        PiAdapter::new("omp", &root_b),
-        AgeIdentity::from_secret_string(&secret).unwrap(),
-        node_b2,
-    );
-    engine_b2.set_path_map(
+    let mut peer_b2 = sim.pi_peer("b", "omp", node_b2);
+    peer_b2.engine.set_path_map(
         ssync_core::PathMap::new(vec![("/data".into(), "/other-canon".into())]).unwrap(),
         None, // omp cannot encode home-relative canonicals without this
     );
-    engine_b2.persist_state(&state_b);
+    peer_b2.persist();
 
     // several passes; then prove sync is otherwise live via A-side traffic
     for _ in 0..6 {
-        engine_b2.tick_once().await;
-        engine_a.tick_once().await;
+        peer_b2.tick().await;
+        peer_a.tick().await;
     }
     let rel2 = "-Projects-y/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
-    let p = root_a.join(rel2);
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     // sentinel cwd OUTSIDE B's mapped prefix: pass-through on both sides
     let sentinel = b"{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4b\",\"cwd\":\"/elsewhere/y\"}\n".to_vec();
-    std::fs::write(&p, &sentinel).unwrap();
-    let mut ok = false;
-    for _ in 0..60 {
-        engine_a.tick_once().await;
-        engine_b2.tick_once().await;
-        if root_b.join(rel2).exists() {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    peer_a.write(rel2, &sentinel);
+    let dest_b_rel2 = peer_b2.path(rel2);
+    let ok = converge(&mut [&mut peer_a, &mut peer_b2], || dest_b_rel2.exists()).await;
     assert!(ok, "sentinel did not sync after restart");
 
     // the frozen session survives everywhere
     assert!(
-        std::fs::read(&dest_a).is_ok_and(|g| g == bytes),
+        file_eq(&dest_a, &bytes),
         "A lost the session to a tombstone from B's unresolvable map"
     );
-    assert!(std::fs::read(&src_b).is_ok_and(|g| g == bytes));
+    assert!(file_eq(&src_b, &bytes));
 }
