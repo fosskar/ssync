@@ -30,6 +30,26 @@ pub struct PathMapEntry {
     pub canonical: PathBuf,
 }
 
+/// How the node finds and reaches peers beyond the local network
+/// (DECISIONS §6, issue #11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Discovery {
+    /// n0 public infrastructure: DNS/pkarr node lookup plus the public
+    /// relays (or the `relay` override). mDNS on the LAN as always.
+    #[default]
+    Default,
+    /// Never leave the local network: no relays, no DNS/pkarr — peers are
+    /// found by mDNS alone. Pair with the cluster artifact (node-id-only).
+    LanOnly,
+}
+
+impl Discovery {
+    fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
 /// On-disk daemon configuration (`$XDG_CONFIG_HOME/ssync/config.toml`).
 /// Unknown keys are hard errors so removed fields (pre-0.14
 /// `namespace_secret_path`/`peers`) and typos fail loudly instead of
@@ -69,6 +89,14 @@ pub struct Config {
     /// set the same URL. Absent = n0 defaults (DECISIONS §6).
     #[serde(default)]
     pub relay: Option<String>,
+    /// Peer reach beyond the LAN; `lan-only` disables all n0 infrastructure.
+    #[serde(default, skip_serializing_if = "Discovery::is_default")]
+    pub discovery: Discovery,
+    /// How often the daemon re-initiates sync with its known peers, in
+    /// seconds (default 60). Lower = faster recovery after a peer restart,
+    /// at the cost of more idle chatter.
+    #[serde(default)]
+    pub resync_interval_secs: Option<u64>,
 }
 
 impl Config {
@@ -126,6 +154,8 @@ impl Config {
             path_map: Vec::new(),
             canonical_home: None,
             relay: None,
+            discovery: Discovery::Default,
+            resync_interval_secs: None,
         })
     }
 
@@ -176,6 +206,14 @@ impl Config {
             && r.parse::<ssync_net::iroh::RelayUrl>().is_err()
         {
             return Err(anyhow!("relay {r:?} is not a valid relay url"));
+        }
+        if cfg.discovery == Discovery::LanOnly && cfg.relay.is_some() {
+            return Err(anyhow!(
+                "discovery = \"lan-only\" never uses a relay — remove the relay key"
+            ));
+        }
+        if cfg.resync_interval_secs == Some(0) {
+            return Err(anyhow!("resync_interval_secs must be at least 1"));
         }
         cfg.build_path_map()?; // fail loudly at parse, not daemon-time (#46)
         // omp's wire encoding is home-relative; without the home context
@@ -364,6 +402,83 @@ mod tests {
     }
 
     #[test]
+    fn discovery_parses_lan_only_and_defaults_to_n0() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            discovery = "lan-only"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        assert_eq!(cfg.discovery, Discovery::LanOnly);
+        let cfg = Config::parse(&toml_str.replace("discovery = \"lan-only\"\n", "")).unwrap();
+        assert_eq!(cfg.discovery, Discovery::Default);
+        // unknown variants fail loudly like unknown keys
+        assert!(Config::parse(&toml_str.replace("lan-only", "lan_only")).is_err());
+    }
+
+    #[test]
+    fn lan_only_discovery_excludes_a_relay() {
+        // lan-only means "never leave the local network"; a relay URL under
+        // it would silently never be used.
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            discovery = "lan-only"
+            relay = "https://relay.example.com"
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let err = Config::parse(toml_str).unwrap_err().to_string();
+        assert!(err.contains("lan-only"), "{err}");
+    }
+
+    #[test]
+    fn resync_interval_parses_and_rejects_zero() {
+        let toml_str = r#"
+            age_identity_path = "/k"
+            data_dir = "/d"
+            resync_interval_secs = 15
+            [[agents]]
+            agent = "pi"
+            session_dir = "/s"
+        "#;
+        let cfg = Config::parse(toml_str).unwrap();
+        assert_eq!(cfg.resync_interval_secs, Some(15));
+        let cfg = Config::parse(&toml_str.replace("resync_interval_secs = 15\n", "")).unwrap();
+        assert_eq!(cfg.resync_interval_secs, None);
+        let err = Config::parse(&toml_str.replace("= 15", "= 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resync_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn saved_defaults_omit_unset_knobs() {
+        // `ssync init` writes defaults(); the generated file must not pin
+        // discovery/resync values the user never chose.
+        let text = toml::to_string_pretty(&Config {
+            agents: vec![],
+            age_identity_path: "/k".into(),
+            data_dir: "/d".into(),
+            cluster_path: None,
+            node_key_path: None,
+            recipients: vec![],
+            path_map: vec![],
+            canonical_home: None,
+            relay: None,
+            discovery: Discovery::Default,
+            resync_interval_secs: None,
+        })
+        .unwrap();
+        assert!(!text.contains("discovery"), "{text}");
+        assert!(!text.contains("resync_interval_secs"), "{text}");
+    }
+
+    #[test]
     fn config_round_trips_nix_module_fields() {
         // mirrors the daemon config the nix modules render, including the
         // cluster artifact path.
@@ -372,6 +487,8 @@ mod tests {
             data_dir = "/var/lib/ssync"
             cluster_path = "/run/secrets/cluster/cluster.toml"
             node_key_path = "/run/secrets/node/key"
+            discovery = "lan-only"
+            resync_interval_secs = 15
 
             [[agents]]
             agent = "pi"
@@ -392,10 +509,14 @@ mod tests {
             cfg.node_key_path.as_deref(),
             Some(Path::new("/run/secrets/node/key"))
         );
+        assert_eq!(cfg.discovery, Discovery::LanOnly);
+        assert_eq!(cfg.resync_interval_secs, Some(15));
         // render back out and reparse: the fields survive a full round-trip.
         let rendered = toml::to_string(&cfg).unwrap();
         let cfg2: Config = toml::from_str(&rendered).unwrap();
         assert_eq!(cfg.cluster_path, cfg2.cluster_path);
+        assert_eq!(cfg.discovery, cfg2.discovery);
+        assert_eq!(cfg.resync_interval_secs, cfg2.resync_interval_secs);
         assert_eq!(cfg.agents.len(), cfg2.agents.len());
     }
 

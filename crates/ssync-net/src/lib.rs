@@ -160,10 +160,19 @@ pub struct Node {
 /// is swept. Content-addressed, so nothing referenced is ever lost.
 const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How the endpoint reaches beyond the LAN (config `discovery` + `relay`,
+/// DECISIONS §6): n0 public infra, n0 with a self-hosted relay (#19), or
+/// nothing at all (#11 — mDNS only, added separately by the daemon).
+enum Reach {
+    N0,
+    Relay(RelayUrl),
+    LanOnly,
+}
+
 impl Node {
     /// No index namespace is active until one is created, opened or joined.
     pub async fn spawn(data_dir: &Path, secret_key: SecretKey) -> Result<Self> {
-        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, None).await
+        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, Reach::N0).await
     }
 
     /// [`spawn`](Self::spawn) with a self-hosted relay replacing the n0
@@ -176,7 +185,16 @@ impl Node {
         secret_key: SecretKey,
         relay: RelayUrl,
     ) -> Result<Self> {
-        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, Some(relay)).await
+        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, Reach::Relay(relay)).await
+    }
+
+    /// [`spawn`](Self::spawn) but never leaving the local network (config
+    /// `discovery = "lan-only"`): no relays, no DNS/pkarr lookup or
+    /// publishing — n0's infrastructure is never contacted. Peers are
+    /// reachable only via [`enable_mdns`](Self::enable_mdns) or explicit
+    /// direct addresses.
+    pub async fn spawn_lan_only(data_dir: &Path, secret_key: SecretKey) -> Result<Self> {
+        Self::spawn_inner(data_dir, secret_key, GC_INTERVAL, Reach::LanOnly).await
     }
 
     /// Register mDNS address lookup: LAN peers become dialable by node-id
@@ -205,23 +223,29 @@ impl Node {
         secret_key: SecretKey,
         gc_interval: std::time::Duration,
     ) -> Result<Self> {
-        Self::spawn_inner(data_dir, secret_key, gc_interval, None).await
+        Self::spawn_inner(data_dir, secret_key, gc_interval, Reach::N0).await
     }
 
     async fn spawn_inner(
         data_dir: &Path,
         secret_key: SecretKey,
         gc_interval: std::time::Duration,
-        relay: Option<RelayUrl>,
+        reach: Reach,
     ) -> Result<Self> {
         tokio::fs::create_dir_all(data_dir)
             .await
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
-        let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
-        if let Some(url) = relay {
-            builder = builder.relay_mode(RelayMode::custom([url]));
+        // Minimal = crypto provider only: RelayMode stays Disabled and no
+        // address lookup is registered — the LAN-only reach.
+        let builder = match reach {
+            Reach::LanOnly => Endpoint::builder(presets::Minimal),
+            Reach::N0 => Endpoint::builder(presets::N0),
+            Reach::Relay(url) => {
+                Endpoint::builder(presets::N0).relay_mode(RelayMode::custom([url]))
+            }
         }
+        .secret_key(secret_key);
         let endpoint = builder.bind().await.context("binding iroh endpoint")?;
 
         // GC: iroh-docs feeds the protect callback every hash referenced by a
@@ -696,6 +720,58 @@ mod tests {
             Some(hash)
         );
         node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lan_only_nodes_sync_over_direct_addresses() {
+        // lan-only = no relays, no DNS/pkarr; the whole reach is mDNS or
+        // explicit direct addresses. Two loopback nodes wired directly must
+        // still converge — proving the Minimal endpoint carries full sync.
+        let (da, db) = (tempdir("lan-a"), tempdir("lan-b"));
+        let mut a = Node::spawn_lan_only(&da, SecretKey::generate())
+            .await
+            .unwrap();
+        let mut b = Node::spawn_lan_only(&db, SecretKey::generate())
+            .await
+            .unwrap();
+        let secret = generate_key_bytes();
+        a.open_shared_namespace(secret).await.unwrap();
+        b.open_shared_namespace(secret).await.unwrap();
+        // without a relay fallback an addr is dialable only once the bound
+        // socket addresses show up; poll instead of assuming bind ordering.
+        let addr_of = |n: &Node| {
+            let addr = n.endpoint_addr();
+            (!addr.addrs.is_empty()).then_some(addr)
+        };
+        let (mut addr_a, mut addr_b) = (addr_of(&a), addr_of(&b));
+        for _ in 0..40 {
+            if addr_a.is_some() && addr_b.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            (addr_a, addr_b) = (addr_of(&a), addr_of(&b));
+        }
+        let addr_a = addr_a.expect("lan-only node a has no direct addrs");
+        let addr_b = addr_b.expect("lan-only node b has no direct addrs");
+        a.sync_with(vec![addr_b]).await.unwrap();
+        b.sync_with(vec![addr_a]).await.unwrap();
+
+        let hash = a.publish("pi/p/s", b"lan bytes".to_vec()).await.unwrap();
+        let mut synced = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if b.index_record("pi/p/s")
+                .await
+                .unwrap()
+                .is_some_and(|r| r.winner == Some(hash))
+            {
+                synced = true;
+                break;
+            }
+        }
+        assert!(synced, "lan-only nodes never converged over direct addrs");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -29,6 +29,12 @@ let
     + lib.optionalString (cfg.relay != null) ''
       relay = "${cfg.relay}"
     ''
+    + lib.optionalString (cfg.discovery != null) ''
+      discovery = "${cfg.discovery}"
+    ''
+    + lib.optionalString (cfg.resyncIntervalSecs != null) ''
+      resync_interval_secs = ${toString cfg.resyncIntervalSecs}
+    ''
     + lib.optionalString (cfg.canonicalHome != null) ''
       canonical_home = "${cfg.canonicalHome}"
     ''
@@ -245,6 +251,32 @@ in
         URL. Null = n0 public defaults.
       '';
     };
+
+    discovery = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.enum [
+          "default"
+          "lan-only"
+        ]
+      );
+      default = null;
+      example = "lan-only";
+      description = ''
+        Peer reach beyond the LAN. "lan-only" never contacts n0's relays or
+        DNS — peers are found by mDNS alone (pair via the cluster artifact).
+        Null = n0 public defaults.
+      '';
+    };
+
+    resyncIntervalSecs = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      example = 15;
+      description = ''
+        How often the daemon re-initiates sync with its known peers, in
+        seconds. Null = the daemon default (60).
+      '';
+    };
     recipients = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -299,6 +331,10 @@ in
       {
         assertion = cfg.clusterFile == null || cfg.recipients == [ ];
         message = "services.ssync.clusterFile replaces recipients — the artifact carries them";
+      }
+      {
+        assertion = cfg.discovery != "lan-only" || cfg.relay == null;
+        message = "services.ssync.discovery = \"lan-only\" never uses a relay — unset services.ssync.relay";
       }
     ];
 

@@ -24,7 +24,7 @@ mod pathmap;
 mod reconcile;
 pub mod search;
 mod status;
-pub use config::{AgentConfig, Config, insert_cluster_path};
+pub use config::{AgentConfig, Config, Discovery, insert_cluster_path};
 use divergence::{Divergence, Verdict};
 pub use pathmap::PathMap;
 use pathmap::Resolver;
@@ -125,7 +125,8 @@ impl Engine {
         self.state_path = Some(path.to_path_buf());
     }
 
-    /// Override the peer re-sync cadence (tests).
+    /// Override the peer re-sync cadence (config `resync_interval_secs`;
+    /// tests use short intervals).
     pub fn set_resync_interval(&mut self, interval: std::time::Duration) {
         self.resync_interval = interval;
     }
