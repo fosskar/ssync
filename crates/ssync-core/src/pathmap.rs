@@ -1,9 +1,16 @@
 //! Prefix map between this machine's local paths and the mesh-wide canonical
 //! form (issue #13, map #42): longest-prefix-match with component boundaries,
-//! both directions, round-trip-guarded. Pure — no IO, no config parsing; the
-//! engine consults it, `Config` validates and builds it.
+//! both directions, round-trip-guarded. [`PathMap`] is the pure core — no IO,
+//! no config parsing; `Config` validates and builds it. [`Resolver`] is the
+//! engine-side orchestration on top: the per-project-dir translation cache,
+//! header reads/rewrites through the adapter, and the per-pass agent freeze
+//! (#49). The engine consults the resolver; everything path-map lives here.
 
-use anyhow::{Result, bail, ensure};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use ssync_adapters::Adapter;
 
 /// Validated prefix pairs. Invariants from construction: absolute prefixes,
 /// no trailing slash, no `/`, no duplicate local or canonical prefixes.
@@ -96,6 +103,211 @@ impl PathMap {
             back.as_deref().unwrap_or("(pass-through)")
         );
         Ok(Some(local))
+    }
+}
+
+/// Wire↔local translation for the engine: caches how each project dir maps,
+/// learns translations from write-backs, and tracks agents whose mapping
+/// failed this pass so their tombstones are withheld (#49). With an empty
+/// map every method is a pass-through.
+#[derive(Debug, Default)]
+pub(crate) struct Resolver {
+    map: PathMap,
+    /// Home context for the wire side of home-relative encodings (omp).
+    canonical_home: Option<PathBuf>,
+    /// Per project dir: how its keys and bytes translate (`None` value =
+    /// pass-through). Dir↔cwd never changes, so entries never invalidate.
+    dir_map: HashMap<PathBuf, Option<String>>,
+    /// Dirs whose mapping failed, already logged (retry stays quiet).
+    logged: HashSet<PathBuf>,
+    /// Agents with an unresolvable mapping this pass (#49).
+    failed_agents: HashSet<String>,
+}
+
+impl Resolver {
+    pub fn new(map: PathMap, canonical_home: Option<PathBuf>) -> Self {
+        Self {
+            map,
+            canonical_home,
+            ..Self::default()
+        }
+    }
+
+    /// The wire form of a local file's session-root-relative path (issue
+    /// #13): the canonical first component when its project dir is mapped.
+    /// `Ok(None)` = pass-through (today's relative path IS the wire form).
+    /// `Err` = unresolvable this tick; the caller skips the file and a later
+    /// pass retries.
+    pub fn wire_rel(&mut self, adapter: &dyn Adapter, rel: &str) -> Result<Option<String>> {
+        // adapters without cwd semantics (omp-blobs, codex, claude-code)
+        // pass through untouched — their keys and bytes carry no paths the
+        // map could act on
+        if self.map.is_empty() || !adapter.maps_paths() {
+            return Ok(None);
+        }
+        let Some((first, rest)) = rel.split_once('/') else {
+            bail!("{rel}: expected <project>/<file>");
+        };
+        let project_dir = adapter.session_root().join(first);
+        Ok(self
+            .dir_mapping(adapter, &project_dir)?
+            .map(|component| format!("{component}/{rest}")))
+    }
+
+    /// How a project dir translates, resolved once from any main session
+    /// file's header and cached — a dir's cwd never changes. `Ok(None)` =
+    /// pass-through (unmapped). `Err` = header unreadable, round-trip guard
+    /// tripped, or encoding needs `canonical_home`: skip and retry.
+    fn dir_mapping(&mut self, adapter: &dyn Adapter, project_dir: &Path) -> Result<Option<String>> {
+        if let Some(cached) = self.dir_map.get(project_dir) {
+            return Ok(cached.clone());
+        }
+        let mut local_cwd = None;
+        for entry in std::fs::read_dir(project_dir)
+            .with_context(|| format!("reading {}", project_dir.display()))?
+        {
+            let p = entry?.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") || !p.is_file() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&p)
+                && let Some(cwd) = adapter.header_cwd(&bytes)
+            {
+                local_cwd = Some(cwd);
+                break;
+            }
+        }
+        let Some(local_cwd) = local_cwd else {
+            bail!(
+                "{}: no session header to resolve the project's cwd",
+                project_dir.display()
+            );
+        };
+        let mapping = match self.map.canonical_of(&local_cwd)? {
+            None => None,
+            Some(canonical_cwd) => Some(
+                adapter
+                    .encode_cwd(&canonical_cwd, self.canonical_home.as_deref())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cannot derive {}'s wire dir for {canonical_cwd}: set canonical_home",
+                            adapter.agent()
+                        )
+                    })?,
+            ),
+        };
+        self.dir_map
+            .insert(project_dir.to_path_buf(), mapping.clone());
+        Ok(mapping)
+    }
+
+    /// Local destination + on-disk bytes for a wire-relative path's
+    /// plaintext. With an empty map: today's literal dest, bytes untouched.
+    /// `Ok(None)` = not resolvable yet (artifact of a not-yet-materialized
+    /// project) — the caller returns false and a later tick retries.
+    pub fn localize(
+        &mut self,
+        adapter: &dyn Adapter,
+        rel: &str,
+        plaintext: Vec<u8>,
+    ) -> Result<Option<(PathBuf, Vec<u8>)>> {
+        let dest = adapter.session_root().join(rel);
+        if self.map.is_empty() || !adapter.maps_paths() {
+            return Ok(Some((dest, plaintext)));
+        }
+        let Some((first, rest)) = rel.split_once('/') else {
+            bail!("{rel}: expected <project>/<file>");
+        };
+        match adapter.header_cwd(&plaintext) {
+            Some(canonical_cwd) => match self.map.local_of(&canonical_cwd)? {
+                // pass-through: the canonical path IS the local path
+                None => Ok(Some((dest, plaintext))),
+                Some(local_cwd) => {
+                    let component = adapter
+                        .encode_cwd(&local_cwd, dirs::home_dir().as_deref())
+                        .ok_or_else(|| anyhow!("cannot derive local dir for {local_cwd}"))?;
+                    let bytes = adapter
+                        .rewrite_header_cwd(&plaintext, &local_cwd)
+                        .ok_or_else(|| anyhow!("cannot rewrite header for {rel}"))?;
+                    let local_dir = adapter.session_root().join(&component);
+                    let local_dest = local_dir.join(rest);
+                    // remember the translation for header-less siblings
+                    // (artifact records) and DeleteLocal
+                    self.dir_map.insert(local_dir, Some(first.to_string()));
+                    Ok(Some((local_dest, bytes)))
+                }
+            },
+            // header-less bytes (artifact records): dir-level translation
+            None => Ok(self
+                .local_project_dir(adapter.session_root(), first)
+                .map(|dir| (dir.join(rest), plaintext))),
+        }
+    }
+
+    /// [`localize`](Self::localize) for actions without plaintext in hand
+    /// (DeleteLocal). `None` = nothing local to touch.
+    pub fn local_dest(&self, adapter: &dyn Adapter, rel: &str) -> Option<PathBuf> {
+        let dest = adapter.session_root().join(rel);
+        if self.map.is_empty() || !adapter.maps_paths() {
+            return Some(dest);
+        }
+        let (first, rest) = rel.split_once('/')?;
+        Some(
+            self.local_project_dir(adapter.session_root(), first)?
+                .join(rest),
+        )
+    }
+
+    /// The local project dir a canonical wire component maps to, from the
+    /// learned/scanned translations (pass-through dirs match by name).
+    fn local_project_dir(&self, root: &Path, canonical_component: &str) -> Option<PathBuf> {
+        self.dir_map.iter().find_map(|(dir, m)| {
+            if !dir.starts_with(root) {
+                return None;
+            }
+            match m {
+                Some(c) if c == canonical_component => Some(dir.clone()),
+                None if dir.file_name().and_then(|n| n.to_str()) == Some(canonical_component) => {
+                    Some(dir.clone())
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// The wire form of a local file's bytes: header cwd mapped to canonical
+    /// (issue #13). A machine-local path must never reach the index — an
+    /// unmappable header is a per-key error, not a pass-through (#49).
+    pub fn canonical_plaintext(&self, adapter: &dyn Adapter, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        if self.map.is_empty() {
+            return Ok(bytes);
+        }
+        let Some(local_cwd) = adapter.header_cwd(&bytes) else {
+            return Ok(bytes); // header-less artifact records pass through
+        };
+        match self.map.canonical_of(&local_cwd)? {
+            Some(canonical) => adapter
+                .rewrite_header_cwd(&bytes, &canonical)
+                .ok_or_else(|| anyhow!("cannot rewrite session header (cwd {canonical})")),
+            None => Ok(bytes),
+        }
+    }
+
+    /// Start a snapshot pass: last pass's failures no longer freeze agents.
+    pub fn begin_pass(&mut self) {
+        self.failed_agents.clear();
+    }
+
+    /// Record a mapping failure: freezes `agent`'s tombstones this pass
+    /// (#49). Returns whether `dir`'s failure is newly seen — log it once.
+    pub fn note_failure(&mut self, agent: &str, dir: PathBuf) -> bool {
+        self.failed_agents.insert(agent.to_string());
+        self.logged.insert(dir)
+    }
+
+    /// Whether `agent` had an unresolvable mapping this pass.
+    pub fn agent_failed(&self, agent: &str) -> bool {
+        self.failed_agents.contains(agent)
     }
 }
 
@@ -238,5 +450,173 @@ mod tests {
         assert!(m.is_empty());
         assert_eq!(m.canonical_of("/any").unwrap(), None);
         assert_eq!(m.local_of("/any").unwrap(), None);
+    }
+
+    mod resolver {
+        use super::*;
+        use ssync_adapters::pi::PiAdapter;
+
+        fn scratch(tag: &str) -> PathBuf {
+            let base =
+                std::env::temp_dir().join(format!("ssync-resolver-{}-{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            base
+        }
+
+        fn header(cwd: &str) -> Vec<u8> {
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4a\",\"cwd\":\"{cwd}\"}}\n{{\"m\":\"1\"}}\n"
+            )
+            .into_bytes()
+        }
+
+        #[test]
+        fn empty_map_is_pass_through() {
+            let root = scratch("inert");
+            let pi = PiAdapter::new("pi", &root);
+            let mut r = Resolver::default();
+            assert_eq!(r.wire_rel(&pi, "--proj--/a.jsonl").unwrap(), None);
+            let bytes = header("/data/x");
+            let (dest, out) = r
+                .localize(&pi, "--proj--/a.jsonl", bytes.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(dest, root.join("--proj--/a.jsonl"));
+            assert_eq!(out, bytes);
+            assert_eq!(
+                r.local_dest(&pi, "--proj--/a.jsonl"),
+                Some(root.join("--proj--/a.jsonl"))
+            );
+            assert_eq!(r.canonical_plaintext(&pi, bytes.clone()).unwrap(), bytes);
+        }
+
+        #[test]
+        fn wire_rel_maps_project_dir_via_header_and_caches() {
+            let root = scratch("wire");
+            let pi = PiAdapter::new("pi", &root);
+            let dir = root.join("--data-Projects-x--");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("s.jsonl"), header("/data/Projects/x")).unwrap();
+            let mut r = Resolver::new(map(&[("/data/Projects", "/canon/Projects")]), None);
+            assert_eq!(
+                r.wire_rel(&pi, "--data-Projects-x--/s.jsonl")
+                    .unwrap()
+                    .as_deref(),
+                Some("--canon-Projects-x--/s.jsonl")
+            );
+            // resolved once per dir: the mapping survives the dir's removal
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                r.wire_rel(&pi, "--data-Projects-x--/t.jsonl")
+                    .unwrap()
+                    .as_deref(),
+                Some("--canon-Projects-x--/t.jsonl")
+            );
+        }
+
+        #[test]
+        fn unmapped_cwd_is_pass_through() {
+            let root = scratch("passthrough");
+            let pi = PiAdapter::new("pi", &root);
+            let dir = root.join("--elsewhere-y--");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("s.jsonl"), header("/elsewhere/y")).unwrap();
+            let mut r = Resolver::new(map(&[("/data/Projects", "/canon/Projects")]), None);
+            assert_eq!(r.wire_rel(&pi, "--elsewhere-y--/s.jsonl").unwrap(), None);
+        }
+
+        #[test]
+        fn missing_header_is_an_error_and_freezes_the_agent() {
+            let root = scratch("freeze");
+            let pi = PiAdapter::new("pi", &root);
+            let dir = root.join("--proj--");
+            std::fs::create_dir_all(&dir).unwrap(); // no session header inside
+            let mut r = Resolver::new(map(&[("/data", "/canon")]), None);
+            assert!(r.wire_rel(&pi, "--proj--/s.jsonl").is_err());
+            assert!(r.note_failure("pi", dir.clone()), "first failure logs");
+            assert!(!r.note_failure("pi", dir), "repeat failure stays quiet");
+            assert!(r.agent_failed("pi"));
+            r.begin_pass();
+            assert!(!r.agent_failed("pi"), "freeze lasts one pass");
+        }
+
+        #[test]
+        fn omp_without_canonical_home_is_an_error() {
+            let root = scratch("omp-home");
+            let omp = PiAdapter::new("omp", &root);
+            let dir = root.join("-Projects-x");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("s.jsonl"), header("/data/Projects/x")).unwrap();
+            let mut r = Resolver::new(map(&[("/data", "/canon-home")]), None);
+            let err = r.wire_rel(&omp, "-Projects-x/s.jsonl").unwrap_err();
+            assert!(err.to_string().contains("canonical_home"), "{err:#}");
+        }
+
+        #[test]
+        fn localize_rewrites_header_and_learns_the_dir_translation() {
+            let root = scratch("localize");
+            let pi = PiAdapter::new("pi", &root);
+            let mut r = Resolver::new(map(&[("/local/work", "/canon/Projects")]), None);
+            let (dest, bytes) = r
+                .localize(
+                    &pi,
+                    "--canon-Projects-x--/s.jsonl",
+                    header("/canon/Projects/x"),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(dest, root.join("--local-work-x--/s.jsonl"));
+            assert_eq!(bytes, header("/local/work/x"));
+
+            // header-less artifact bytes ride the learned translation ...
+            let art = b"{\"type\":\"advisor\"}\n".to_vec();
+            let (art_dest, art_bytes) = r
+                .localize(&pi, "--canon-Projects-x--/art/a.jsonl", art.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(art_dest, root.join("--local-work-x--/art/a.jsonl"));
+            assert_eq!(art_bytes, art);
+            // ... and so does DeleteLocal's dest lookup
+            assert_eq!(
+                r.local_dest(&pi, "--canon-Projects-x--/s.jsonl"),
+                Some(root.join("--local-work-x--/s.jsonl"))
+            );
+        }
+
+        #[test]
+        fn localize_artifact_of_unmaterialized_project_retries_later() {
+            let root = scratch("unresolved");
+            let pi = PiAdapter::new("pi", &root);
+            let mut r = Resolver::new(map(&[("/local/work", "/canon/Projects")]), None);
+            // no translation learned yet: not resolvable, not an error
+            let out = r
+                .localize(
+                    &pi,
+                    "--canon-Projects-x--/art/a.jsonl",
+                    b"no header\n".to_vec(),
+                )
+                .unwrap();
+            assert_eq!(out, None);
+        }
+
+        #[test]
+        fn canonical_plaintext_maps_the_header_cwd() {
+            let root = scratch("canonical");
+            let pi = PiAdapter::new("pi", &root);
+            let r = Resolver::new(map(&[("/local/work", "/canon/Projects")]), None);
+            assert_eq!(
+                r.canonical_plaintext(&pi, header("/local/work/x")).unwrap(),
+                header("/canon/Projects/x")
+            );
+            // header-less artifact records pass through
+            let art = b"{\"type\":\"advisor\"}\n".to_vec();
+            assert_eq!(r.canonical_plaintext(&pi, art.clone()).unwrap(), art);
+            // an unmapped cwd is already canonical
+            assert_eq!(
+                r.canonical_plaintext(&pi, header("/elsewhere/y")).unwrap(),
+                header("/elsewhere/y")
+            );
+        }
     }
 }

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use futures_lite::StreamExt;
 use notify::{RecursiveMode, Watcher};
 use ssync_adapters::{Adapter, SessionIdentity};
@@ -27,6 +27,7 @@ mod status;
 pub use config::{AgentConfig, Config, insert_cluster_path};
 use divergence::{Divergence, Verdict};
 pub use pathmap::PathMap;
+use pathmap::Resolver;
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 pub use status::{PeerStatus, StatusReport};
 
@@ -79,18 +80,8 @@ pub struct Engine {
     /// Per-agent session exclusion patterns (issue #14); a matching key is
     /// invisible to reconcile from both sides, freezing it everywhere.
     excludes: std::collections::HashMap<String, Vec<String>>,
-    /// Prefix map local↔canonical (issue #13, map #42); empty = inert.
-    path_map: PathMap,
-    /// Home context for the wire side of home-relative encodings (omp).
-    canonical_home: Option<PathBuf>,
-    /// Per project dir: how its keys and bytes translate (`None` value =
-    /// pass-through). Dir↔cwd never changes, so entries never invalidate.
-    dir_map: std::collections::HashMap<PathBuf, Option<String>>,
-    /// Dirs whose mapping failed, already logged (retry stays quiet).
-    dir_map_logged: std::collections::HashSet<PathBuf>,
-    /// Agents with an unresolvable mapping this pass: their tombstones are
-    /// withheld — a skipped file must never read as a deletion (#49).
-    map_failed_agents: std::collections::HashSet<String>,
+    /// Wire↔local path-map translation (issue #13, map #42); default = inert.
+    resolver: Resolver,
 }
 
 impl Engine {
@@ -120,11 +111,7 @@ impl Engine {
             rotation_pending: false,
             import_errors: 0,
             excludes: Default::default(),
-            path_map: PathMap::default(),
-            canonical_home: None,
-            dir_map: Default::default(),
-            dir_map_logged: Default::default(),
-            map_failed_agents: Default::default(),
+            resolver: Resolver::default(),
         }
     }
 
@@ -150,8 +137,7 @@ impl Engine {
 
     /// The `[[path_map]]` + `canonical_home` from config (issue #13).
     pub fn set_path_map(&mut self, map: PathMap, canonical_home: Option<PathBuf>) {
-        self.path_map = map;
-        self.canonical_home = canonical_home;
+        self.resolver = Resolver::new(map, canonical_home);
     }
 
     /// Live index keys (wire form) — status/debug surface; the two-node
@@ -194,174 +180,45 @@ impl Engine {
         format!("{}/{}", id.agent, id.relative_path.display())
     }
 
-    /// The wire key for a local file (issue #13): the canonical first
-    /// component when its project dir is mapped, today's relative path
+    /// The wire key for a local file (issue #13): translated through the
+    /// path map when its project dir is mapped, today's relative path
     /// otherwise. `Err` = unresolvable this tick; the caller skips the file
     /// (logged once) and a later pass retries.
     fn mapped_key(&mut self, id: &SessionIdentity, path: &Path) -> Result<String> {
-        if self.path_map.is_empty() {
-            return Ok(self.index_key(id));
-        }
         let Some(idx) = self.adapter_index_of_path(path) else {
             return Ok(self.index_key(id));
         };
-        // adapters without cwd semantics (omp-blobs, codex, claude-code)
-        // pass through untouched — their keys and bytes carry no paths the
-        // map could act on
-        if !self.adapters[idx].maps_paths() {
-            return Ok(self.index_key(id));
-        }
-        let rel = id.relative_path.to_string_lossy().into_owned();
-        let Some((first, rest)) = rel.split_once('/') else {
-            bail!("{rel}: expected <project>/<file>");
-        };
-        let project_dir = self.adapters[idx].session_root().join(first);
-        match self.dir_mapping(idx, &project_dir)? {
-            None => Ok(self.index_key(id)),
-            Some(component) => Ok(format!("{}/{component}/{rest}", id.agent)),
-        }
-    }
-
-    /// How a project dir translates, resolved once from any main session
-    /// file's header and cached — a dir's cwd never changes. `Ok(None)` =
-    /// pass-through (unmapped). `Err` = header unreadable, round-trip guard
-    /// tripped, or encoding needs `canonical_home`: skip and retry.
-    fn dir_mapping(&mut self, idx: usize, project_dir: &Path) -> Result<Option<String>> {
-        if let Some(cached) = self.dir_map.get(project_dir) {
-            return Ok(cached.clone());
-        }
+        let rel = id.relative_path.to_string_lossy();
         let adapter = self.adapters[idx].as_ref();
-        let mut local_cwd = None;
-        for entry in std::fs::read_dir(project_dir)
-            .with_context(|| format!("reading {}", project_dir.display()))?
-        {
-            let p = entry?.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") || !p.is_file() {
-                continue;
-            }
-            if let Ok(bytes) = std::fs::read(&p)
-                && let Some(cwd) = adapter.header_cwd(&bytes)
-            {
-                local_cwd = Some(cwd);
-                break;
-            }
+        match self.resolver.wire_rel(adapter, &rel)? {
+            None => Ok(self.index_key(id)),
+            Some(mapped) => Ok(format!("{}/{mapped}", id.agent)),
         }
-        let Some(local_cwd) = local_cwd else {
-            bail!(
-                "{}: no session header to resolve the project's cwd",
-                project_dir.display()
-            );
-        };
-        let mapping = match self.path_map.canonical_of(&local_cwd)? {
-            None => None,
-            Some(canonical_cwd) => Some(
-                adapter
-                    .encode_cwd(&canonical_cwd, self.canonical_home.as_deref())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "cannot derive {}'s wire dir for {canonical_cwd}: set canonical_home",
-                            adapter.agent()
-                        )
-                    })?,
-            ),
-        };
-        self.dir_map
-            .insert(project_dir.to_path_buf(), mapping.clone());
-        Ok(mapping)
     }
 
-    /// Local destination + on-disk bytes for a wire key's plaintext. With an
-    /// empty map: today's literal dest, bytes untouched. `Ok(None)` = not
-    /// resolvable yet (artifact of a not-yet-materialized project) — the
-    /// caller returns false and a later tick retries.
+    /// Local destination + on-disk bytes for a wire key's plaintext, through
+    /// the path map. `Ok(None)` = not resolvable yet — the caller returns
+    /// false and a later tick retries.
     fn localize(&mut self, key: &str, plaintext: Vec<u8>) -> Result<Option<(PathBuf, Vec<u8>)>> {
-        let Some(dest) = self.dest_of(key) else {
+        let Some(idx) = self.adapter_index_of_key(key) else {
             return Ok(None);
         };
-        if self.path_map.is_empty() || self.adapter_of_key(key).is_none_or(|a| !a.maps_paths()) {
-            return Ok(Some((dest, plaintext)));
-        }
-        let learned: Option<(PathBuf, String)>;
-        let out = {
-            let Some(adapter) = self.adapter_of_key(key) else {
-                return Ok(None);
-            };
-            let Some(rel) = key
-                .strip_prefix(adapter.agent())
-                .and_then(|r| r.strip_prefix('/'))
-            else {
-                return Ok(None);
-            };
-            let Some((first, rest)) = rel.split_once('/') else {
-                bail!("{rel}: expected <project>/<file>");
-            };
-            match adapter.header_cwd(&plaintext) {
-                Some(canonical_cwd) => match self.path_map.local_of(&canonical_cwd)? {
-                    // pass-through: the canonical path IS the local path
-                    None => {
-                        learned = None;
-                        Some((dest, plaintext))
-                    }
-                    Some(local_cwd) => {
-                        let component = adapter
-                            .encode_cwd(&local_cwd, dirs::home_dir().as_deref())
-                            .ok_or_else(|| anyhow!("cannot derive local dir for {local_cwd}"))?;
-                        let bytes = adapter
-                            .rewrite_header_cwd(&plaintext, &local_cwd)
-                            .ok_or_else(|| anyhow!("cannot rewrite header for {key}"))?;
-                        let local_dir = adapter.session_root().join(&component);
-                        let local_dest = local_dir.join(rest);
-                        // remember the translation for header-less siblings
-                        // (artifact records) and DeleteLocal
-                        learned = Some((local_dir, first.to_string()));
-                        Some((local_dest, bytes))
-                    }
-                },
-                // header-less bytes (artifact records): dir-level translation
-                None => {
-                    learned = None;
-                    self.local_project_dir(adapter.session_root(), first)
-                        .map(|dir| (dir.join(rest), plaintext))
-                }
-            }
+        let adapter = self.adapters[idx].as_ref();
+        let Some(rel) = key
+            .strip_prefix(adapter.agent())
+            .and_then(|r| r.strip_prefix('/'))
+        else {
+            return Ok(None);
         };
-        if let Some((dir, m)) = learned {
-            self.dir_map.insert(dir, Some(m));
-        }
-        Ok(out)
-    }
-
-    /// The local project dir a canonical wire component maps to, from the
-    /// learned/scanned translations (pass-through dirs match by name).
-    fn local_project_dir(&self, root: &Path, canonical_component: &str) -> Option<PathBuf> {
-        self.dir_map.iter().find_map(|(dir, m)| {
-            if !dir.starts_with(root) {
-                return None;
-            }
-            match m {
-                Some(c) if c == canonical_component => Some(dir.clone()),
-                None if dir.file_name().and_then(|n| n.to_str()) == Some(canonical_component) => {
-                    Some(dir.clone())
-                }
-                _ => None,
-            }
-        })
+        self.resolver.localize(adapter, rel, plaintext)
     }
 
     /// [`dest_of`](Self::dest_of) through the path map (for actions without
     /// plaintext in hand: DeleteLocal). `None` = nothing local to touch.
     fn local_dest_of(&self, key: &str) -> Option<PathBuf> {
-        let dest = self.dest_of(key)?;
-        if self.path_map.is_empty() || self.adapter_of_key(key).is_none_or(|a| !a.maps_paths()) {
-            return Some(dest);
-        }
         let adapter = self.adapter_of_key(key)?;
         let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
-        let (first, rest) = rel.split_once('/')?;
-        Some(
-            self.local_project_dir(adapter.session_root(), first)?
-                .join(rest),
-        )
+        self.resolver.local_dest(adapter, rel)
     }
 
     /// Index of the adapter whose session root contains `path`.
@@ -369,6 +226,14 @@ impl Engine {
         self.adapters
             .iter()
             .position(|a| path.starts_with(a.session_root()))
+    }
+
+    /// Index of the adapter owning an index key (matching `{agent}/` prefix).
+    fn adapter_index_of_key(&self, key: &str) -> Option<usize> {
+        self.adapters.iter().position(|a| {
+            key.strip_prefix(a.agent())
+                .is_some_and(|r| r.starts_with('/'))
+        })
     }
 
     /// Read → encrypt → blob → upsert index. Dedups on *plaintext* (age
@@ -401,21 +266,10 @@ impl Engine {
     /// (issue #13). A machine-local path must never reach the index — an
     /// unmappable header is a per-key error, not a pass-through (#49).
     fn canonical_plaintext(&self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
-        if self.path_map.is_empty() {
-            return Ok(bytes);
-        }
         let Some(adapter) = self.adapter_of_key(key) else {
             return Ok(bytes);
         };
-        let Some(local_cwd) = adapter.header_cwd(&bytes) else {
-            return Ok(bytes); // header-less artifact records pass through
-        };
-        match self.path_map.canonical_of(&local_cwd)? {
-            Some(canonical) => adapter
-                .rewrite_header_cwd(&bytes, &canonical)
-                .ok_or_else(|| anyhow!("cannot rewrite header for {key}")),
-            None => Ok(bytes),
-        }
+        self.resolver.canonical_plaintext(adapter, bytes)
     }
 
     /// Identify a path via the adapter whose session root contains it.
@@ -589,7 +443,7 @@ impl Engine {
 
     /// Snapshot every configured session dir as `reconcile` input.
     fn local_snapshot(&mut self) -> Vec<LocalFile> {
-        self.map_failed_agents.clear();
+        self.resolver.begin_pass();
         let mut out = Vec::new();
         for path in self.all_session_files() {
             let Some(stamp) = file_stamp_micros(&path) else {
@@ -611,9 +465,8 @@ impl Engine {
                     // an unresolvable mapping FREEZES the agent's tombstones
                     // this pass (#49): a skip that read as deletion would
                     // propagate mesh-wide (same class as the #14 fix)
-                    self.map_failed_agents.insert(id.agent.clone());
                     let dir = path.parent().unwrap_or(&path).to_path_buf();
-                    if self.dir_map_logged.insert(dir) {
+                    if self.resolver.note_failure(&id.agent, dir) {
                         eprintln!("ssync: skipping {}: {e:#}", path.display());
                     }
                     continue;
@@ -690,7 +543,7 @@ impl Engine {
             if let Action::Tombstone { key } = &action
                 && self
                     .adapter_of_key(key)
-                    .is_some_and(|a| self.map_failed_agents.contains(a.agent()))
+                    .is_some_and(|a| self.resolver.agent_failed(a.agent()))
             {
                 continue;
             }
