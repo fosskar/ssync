@@ -20,7 +20,7 @@ use ssync_net::iroh::SecretKey;
 pub struct Sim {
     pub base: PathBuf,
     /// Shared identity secret; per-machine-key tests build their own.
-    pub secret: String,
+    secret: String,
 }
 
 impl Sim {

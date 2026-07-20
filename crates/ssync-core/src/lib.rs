@@ -159,10 +159,8 @@ impl Engine {
     /// The adapter owning an index key (matching `{agent}/` prefix), if any —
     /// peers may sync agents this node does not have configured.
     fn adapter_of_key(&self, key: &str) -> Option<&dyn Adapter> {
-        self.adapters.iter().map(|a| a.as_ref()).find(|a| {
-            key.strip_prefix(a.agent())
-                .is_some_and(|r| r.starts_with('/'))
-        })
+        self.adapter_index_of_key(key)
+            .map(|i| self.adapters[i].as_ref())
     }
 
     /// The adapter whose session root contains `path`.
@@ -218,7 +216,7 @@ impl Engine {
     fn local_dest_of(&self, key: &str) -> Option<PathBuf> {
         let adapter = self.adapter_of_key(key)?;
         let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
-        self.resolver.local_dest(adapter, rel)
+        self.resolver.local_dest_of(adapter, rel)
     }
 
     /// Index of the adapter whose session root contains `path`.

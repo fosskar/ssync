@@ -246,7 +246,7 @@ impl Resolver {
 
     /// [`localize`](Self::localize) for actions without plaintext in hand
     /// (DeleteLocal). `None` = nothing local to touch.
-    pub fn local_dest(&self, adapter: &dyn Adapter, rel: &str) -> Option<PathBuf> {
+    pub fn local_dest_of(&self, adapter: &dyn Adapter, rel: &str) -> Option<PathBuf> {
         let dest = adapter.session_root().join(rel);
         if self.map.is_empty() || !adapter.maps_paths() {
             return Some(dest);
@@ -485,7 +485,7 @@ mod tests {
             assert_eq!(dest, root.join("--proj--/a.jsonl"));
             assert_eq!(out, bytes);
             assert_eq!(
-                r.local_dest(&pi, "--proj--/a.jsonl"),
+                r.local_dest_of(&pi, "--proj--/a.jsonl"),
                 Some(root.join("--proj--/a.jsonl"))
             );
             assert_eq!(r.canonical_plaintext(&pi, bytes.clone()).unwrap(), bytes);
@@ -579,7 +579,7 @@ mod tests {
             assert_eq!(art_bytes, art);
             // ... and so does DeleteLocal's dest lookup
             assert_eq!(
-                r.local_dest(&pi, "--canon-Projects-x--/s.jsonl"),
+                r.local_dest_of(&pi, "--canon-Projects-x--/s.jsonl"),
                 Some(root.join("--local-work-x--/s.jsonl"))
             );
         }
