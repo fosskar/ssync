@@ -332,6 +332,10 @@ in
         assertion = cfg.clusterFile == null || cfg.recipients == [ ];
         message = "services.ssync.clusterFile replaces recipients — the artifact carries them";
       }
+      {
+        assertion = cfg.discovery != "lan-only" || cfg.relay == null;
+        message = "services.ssync.discovery = \"lan-only\" never uses a relay — unset services.ssync.relay";
+      }
     ];
 
     # the daemon runs from the store path, but status/conflicts/ticket/cleanup

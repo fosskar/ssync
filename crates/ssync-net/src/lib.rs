@@ -238,14 +238,14 @@ impl Node {
 
         // Minimal = crypto provider only: RelayMode stays Disabled and no
         // address lookup is registered — the LAN-only reach.
-        let mut builder = match reach {
+        let builder = match reach {
             Reach::LanOnly => Endpoint::builder(presets::Minimal),
-            Reach::N0 | Reach::Relay(_) => Endpoint::builder(presets::N0),
+            Reach::N0 => Endpoint::builder(presets::N0),
+            Reach::Relay(url) => {
+                Endpoint::builder(presets::N0).relay_mode(RelayMode::custom([url]))
+            }
         }
         .secret_key(secret_key);
-        if let Reach::Relay(url) = reach {
-            builder = builder.relay_mode(RelayMode::custom([url]));
-        }
         let endpoint = builder.bind().await.context("binding iroh endpoint")?;
 
         // GC: iroh-docs feeds the protect callback every hash referenced by a

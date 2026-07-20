@@ -438,6 +438,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     let node_key_path = config.node_key_file();
     let secret = load_or_create_secret_key(&node_key_path).await?;
     let mut node = match (config.discovery, &config.relay) {
+        // lan-only + relay is rejected at Config::parse; the relay slot is None here
         (Discovery::LanOnly, _) => {
             let node = Node::spawn_lan_only(&config.data_dir, secret).await?;
             println!("ssync: lan-only discovery (mDNS; n0 relays and DNS never contacted)");
