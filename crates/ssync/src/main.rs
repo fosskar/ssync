@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use ssync_adapters::adapter_for;
-use ssync_core::{Config, Engine, StatusReport};
+use ssync_core::{Config, Discovery, Engine, StatusReport};
 use ssync_crypto::AgeIdentity;
 use ssync_net::iroh_docs::{DocTicket, NamespaceId};
 use ssync_net::{Node, load_or_create_secret_key};
@@ -437,14 +437,19 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
 
     let node_key_path = config.node_key_file();
     let secret = load_or_create_secret_key(&node_key_path).await?;
-    let mut node = match &config.relay {
-        Some(url) => {
+    let mut node = match (config.discovery, &config.relay) {
+        (Discovery::LanOnly, _) => {
+            let node = Node::spawn_lan_only(&config.data_dir, secret).await?;
+            println!("ssync: lan-only discovery (mDNS; n0 relays and DNS never contacted)");
+            node
+        }
+        (Discovery::Default, Some(url)) => {
             let relay = url.parse().map_err(|e| anyhow!("relay {url:?}: {e}"))?;
             let node = Node::spawn_with_relay(&config.data_dir, secret, relay).await?;
             println!("ssync: self-hosted relay {url} (n0 public relays disabled)");
             node
         }
-        None => Node::spawn(&config.data_dir, secret).await?,
+        (Discovery::Default, None) => Node::spawn(&config.data_dir, secret).await?,
     };
     node.enable_mdns();
 
@@ -507,6 +512,9 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
             "ssync: path map active ({} prefix pair(s))",
             config.path_map.len()
         );
+    }
+    if let Some(secs) = config.resync_interval_secs {
+        engine.set_resync_interval(std::time::Duration::from_secs(secs));
     }
     engine.persist_state(&config.data_dir.join("state.toml"));
     for a in &config.agents {

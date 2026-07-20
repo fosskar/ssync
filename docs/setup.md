@@ -324,13 +324,45 @@ Honest scope — what the override does and does not cover:
 - **Covered:** all relayed *traffic* and the NAT-traversal bootstrap move to
   your relay; n0's relays are never contacted.
 - **Not covered:** node-address *discovery* still uses n0's public DNS/pkarr
-  service (node-id → current addresses; metadata only, no session data). A
-  fully n0-free deployment is possible on a LAN today (cluster file + mDNS —
-  no relay, no DNS involved); self-hosting discovery across networks would
-  additionally need an `iroh-dns-server`, which ssync does not wire up yet —
-  open an issue if you need it.
+  service (node-id → current addresses; metadata only, no session data). For
+  a fully n0-free deployment on a LAN, set `discovery = "lan-only"` (below);
+  self-hosting discovery across networks would additionally need an
+  `iroh-dns-server`, which ssync does not wire up yet — open an issue if you
+  need it.
 - The relay is still optional infrastructure: direct connections are always
   preferred, and machines that can hole-punch exchange all data p2p.
+
+## LAN-only discovery
+
+Machines that only ever meet on the same network (homelab, office LAN) can opt
+out of n0's infrastructure entirely:
+
+```toml
+# never contact n0's relays or DNS — peers are found by mDNS alone
+discovery = "lan-only"
+```
+
+(nix: `services.ssync.discovery`.) No relays, no DNS/pkarr publishing or
+lookup: nothing about your machines ever leaves the local network. Pair via
+the cluster artifact (`ssync cluster`) — it carries node-ids, and mDNS makes
+them dialable on the LAN. The tradeoff is inherent: two machines that are NOT
+on the same network cannot find each other in this mode. `relay` and
+`discovery = "lan-only"` are mutually exclusive (a relay would never be used).
+
+## Peer re-sync interval
+
+The daemon re-initiates sync with its known peers every 60 seconds — the
+recovery path when a live link died silently (peer rebooted, network moved).
+Tune it when the default feels slow after a laptop wakes up:
+
+```toml
+# seconds between re-sync rounds (default 60)
+resync_interval_secs = 15
+```
+
+(nix: `services.ssync.resyncIntervalSecs`.) Lower = faster reconvergence
+after restarts, at the cost of more idle chatter; it does not affect how fast
+live changes propagate (those are event-driven).
 
 ## Everyday use
 
