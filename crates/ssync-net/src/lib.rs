@@ -689,6 +689,17 @@ impl Node {
 mod tests {
     use super::*;
 
+    async fn direct_addr_of(node: &Node) -> EndpointAddr {
+        for _ in 0..40 {
+            let addr = node.endpoint_addr();
+            if !addr.addrs.is_empty() {
+                return addr;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        panic!("node {} has no direct addresses", node.endpoint_addr().id);
+    }
+
     #[test]
     fn parse_peer_addrs_trims_and_skips_junk() {
         let id1 = node_id_of(&generate_key_bytes());
@@ -793,22 +804,8 @@ mod tests {
         let secret = generate_key_bytes();
         a.open_shared_namespace(secret).await.unwrap();
         b.open_shared_namespace(secret).await.unwrap();
-        // without a relay fallback an addr is dialable only once the bound
-        // socket addresses show up; poll instead of assuming bind ordering.
-        let addr_of = |n: &Node| {
-            let addr = n.endpoint_addr();
-            (!addr.addrs.is_empty()).then_some(addr)
-        };
-        let (mut addr_a, mut addr_b) = (addr_of(&a), addr_of(&b));
-        for _ in 0..40 {
-            if addr_a.is_some() && addr_b.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            (addr_a, addr_b) = (addr_of(&a), addr_of(&b));
-        }
-        let addr_a = addr_a.expect("lan-only node a has no direct addrs");
-        let addr_b = addr_b.expect("lan-only node b has no direct addrs");
+        let addr_a = direct_addr_of(&a).await;
+        let addr_b = direct_addr_of(&b).await;
         a.sync_with(vec![addr_b]).await.unwrap();
         b.sync_with(vec![addr_a]).await.unwrap();
 
@@ -877,21 +874,22 @@ mod tests {
     #[tokio::test]
     async fn peer_paths_observe_active_direct_path_once_connected() {
         let (da, db) = (tempdir("paths-a"), tempdir("paths-b"));
-        let mut a = Node::spawn(&da, SecretKey::generate()).await.unwrap();
-        let mut b = Node::spawn(&db, SecretKey::generate()).await.unwrap();
+        let mut a = Node::spawn_lan_only(&da, SecretKey::generate())
+            .await
+            .unwrap();
+        let mut b = Node::spawn_lan_only(&db, SecretKey::generate())
+            .await
+            .unwrap();
         let secret = generate_key_bytes();
         a.open_shared_namespace(secret).await.unwrap();
         b.open_shared_namespace(secret).await.unwrap();
-        let (addr_a, addr_b) = (a.endpoint_addr(), b.endpoint_addr());
+        let addr_a = direct_addr_of(&a).await;
+        let addr_b = direct_addr_of(&b).await;
         let id_a = addr_a.id;
         a.sync_with(vec![addr_b]).await.unwrap();
         b.sync_with(vec![addr_a]).await.unwrap();
         a.publish("pi/p/s", b"ciphertext".to_vec()).await.unwrap();
 
-        // poll: the connection (and its path classification) settles async.
-        // Direct = localhost only; Mixed allowed because on a networked dev
-        // machine the n0 relay may also be active — the invariant is that the
-        // direct localhost path is observed, not that the relay is absent.
         let mut kind = PathKind::Unknown;
         for _ in 0..40 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -902,9 +900,10 @@ mod tests {
                 }
             }
         }
-        assert!(
-            matches!(kind, PathKind::Direct | PathKind::Mixed),
-            "in-process peers must show an active direct path, got {kind}"
+        assert_eq!(
+            kind,
+            PathKind::Direct,
+            "in-process peers must show an active direct path"
         );
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
@@ -928,15 +927,20 @@ mod tests {
     #[tokio::test]
     async fn blob_fetches_missed_download_from_peers() {
         let (da, db) = (tempdir("blob-fetch-a"), tempdir("blob-fetch-b"));
-        let mut a = Node::spawn(&da, SecretKey::generate()).await.unwrap();
-        let mut b = Node::spawn(&db, SecretKey::generate()).await.unwrap();
+        let mut a = Node::spawn_lan_only(&da, SecretKey::generate())
+            .await
+            .unwrap();
+        let mut b = Node::spawn_lan_only(&db, SecretKey::generate())
+            .await
+            .unwrap();
         let secret = generate_key_bytes();
         a.open_shared_namespace(secret).await.unwrap();
         b.open_shared_namespace(secret).await.unwrap();
         // model iroh-docs' missed live download (never retried upstream):
         // index entries sync, content does not
         b.disable_auto_download().await.unwrap();
-        let (addr_a, addr_b) = (a.endpoint_addr(), b.endpoint_addr());
+        let addr_a = direct_addr_of(&a).await;
+        let addr_b = direct_addr_of(&b).await;
         a.sync_with(vec![addr_b]).await.unwrap();
         b.sync_with(vec![addr_a]).await.unwrap();
         let hash = a.publish("pi/p/s", b"ciphertext".to_vec()).await.unwrap();
