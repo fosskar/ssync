@@ -69,7 +69,7 @@ pub fn plan(adapters: &[Box<dyn Adapter>], filter: &Filter) -> Result<Vec<Victim
         {
             continue;
         }
-        let files = crate::session_files(adapter.session_root(), adapter.as_ref());
+        let files = crate::wiremap::session_files(adapter.session_root(), adapter.as_ref());
         let mut selected = Vec::new();
         for path in &files {
             let old_enough = match filter.before {
