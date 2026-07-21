@@ -3,6 +3,7 @@
 mod cleanup_timer;
 mod cluster;
 mod service;
+mod systemd;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

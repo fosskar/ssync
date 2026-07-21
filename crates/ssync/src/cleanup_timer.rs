@@ -4,16 +4,13 @@
 //! propagate mesh-wide through the daemon's tombstone path: a timer on ONE
 //! machine prunes ALL machines.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-use ssync_core::Config;
 
-use crate::service::{
-    HARDENING, check_access, create_write_paths, ensure_install_mode, ensure_unit_safe, is_root,
-    remove_units, service_user_of, systemctl, unit_dir,
+use crate::systemd::{
+    self, Activation, HARDENING, RemoveResult, UnitFile, UnitSet, ensure_unit_safe,
 };
 
 const SERVICE_NAME: &str = "ssync-cleanup.service";
@@ -202,77 +199,55 @@ pub fn cmd_enable(
     selectors: CleanupSelectors,
     user: Option<String>,
 ) -> Result<()> {
-    let user_mode = !is_root()?;
-    ensure_install_mode(user_mode, user.as_ref(), config_explicit, config_path)?;
-
-    let config = Config::load(config_path)
-        .with_context(|| format!("loading {} (run `ssync init` first)", config_path.display()))?;
-    if let Some(a) = &selectors.agent {
-        ensure!(
-            config.agents.iter().any(|c| c.agent == *a),
-            "agent {a:?} is not in the config"
-        );
-    }
-    let schedule = schedule_of(&every)?;
-    if let Schedule::Calendar(expr) = &schedule {
-        validate_calendar(expr)?;
-    }
-    let cleanup_args = cleanup_args_of(selectors)?;
-
-    // resolve everything fallible before touching the filesystem
-    let exec = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .context("resolving the ssync binary path")?;
-    let config_abs = config_path
-        .canonicalize()
-        .with_context(|| format!("resolving {}", config_path.display()))?;
-    let service_user = match &user {
-        Some(name) => Some(service_user_of(name)?),
-        None => None,
-    };
-    if let Some(who) = &service_user {
-        check_access(&exec, who, 0o5)?;
-        check_access(&config_abs, who, 0o4)?;
-    }
-
-    // ReadWritePaths requires the session dirs to exist at unit start
-    let session_dirs: Vec<PathBuf> = config
-        .agents
-        .iter()
-        .map(|a| a.session_dir.clone())
-        .collect();
-    create_write_paths(&session_dirs, service_user.as_ref())?;
-    if let Some(who) = &service_user {
-        // pre-existing dirs were never chowned; catch a root-owned leaf now
-        for p in &session_dirs {
-            check_access(p, who, 0o7)?;
-        }
-    }
-
-    let spec = TimerSpec {
-        exec,
-        config_path: config_abs,
-        cleanup_args,
-        session_dirs,
+    let installed = systemd::install(
+        config_path,
+        config_explicit,
         user,
-        schedule,
-    };
-    validate_spec(&spec)?;
+        move |config, context| {
+            if let Some(agent) = &selectors.agent {
+                ensure!(
+                    config.agents.iter().any(|entry| entry.agent == *agent),
+                    "agent {agent:?} is not in the config"
+                );
+            }
+            let schedule = schedule_of(&every)?;
+            if let Schedule::Calendar(expression) = &schedule {
+                validate_calendar(expression)?;
+            }
+            let cleanup_args = cleanup_args_of(selectors)?;
+            let session_dirs: Vec<PathBuf> = config
+                .agents
+                .iter()
+                .map(|agent| agent.session_dir.clone())
+                .collect();
+            let spec = TimerSpec {
+                exec: context.exec,
+                config_path: context.config_path,
+                cleanup_args,
+                session_dirs: session_dirs.clone(),
+                user: context.user,
+                schedule,
+            };
+            validate_spec(&spec)?;
+            Ok(UnitSet {
+                files: vec![
+                    UnitFile {
+                        name: SERVICE_NAME,
+                        contents: render_service(&spec),
+                    },
+                    UnitFile {
+                        name: TIMER_NAME,
+                        contents: render_timer(&spec),
+                    },
+                ],
+                write_paths: session_dirs,
+                required_executables: Vec::new(),
+                activation: Activation::EnableNow(TIMER_NAME),
+            })
+        },
+    )?;
 
-    let dir = unit_dir(user_mode)?;
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    for (name, text) in [
-        (SERVICE_NAME, render_service(&spec)),
-        (TIMER_NAME, render_timer(&spec)),
-    ] {
-        let path = dir.join(name);
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
-    }
-
-    systemctl(user_mode, &["daemon-reload"])?;
-    systemctl(user_mode, &["enable", "--now", TIMER_NAME])?;
-
-    let scope = if user_mode { "--user " } else { "" };
+    let scope = if installed.user_mode { "--user " } else { "" };
     println!("installed and started {TIMER_NAME}");
     println!(
         "cleanup deletes sessions on EVERY machine (the daemon propagates \
@@ -283,33 +258,21 @@ pub fn cmd_enable(
 }
 
 pub fn cmd_disable() -> Result<()> {
-    let user_mode = !is_root()?;
-    let dir = unit_dir(user_mode)?;
-    if !dir.join(TIMER_NAME).exists() {
-        bail!(
-            "nothing to disable: {} does not exist",
-            dir.join(TIMER_NAME).display()
-        );
+    match systemd::remove(TIMER_NAME, &[TIMER_NAME, SERVICE_NAME])? {
+        RemoveResult::Missing(path) => {
+            bail!("nothing to disable: {} does not exist", path.display())
+        }
+        RemoveResult::Removed(_) => {
+            println!("removed {TIMER_NAME}");
+            Ok(())
+        }
     }
-    remove_units(user_mode, TIMER_NAME, &[TIMER_NAME, SERVICE_NAME])?;
-    println!("removed {TIMER_NAME}");
-    Ok(())
 }
 
 pub fn cmd_status() -> Result<()> {
-    let user_mode = !is_root()?;
-    if !unit_dir(user_mode)?.join(TIMER_NAME).exists() {
+    if !systemd::show_status(TIMER_NAME)? {
         println!("cleanup timer not installed");
-        return Ok(());
     }
-    let mut cmd = Command::new("systemctl");
-    if user_mode {
-        cmd.arg("--user");
-    }
-    // `status` exits non-zero for an inactive unit; its output is the answer
-    cmd.args(["--no-pager", "status", TIMER_NAME])
-        .status()
-        .context("running systemctl (is systemd available?)")?;
     Ok(())
 }
 
