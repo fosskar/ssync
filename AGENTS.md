@@ -16,9 +16,10 @@ Impure shell around pure decision cores:
 - `ssync` (bin) is the composition root: config → age identity → iroh `Node` → adapters →
   `Engine::run`.
 - `Engine::run` (ssync-core) is one `tokio::select!` loop. Event sources: notify fs
-  watcher, iroh-docs LiveEvents (drained on a dedicated task, forwarded as a `DocSignal`
-  — relevance ping or learned peer id — over an **unbounded** channel; bounded
-  subscriber channels deadlock the iroh-docs actor), 15s rescan, 60s resync. FS and
+  watcher, `Node::signals` wake pings (iroh-docs LiveEvents are drained behind the net
+  seam on a dedicated task — bounded subscriber channels deadlock the iroh-docs actor —
+  and peers learned on the live stream are recorded by the node itself), 15s rescan,
+  60s resync. FS and
   index events funnel into a 400ms-debounced tick; the rescan ticks directly, the
   resync only re-initiates peer sync.
 - Each tick: `local_snapshot` + `index_snapshot` → pure `reconcile()` → `Vec<Action>`
@@ -26,9 +27,9 @@ Impure shell around pure decision cores:
   (atomic temp+rename to `data_dir/state.toml`).
 - Import path: file → age-encrypt (subprocess) → `Node::publish` (blob + index entry keyed
   `{agent}/{relative_path}`; the ONLY write path — temp-tag prevents the GC race).
-- Export path: index entry → `get_blob` (miss → `fetch_blob` from peers, 30s bound;
-  iroh-docs never retries a missed download, upstream iroh-docs#88) → decrypt → atomic
-  temp+rename write-back.
+- Export path: index entry → `Node::blob` (local miss → bounded fetch from peers behind
+  the net seam; iroh-docs never retries a missed download, upstream iroh-docs#88) →
+  decrypt → atomic temp+rename write-back.
 - Conflicts: winner = newest entry, selected once behind the net seam (`IndexRecord`);
   append-only formats (pi/omp) get the deterministic lossless line-union merge, others
   newest-wins. The merge verdict is all-or-skip: a partial version set never merges.
@@ -156,7 +157,7 @@ flake.lock. CI is nixbot building the flake checks (plus the nixbot effects in
 - `crates/ssync-core/src/lib.rs` — `Engine`, the event loop.
 - `crates/ssync-core/src/config.rs` — `Config` (`$XDG_CONFIG_HOME/ssync/config.toml`, `~/`
   expanded per-machine).
-- `crates/ssync-net/src/lib.rs` — `Node`, `publish`, `fetch_blob`, `IndexRecord`.
+- `crates/ssync-net/src/lib.rs` — `Node`, `publish`, `blob`, `signals`, `IndexRecord`.
 - `crates/ssync-adapters/src/lib.rs` — `Adapter` trait + `adapter_for` (extensibility point).
 - `Cargo.toml` (root) — workspace version + all dep versions.
 - `flake.nix` + `nix/` — the whole build/CI surface.

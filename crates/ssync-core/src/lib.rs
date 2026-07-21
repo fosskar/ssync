@@ -5,13 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use futures_lite::StreamExt;
 use notify::{RecursiveMode, Watcher};
 use ssync_adapters::{Adapter, SessionIdentity};
 use ssync_crypto::AgeIdentity;
 use ssync_net::Node;
-use ssync_net::iroh::EndpointId;
-use ssync_net::iroh_docs::engine::LiveEvent;
 
 use ssync_net::iroh_blobs::Hash;
 
@@ -30,14 +27,6 @@ pub use pathmap::PathMap;
 use pathmap::Resolver;
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 pub use status::{PeerStatus, StatusReport};
-
-/// What the doc-event drain task forwards to the select loop.
-enum DocSignal {
-    /// A remote index change worth a reconcile tick.
-    Changed,
-    /// A peer seen on the live stream (gossip neighbor or completed sync).
-    Peer(EndpointId),
-}
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
 /// its supervisor restarts it with a fresh mount namespace.
@@ -612,23 +601,12 @@ impl Engine {
             Action::WriteFile { key, hash } => {
                 // dest + on-disk bytes resolve through the path map after
                 // decryption (the header carries the canonical cwd)
-                // the live engine can miss a content download and never retries
-                // (iroh-docs#88): fetch from peers explicitly, bounded; else a
-                // later tick retries.
-                let ciphertext = match self.node.get_blob(*hash).await {
+                let ciphertext = match self.node.blob(*hash).await {
                     Ok(c) => c,
-                    Err(_) => {
-                        let fetch = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            self.node.fetch_blob(*hash),
-                        );
-                        if !matches!(fetch.await, Ok(Ok(()))) {
-                            return false;
-                        }
-                        let Ok(c) = self.node.get_blob(*hash).await else {
-                            return false;
-                        };
-                        c
+                    // per-key error, retried next tick like every other arm
+                    Err(e) => {
+                        eprintln!("ssync: fetch {key}: {e:#}");
+                        return false;
                     }
                 };
                 let plaintext = match self.identity.decrypt(&ciphertext) {
@@ -724,44 +702,10 @@ impl Engine {
                 .with_context(|| format!("watching {}", adapter.session_root().display()))?;
         }
 
-        // Drain doc events on a dedicated task, immediately and unconditionally:
-        // iroh-docs awaits subscriber sends on bounded channels inside its
-        // actor, so an unread subscription wedges the whole store once enough
-        // events queue up (a large initial import is enough). Only a relevance
-        // signal (and learned peer ids) crosses to the select loop, over an
-        // unbounded channel.
-        let events = self.node.subscribe().await?;
-        // Peer events fired before this subscription existed are lost (the
-        // ticket issuer would otherwise wait a full peer resync interval to
-        // learn the joiner). iroh-docs persists synced peers before emitting
-        // the event, so seeding after subscribing leaves no gap.
-        if let Err(e) = self.node.load_persisted_peers().await {
-            eprintln!("ssync: loading persisted peers: {e:#}");
-        }
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut events = std::pin::pin!(events);
-            while let Some(ev) = events.next().await {
-                let sig = match ev {
-                    Ok(LiveEvent::InsertRemote { .. }) | Ok(LiveEvent::ContentReady { .. }) => {
-                        Some(DocSignal::Changed)
-                    }
-                    // Ticket pairing records peers on the joining side only;
-                    // the issuer learns its peers here (gossip neighbors and
-                    // completed syncs) so fetch_blob recovery and resync work.
-                    Ok(LiveEvent::NeighborUp(peer)) => Some(DocSignal::Peer(peer)),
-                    Ok(LiveEvent::SyncFinished(e)) if e.result.is_ok() => {
-                        Some(DocSignal::Peer(e.peer))
-                    }
-                    _ => None,
-                };
-                if let Some(sig) = sig
-                    && etx.send(sig).is_err()
-                {
-                    break;
-                }
-            }
-        });
+        // Doc events are drained behind the Node seam (Node::signals): only
+        // wake pings cross, and peers learned on the live stream are
+        // recorded by the node itself.
+        let mut erx = self.node.signals().await?;
         let mut events_ended = false;
 
         // initial reconcile
@@ -796,13 +740,7 @@ impl Engine {
                 }
                 ev = erx.recv(), if !events_ended => {
                     match ev {
-                        Some(DocSignal::Changed) => {
-                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
-                        }
-                        // A new peer may carry content a fetch already missed;
-                        // schedule a tick so the retry happens promptly.
-                        Some(DocSignal::Peer(id)) => {
-                            self.node.add_peer(id);
+                        Some(()) => {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                         // ended stream: disarm this select arm, or it is ready

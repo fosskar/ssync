@@ -2,9 +2,10 @@
 //! Stores ciphertext blobs plus a synced key-value index.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use futures_lite::{Stream, StreamExt};
+use futures_lite::StreamExt;
 use iroh::endpoint::{RelayMode, TransportAddrUsage, presets};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
@@ -22,6 +23,7 @@ use iroh_docs::{AuthorId, DocTicket, NamespaceId};
 use iroh_docs::{Capability, NamespaceSecret};
 use iroh_gossip::net::Gossip;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
+use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 pub use {iroh, iroh_blobs, iroh_docs};
 
@@ -109,6 +111,16 @@ fn parse_peer_addrs(node_ids: &[String]) -> Vec<EndpointAddr> {
     addrs
 }
 
+/// Record a peer as a content provider for [`Node::blob`] recovery and
+/// resync, deduplicated. Free-standing so the [`Node::signals`] drain task
+/// can record peers it learns from the live stream.
+fn remember_peer(peers: &Mutex<Vec<EndpointId>>, id: EndpointId) {
+    let mut peers = peers.lock();
+    if !peers.contains(&id) {
+        peers.push(id);
+    }
+}
+
 /// Load the iroh secret key, generating and persisting one on first run so the
 /// node's public identity is stable across restarts.
 pub async fn load_or_create_secret_key(path: &Path) -> Result<SecretKey> {
@@ -151,7 +163,7 @@ pub struct Node {
     docs: Docs,
     author: AuthorId,
     doc: Option<Doc>,
-    peers: Vec<EndpointId>,
+    peers: Arc<Mutex<Vec<EndpointId>>>,
     _router: Router,
 }
 
@@ -159,6 +171,9 @@ pub struct Node {
 /// entry are protected (via iroh-docs' protect callback); superseded ciphertext
 /// is swept. Content-addressed, so nothing referenced is ever lost.
 const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Bound on recovering one missed blob download from peers ([`Node::blob`]).
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How the endpoint reaches beyond the LAN (config `discovery` + `relay`,
 /// DECISIONS §6): n0 public infra, n0 with a self-hosted relay (#19), or
@@ -300,7 +315,7 @@ impl Node {
             docs,
             author,
             doc: None,
-            peers: Vec::new(),
+            peers: Arc::new(Mutex::new(Vec::new())),
             _router: router,
         })
     }
@@ -390,15 +405,12 @@ impl Node {
     }
 
     /// Snapshot of how each known peer is currently reachable, classified from
-    /// the active transport addresses iroh reports. Duplicate peer entries
-    /// (join + resync both remember peers) are reported once.
+    /// the active transport addresses iroh reports. Every insert path
+    /// deduplicates ([`remember_peer`]), so the list is duplicate-free.
     pub async fn peer_paths(&self) -> Vec<PeerPath> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::with_capacity(self.peers.len());
-        for id in &self.peers {
-            if !seen.insert(*id) {
-                continue;
-            }
+        let peers = self.peers.lock().clone();
+        let mut out = Vec::with_capacity(peers.len());
+        for id in &peers {
             let mut direct = false;
             let mut relay = false;
             if let Some(info) = self.endpoint.remote_info(*id).await {
@@ -424,34 +436,28 @@ impl Node {
     }
 
     /// Start syncing the active namespace with the given peer addresses; the
-    /// peers are remembered as content providers for [`fetch_blob`](Self::fetch_blob).
-    pub async fn sync_with(&mut self, addrs: Vec<EndpointAddr>) -> Result<()> {
+    /// peers are remembered as content providers for [`blob`](Self::blob)
+    /// recovery.
+    pub async fn sync_with(&self, addrs: Vec<EndpointAddr>) -> Result<()> {
         if !addrs.is_empty() {
-            self.peers.extend(addrs.iter().map(|a| a.id));
+            for a in &addrs {
+                remember_peer(&self.peers, a.id);
+            }
             self.doc()?.start_sync(addrs).await?;
         }
         Ok(())
     }
 
-    /// Remember a peer learned at runtime (gossip neighbor, completed sync) as
-    /// a content provider for [`fetch_blob`](Self::fetch_blob) and resync.
-    /// Ticket pairing only records peers on the joining side — the issuer
-    /// starts empty and depends on this to recover missed downloads.
-    pub fn add_peer(&mut self, id: EndpointId) {
-        if !self.peers.contains(&id) {
-            self.peers.push(id);
-        }
-    }
-
     /// Seed the fetch-peer list from the peers iroh-docs persisted for the
     /// active namespace (it registers every successfully synced peer before
-    /// emitting the corresponding live event). Events fired before
-    /// [`subscribe`](Self::subscribe) existed are lost; the store is not, so
-    /// subscribing and then seeding leaves no gap — and covers restarts.
-    pub async fn load_persisted_peers(&mut self) -> Result<()> {
+    /// emitting the corresponding live event). Events fired before the
+    /// [`signals`](Self::signals) subscription existed are lost; the store is
+    /// not, so subscribing and then seeding leaves no gap — and covers
+    /// restarts.
+    async fn load_persisted_peers(&self) -> Result<()> {
         if let Some(peers) = self.doc()?.get_sync_peers().await? {
             for bytes in peers {
-                self.add_peer(EndpointId::from_bytes(&bytes)?);
+                remember_peer(&self.peers, EndpointId::from_bytes(&bytes)?);
             }
         }
         Ok(())
@@ -461,26 +467,25 @@ impl Node {
     /// when a peer restarts (one-way sync until reconnect); the daemon calls
     /// this periodically. iroh-docs dedupes already-running syncs.
     pub async fn resync(&self) -> Result<()> {
-        if self.peers.is_empty() {
+        let peers = self.peers.lock().clone();
+        if peers.is_empty() {
             return Ok(());
         }
-        let addrs = self
-            .peers
-            .iter()
-            .map(|id| EndpointAddr::from(*id))
-            .collect();
+        let addrs = peers.iter().map(|id| EndpointAddr::from(*id)).collect();
         self.doc()?.start_sync(addrs).await
     }
 
     /// Start syncing with the given peer node-ids. Addresses are resolved via
     /// iroh discovery, so only the node-ids are needed.
-    pub async fn sync_with_peers(&mut self, node_ids: &[String]) -> Result<()> {
+    pub async fn sync_with_peers(&self, node_ids: &[String]) -> Result<()> {
         self.sync_with(parse_peer_addrs(node_ids)).await
     }
 
     /// Import `ticket`'s namespace, start syncing, make it active.
     pub async fn join(&mut self, ticket: DocTicket) -> Result<NamespaceId> {
-        self.peers.extend(ticket.nodes.iter().map(|a| a.id));
+        for a in &ticket.nodes {
+            remember_peer(&self.peers, a.id);
+        }
         let (doc, _events) = self.docs.api().import_and_subscribe(ticket).await?;
         let id = doc.id();
         self.doc = Some(doc);
@@ -488,12 +493,14 @@ impl Node {
     }
 
     /// Download a blob from the known peers. The docs live engine can miss a
-    /// content download and never retries; reconcile calls this on demand.
-    pub async fn fetch_blob(&self, hash: Hash) -> Result<()> {
-        anyhow::ensure!(!self.peers.is_empty(), "no peers to fetch {hash} from");
+    /// content download and never retries; [`blob`](Self::blob) calls this on
+    /// demand.
+    async fn fetch_blob(&self, hash: Hash) -> Result<()> {
+        let peers = self.peers.lock().clone();
+        anyhow::ensure!(!peers.is_empty(), "no peers to fetch {hash} from");
         self.blobs
             .downloader(&self.endpoint)
-            .download(hash, Shuffled::new(self.peers.clone()))
+            .download(hash, Shuffled::new(peers))
             .await?;
         Ok(())
     }
@@ -514,9 +521,44 @@ impl Node {
             .await
     }
 
-    /// Live event stream for the active namespace; drives the exporter.
-    pub async fn subscribe(&self) -> Result<impl Stream<Item = Result<LiveEvent>> + use<>> {
-        self.doc()?.subscribe().await
+    /// Wake pings for the daemon loop: one `()` per relevant remote index
+    /// event. Two iroh-docs facts stay behind this seam: the docs actor
+    /// awaits subscriber sends on bounded channels, so an unread subscription
+    /// wedges the whole store once enough events queue up — the stream is
+    /// drained immediately on a dedicated task and only the ping crosses,
+    /// over an unbounded channel; and peers seen on the live stream (gossip
+    /// neighbors, completed syncs) are recorded as content providers here,
+    /// because ticket pairing records peers on the joining side only — the
+    /// issuer starts empty and depends on this for [`blob`](Self::blob)
+    /// recovery and resync.
+    pub async fn signals(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<()>> {
+        let events = self.doc()?.subscribe().await?;
+        if let Err(e) = self.load_persisted_peers().await {
+            eprintln!("ssync: loading persisted peers: {e:#}");
+        }
+        let peers = Arc::clone(&self.peers);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut events = std::pin::pin!(events);
+            while let Some(ev) = events.next().await {
+                let relevant = match ev {
+                    Ok(LiveEvent::InsertRemote { .. }) | Ok(LiveEvent::ContentReady { .. }) => true,
+                    Ok(LiveEvent::NeighborUp(peer)) => {
+                        remember_peer(&peers, peer);
+                        true
+                    }
+                    Ok(LiveEvent::SyncFinished(e)) if e.result.is_ok() => {
+                        remember_peer(&peers, e.peer);
+                        true
+                    }
+                    _ => false,
+                };
+                if relevant && tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     /// Store `data` as a blob and set it as this author's entry for `key` —
@@ -542,6 +584,20 @@ impl Node {
     pub async fn get_blob(&self, hash: Hash) -> Result<Vec<u8>> {
         let bytes = self.blobs.blobs().get_bytes(hash).await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Ciphertext for `hash`, recovering from a missed live download:
+    /// iroh-docs never retries a missed content download (iroh-docs#88), so a
+    /// local miss falls back to an explicit bounded fetch from the known
+    /// peers.
+    pub async fn blob(&self, hash: Hash) -> Result<Vec<u8>> {
+        if let Ok(bytes) = self.get_blob(hash).await {
+            return Ok(bytes);
+        }
+        tokio::time::timeout(FETCH_TIMEOUT, self.fetch_blob(hash))
+            .await
+            .with_context(|| format!("fetching {hash} from peers timed out"))??;
+        self.get_blob(hash).await
     }
 
     /// Delete this node's entry for `key` (append-only tombstone that syncs).
@@ -867,6 +923,72 @@ mod tests {
         assert_eq!(paths.len(), 1, "duplicate peer entries must be deduped");
         assert_eq!(paths[0].kind, PathKind::Unknown);
         node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blob_fetches_missed_download_from_peers() {
+        let (da, db) = (tempdir("blob-fetch-a"), tempdir("blob-fetch-b"));
+        let mut a = Node::spawn(&da, SecretKey::generate()).await.unwrap();
+        let mut b = Node::spawn(&db, SecretKey::generate()).await.unwrap();
+        let secret = generate_key_bytes();
+        a.open_shared_namespace(secret).await.unwrap();
+        b.open_shared_namespace(secret).await.unwrap();
+        // model iroh-docs' missed live download (never retried upstream):
+        // index entries sync, content does not
+        b.disable_auto_download().await.unwrap();
+        let (addr_a, addr_b) = (a.endpoint_addr(), b.endpoint_addr());
+        a.sync_with(vec![addr_b]).await.unwrap();
+        b.sync_with(vec![addr_a]).await.unwrap();
+        let hash = a.publish("pi/p/s", b"ciphertext".to_vec()).await.unwrap();
+        let mut seen = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if b.index_record("pi/p/s").await.unwrap().is_some() {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "index entry never synced to b");
+        assert!(
+            b.get_blob(hash).await.is_err(),
+            "content must be missing before recovery"
+        );
+        assert_eq!(b.blob(hash).await.unwrap(), b"ciphertext".to_vec());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signals_ping_on_remote_insert_and_learn_peer() {
+        // a models the ticket-issuer side: it records no peers itself and must
+        // learn b from the live stream so fetch recovery and resync work.
+        let (da, db) = (tempdir("signals-a"), tempdir("signals-b"));
+        let mut a = Node::spawn(&da, SecretKey::generate()).await.unwrap();
+        let mut b = Node::spawn(&db, SecretKey::generate()).await.unwrap();
+        a.create_namespace().await.unwrap();
+        let mut signals = a.signals().await.unwrap();
+        let id_b = b.endpoint_addr().id;
+        // the prod issuer flow: b joins via ticket (recording a as its peer);
+        // a records nothing itself and must learn b from the live stream.
+        let ticket = a.share().await.unwrap();
+        b.join(ticket).await.unwrap();
+        b.publish("pi/p/s", b"ciphertext".to_vec()).await.unwrap();
+        let ping = tokio::time::timeout(std::time::Duration::from_secs(30), signals.recv()).await;
+        assert!(
+            matches!(ping, Ok(Some(()))),
+            "no wake ping for remote insert"
+        );
+        let mut learned = false;
+        for _ in 0..60 {
+            if a.peer_paths().await.iter().any(|p| p.id == id_b) {
+                learned = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        assert!(learned, "issuer never learned the joining peer");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     const GC_TEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
