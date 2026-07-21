@@ -7,7 +7,7 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use ssync_core::Config;
 
-/// Hardening shared with the NixOS and Home Manager modules.
+/// Hardening shared with the NixOS and Home Manager modules (DECISIONS §12).
 pub(crate) const HARDENING: &str = "\
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -40,12 +40,13 @@ UMask=0077
 ";
 
 /// Values resolved by the lifecycle before command-specific unit rendering.
-pub(crate) struct InstallContext {
-    pub exec: PathBuf,
-    pub config_path: PathBuf,
-    pub user: Option<String>,
+pub(crate) struct InstallContext<'a> {
+    pub exec: &'a Path,
+    pub config_path: &'a Path,
+    pub user: Option<&'a str>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct UnitFile {
     pub name: &'static str,
     pub contents: String,
@@ -58,10 +59,27 @@ pub(crate) struct UnitSet {
     pub activation: Activation,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Activation {
     Restart(&'static str),
     EnableNow(&'static str),
+}
+
+impl Activation {
+    fn control_steps(self) -> [Option<SystemctlStep>; 3] {
+        match self {
+            Self::Restart(name) => [
+                Some(SystemctlStep::DaemonReload),
+                Some(SystemctlStep::Enable(name)),
+                Some(SystemctlStep::Restart(name)),
+            ],
+            Self::EnableNow(name) => [
+                Some(SystemctlStep::DaemonReload),
+                Some(SystemctlStep::EnableNow(name)),
+                None,
+            ],
+        }
+    }
 }
 
 pub(crate) struct InstallResult {
@@ -69,13 +87,14 @@ pub(crate) struct InstallResult {
     pub user_mode: bool,
 }
 
-pub(crate) enum RemoveResult {
-    Missing(PathBuf),
-    Removed(PathBuf),
+pub(crate) struct RemoveSpec<'a> {
+    pub primary: &'static str,
+    pub files: &'a [&'static str],
+    pub missing_action: &'static str,
 }
 
 /// Refuse a value a unit file cannot carry verbatim: systemd expands `%`
-/// specifiers, splits path lists on whitespace, and interprets quotes/slashes.
+/// specifiers, splits path lists on whitespace, and interprets quotes/backslashes.
 pub(crate) fn ensure_unit_safe(value: &str, what: &str) -> Result<()> {
     ensure!(
         !value.contains(['%', '"', '\\']) && !value.chars().any(|c| c.is_whitespace()),
@@ -90,7 +109,7 @@ pub(crate) fn install(
     config_path: &Path,
     config_explicit: bool,
     user: Option<String>,
-    render: impl FnOnce(&Config, InstallContext) -> Result<UnitSet>,
+    render: impl FnOnce(&Config, InstallContext<'_>) -> Result<UnitSet>,
 ) -> Result<InstallResult> {
     let user_mode = !is_root()?;
     ensure_install_mode(user_mode, user.as_ref(), config_explicit, config_path)?;
@@ -111,9 +130,9 @@ pub(crate) fn install(
     let units = render(
         &config,
         InstallContext {
-            exec: exec.clone(),
-            config_path: config_abs.clone(),
-            user,
+            exec: &exec,
+            config_path: &config_abs,
+            user: user.as_deref(),
         },
     )?;
 
@@ -133,28 +152,37 @@ pub(crate) fn install(
     }
 
     let unit_dir = unit_dir(user_mode)?;
-    install_units_with(
-        &unit_dir,
+    InstallPlan {
+        unit_dir: &unit_dir,
         user_mode,
-        &units.files,
-        units.activation,
-        &mut ProcessControl,
-    )?;
+        files: &units.files,
+        activation: units.activation,
+    }
+    .execute()?;
     Ok(InstallResult {
         unit_dir,
         user_mode,
     })
 }
 
-pub(crate) fn remove(primary: &str, files: &[&str]) -> Result<RemoveResult> {
+pub(crate) fn remove(spec: RemoveSpec<'_>) -> Result<PathBuf> {
     let user_mode = !is_root()?;
     let unit_dir = unit_dir(user_mode)?;
-    let primary_path = unit_dir.join(primary);
-    if !primary_path.exists() {
-        return Ok(RemoveResult::Missing(primary_path));
+    let primary_path = unit_dir.join(spec.primary);
+    ensure!(
+        primary_path.exists(),
+        "nothing to {}: {} does not exist",
+        spec.missing_action,
+        primary_path.display()
+    );
+    RemovalPlan {
+        unit_dir: &unit_dir,
+        user_mode,
+        primary: spec.primary,
+        files: spec.files,
     }
-    remove_units_with(&unit_dir, user_mode, primary, files, &mut ProcessControl)?;
-    Ok(RemoveResult::Removed(primary_path))
+    .execute()?;
+    Ok(primary_path)
 }
 
 /// Show a unit's systemd status. A non-zero `systemctl status` is still output.
@@ -163,83 +191,155 @@ pub(crate) fn show_status(name: &str) -> Result<bool> {
     if !unit_dir(user_mode)?.join(name).exists() {
         return Ok(false);
     }
-    let mut command = Command::new("systemctl");
-    if user_mode {
-        command.arg("--user");
-    }
-    command
+    systemctl_command(user_mode)
         .args(["--no-pager", "status", name])
         .status()
         .context("running systemctl (is systemd available?)")?;
     Ok(true)
 }
 
-trait UnitControl {
-    fn checked(&mut self, user_mode: bool, args: &[&str]) -> Result<()>;
+fn systemctl_command(user_mode: bool) -> Command {
+    let mut command = Command::new("systemctl");
+    if user_mode {
+        command.arg("--user");
+    }
+    command
 }
 
-struct ProcessControl;
+fn run_systemctl(user_mode: bool, args: &[&str]) -> Result<()> {
+    let status = systemctl_command(user_mode)
+        .args(args)
+        .status()
+        .context("running systemctl (is systemd available?)")?;
+    ensure!(status.success(), "systemctl {} failed", args.join(" "));
+    Ok(())
+}
 
-impl UnitControl for ProcessControl {
-    fn checked(&mut self, user_mode: bool, args: &[&str]) -> Result<()> {
-        let mut command = Command::new("systemctl");
-        if user_mode {
-            command.arg("--user");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemctlStep {
+    DaemonReload,
+    Enable(&'static str),
+    Restart(&'static str),
+    EnableNow(&'static str),
+    Stop(&'static str),
+    Disable(&'static str),
+}
+
+impl SystemctlStep {
+    fn execute(self, user_mode: bool) -> Result<()> {
+        match self {
+            Self::DaemonReload => run_systemctl(user_mode, &["daemon-reload"]),
+            Self::Enable(name) => run_systemctl(user_mode, &["enable", name]),
+            Self::Restart(name) => run_systemctl(user_mode, &["restart", name]),
+            Self::EnableNow(name) => run_systemctl(user_mode, &["enable", "--now", name]),
+            Self::Stop(name) => run_systemctl(user_mode, &["stop", name]),
+            Self::Disable(name) => run_systemctl(user_mode, &["disable", name]),
         }
-        let status = command
-            .args(args)
-            .status()
-            .context("running systemctl (is systemd available?)")?;
-        ensure!(status.success(), "systemctl {} failed", args.join(" "));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallStep<'a> {
+    Write(&'a UnitFile),
+    Control(SystemctlStep),
+}
+
+struct InstallPlan<'a> {
+    unit_dir: &'a Path,
+    user_mode: bool,
+    files: &'a [UnitFile],
+    activation: Activation,
+}
+
+impl InstallPlan<'_> {
+    fn steps(&self) -> impl Iterator<Item = InstallStep<'_>> {
+        self.files.iter().map(InstallStep::Write).chain(
+            self.activation
+                .control_steps()
+                .into_iter()
+                .flatten()
+                .map(InstallStep::Control),
+        )
+    }
+
+    fn execute(&self) -> Result<()> {
+        fs::create_dir_all(self.unit_dir)
+            .with_context(|| format!("creating {}", self.unit_dir.display()))?;
+        for step in self.steps() {
+            match step {
+                InstallStep::Write(unit) => {
+                    let path = self.unit_dir.join(unit.name);
+                    fs::write(&path, &unit.contents)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                }
+                InstallStep::Control(command) => command.execute(self.user_mode)?,
+            }
+        }
         Ok(())
     }
 }
 
-fn install_units_with(
-    unit_dir: &Path,
-    user_mode: bool,
-    files: &[UnitFile],
-    activation: Activation,
-    control: &mut impl UnitControl,
-) -> Result<()> {
-    fs::create_dir_all(unit_dir).with_context(|| format!("creating {}", unit_dir.display()))?;
-    for unit in files {
-        let path = unit_dir.join(unit.name);
-        fs::write(&path, &unit.contents).with_context(|| format!("writing {}", path.display()))?;
-    }
-
-    control.checked(user_mode, &["daemon-reload"])?;
-    match activation {
-        Activation::Restart(name) => {
-            control.checked(user_mode, &["enable", name])?;
-            control.checked(user_mode, &["restart", name])?;
-        }
-        Activation::EnableNow(name) => {
-            control.checked(user_mode, &["enable", "--now", name])?;
-        }
-    }
-    Ok(())
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalStep {
+    Control {
+        step: SystemctlStep,
+        best_effort: bool,
+    },
+    Remove(&'static str),
 }
 
-fn remove_units_with(
-    unit_dir: &Path,
+struct RemovalPlan<'a> {
+    unit_dir: &'a Path,
     user_mode: bool,
-    primary: &str,
-    files: &[&str],
-    control: &mut impl UnitControl,
-) -> Result<()> {
-    for args in [&["stop", primary][..], &["disable", primary][..]] {
-        if let Err(error) = control.checked(user_mode, args) {
+    primary: &'static str,
+    files: &'a [&'static str],
+}
+
+impl RemovalPlan<'_> {
+    fn steps(&self) -> impl Iterator<Item = RemovalStep> + '_ {
+        std::iter::once(RemovalStep::Control {
+            step: SystemctlStep::Stop(self.primary),
+            best_effort: true,
+        })
+        .chain(std::iter::once(RemovalStep::Control {
+            step: SystemctlStep::Disable(self.primary),
+            best_effort: true,
+        }))
+        .chain(self.files.iter().copied().map(RemovalStep::Remove))
+        .chain(std::iter::once(RemovalStep::Control {
+            step: SystemctlStep::DaemonReload,
+            best_effort: false,
+        }))
+    }
+
+    fn execute(&self) -> Result<()> {
+        for step in self.steps() {
+            match step {
+                RemovalStep::Control { step, best_effort } => {
+                    settle_control_result(step.execute(self.user_mode), best_effort)?;
+                }
+                RemovalStep::Remove(name) => {
+                    let path = self.unit_dir.join(name);
+                    if path.exists() {
+                        fs::remove_file(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn settle_control_result(result: Result<()>, best_effort: bool) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if best_effort => {
             eprintln!("ssync: {error}");
+            Ok(())
         }
+        Err(error) => Err(error),
     }
-    for name in files {
-        let path = unit_dir.join(name);
-        if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        }
-    }
-    control.checked(user_mode, &["daemon-reload"])
 }
 
 fn ensure_install_mode(
@@ -403,30 +503,7 @@ fn create_write_paths(paths: &[PathBuf], owner: Option<&ServiceUser>) -> Result<
 mod tests {
     use std::path::PathBuf;
 
-    use anyhow::{Result, anyhow};
-
     use super::*;
-
-    #[derive(Default)]
-    struct RecordingControl {
-        calls: Vec<(bool, Vec<String>)>,
-        fail_on: Option<String>,
-    }
-
-    impl UnitControl for RecordingControl {
-        fn checked(&mut self, user_mode: bool, args: &[&str]) -> Result<()> {
-            self.calls.push((
-                user_mode,
-                args.iter().map(|arg| (*arg).to_string()).collect(),
-            ));
-            if let Some(needle) = self.fail_on.as_deref()
-                && args.join(" ") == needle
-            {
-                return Err(anyhow!("injected {needle} failure"));
-            }
-            Ok(())
-        }
-    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ssync-systemd-{tag}-{}", std::process::id()));
@@ -435,49 +512,45 @@ mod tests {
         dir
     }
 
-    fn calls(control: &RecordingControl) -> Vec<(bool, Vec<&str>)> {
-        control
-            .calls
-            .iter()
-            .map(|(user, args)| (*user, args.iter().map(String::as_str).collect()))
-            .collect()
-    }
-
     #[test]
-    fn restart_install_writes_units_then_runs_exact_control_sequence() {
+    fn restart_install_orders_writes_before_control() {
         let dir = scratch("restart");
         let files = [UnitFile {
             name: "ssync.service",
             contents: "daemon unit\n".into(),
         }];
-        let mut control = RecordingControl::default();
-
-        install_units_with(
-            &dir,
-            true,
-            &files,
-            Activation::Restart("ssync.service"),
-            &mut control,
-        )
-        .unwrap();
+        let plan = InstallPlan {
+            unit_dir: &dir,
+            user_mode: true,
+            files: &files,
+            activation: Activation::Restart("ssync.service"),
+        };
 
         assert_eq!(
-            fs::read_to_string(dir.join("ssync.service")).unwrap(),
-            "daemon unit\n"
-        );
-        assert_eq!(
-            calls(&control),
+            plan.steps().collect::<Vec<_>>(),
             vec![
-                (true, vec!["daemon-reload"]),
-                (true, vec!["enable", "ssync.service"]),
-                (true, vec!["restart", "ssync.service"]),
+                InstallStep::Write(&files[0]),
+                InstallStep::Control(SystemctlStep::DaemonReload),
+                InstallStep::Control(SystemctlStep::Enable("ssync.service")),
+                InstallStep::Control(SystemctlStep::Restart("ssync.service")),
             ]
         );
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn timer_install_writes_both_units_before_enable_now() {
+    fn systemctl_command_scopes_only_user_mode() {
+        let command = systemctl_command(true);
+        let user_args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(user_args, vec!["--user"]);
+        assert!(systemctl_command(false).get_args().next().is_none());
+    }
+
+    #[test]
+    fn timer_install_orders_both_writes_before_enable_now() {
         let dir = scratch("timer");
         let files = [
             UnitFile {
@@ -489,66 +562,65 @@ mod tests {
                 contents: "cleanup timer\n".into(),
             },
         ];
-        let mut control = RecordingControl::default();
-
-        install_units_with(
-            &dir,
-            false,
-            &files,
-            Activation::EnableNow("ssync-cleanup.timer"),
-            &mut control,
-        )
-        .unwrap();
+        let plan = InstallPlan {
+            unit_dir: &dir,
+            user_mode: false,
+            files: &files,
+            activation: Activation::EnableNow("ssync-cleanup.timer"),
+        };
 
         assert_eq!(
-            fs::read_to_string(dir.join("ssync-cleanup.service")).unwrap(),
-            "cleanup service\n"
-        );
-        assert_eq!(
-            fs::read_to_string(dir.join("ssync-cleanup.timer")).unwrap(),
-            "cleanup timer\n"
-        );
-        assert_eq!(
-            calls(&control),
+            plan.steps().collect::<Vec<_>>(),
             vec![
-                (false, vec!["daemon-reload"]),
-                (false, vec!["enable", "--now", "ssync-cleanup.timer"]),
+                InstallStep::Write(&files[0]),
+                InstallStep::Write(&files[1]),
+                InstallStep::Control(SystemctlStep::DaemonReload),
+                InstallStep::Control(SystemctlStep::EnableNow("ssync-cleanup.timer")),
             ]
         );
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn removal_continues_after_stop_failure_and_reloads() {
+    fn removal_plan_keeps_stop_and_disable_best_effort() {
         let dir = scratch("remove");
-        for name in ["ssync-cleanup.service", "ssync-cleanup.timer"] {
-            fs::write(dir.join(name), name).unwrap();
-        }
-        let mut control = RecordingControl {
-            fail_on: Some("stop ssync-cleanup.timer".into()),
-            ..Default::default()
+        let plan = RemovalPlan {
+            unit_dir: &dir,
+            user_mode: false,
+            primary: "ssync-cleanup.timer",
+            files: &["ssync-cleanup.timer", "ssync-cleanup.service"],
         };
 
-        remove_units_with(
-            &dir,
-            false,
-            "ssync-cleanup.timer",
-            &["ssync-cleanup.timer", "ssync-cleanup.service"],
-            &mut control,
-        )
-        .unwrap();
-
-        assert!(!dir.join("ssync-cleanup.timer").exists());
-        assert!(!dir.join("ssync-cleanup.service").exists());
         assert_eq!(
-            calls(&control),
+            plan.steps().collect::<Vec<_>>(),
             vec![
-                (false, vec!["stop", "ssync-cleanup.timer"]),
-                (false, vec!["disable", "ssync-cleanup.timer"]),
-                (false, vec!["daemon-reload"]),
+                RemovalStep::Control {
+                    step: SystemctlStep::Stop("ssync-cleanup.timer"),
+                    best_effort: true,
+                },
+                RemovalStep::Control {
+                    step: SystemctlStep::Disable("ssync-cleanup.timer"),
+                    best_effort: true,
+                },
+                RemovalStep::Remove("ssync-cleanup.timer"),
+                RemovalStep::Remove("ssync-cleanup.service"),
+                RemovalStep::Control {
+                    step: SystemctlStep::DaemonReload,
+                    best_effort: false,
+                },
             ]
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removal_control_failures_obey_step_policy() {
+        let best_effort = settle_control_result(Err(anyhow::anyhow!("stop failed")), true);
+        assert!(best_effort.is_ok());
+
+        let required =
+            settle_control_result(Err(anyhow::anyhow!("reload failed")), false).unwrap_err();
+        assert_eq!(required.to_string(), "reload failed");
     }
 
     #[test]

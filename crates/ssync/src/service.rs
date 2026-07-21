@@ -6,29 +6,29 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use ssync_core::Config;
 
 use crate::systemd::{
-    self, Activation, HARDENING, RemoveResult, UnitFile, UnitSet, ensure_unit_safe,
+    self, Activation, HARDENING, RemoveSpec, UnitFile, UnitSet, ensure_unit_safe,
 };
 
 /// Everything that varies between the user-mode and system-mode unit.
-pub struct ServiceSpec {
+pub struct ServiceSpec<'a> {
     /// Absolute path of the ssync binary to run.
-    pub exec: PathBuf,
+    pub exec: &'a Path,
     /// Config file the daemon runs with (embedded in `ExecStart`).
-    pub config_path: PathBuf,
+    pub config_path: &'a Path,
     /// Dirs the sandbox may write: the agents' session dirs plus `data_dir`.
     pub read_write_paths: Vec<PathBuf>,
     /// `PATH` for the daemon: the install-time dirs of `age`/`age-keygen`
     /// plus the distro defaults (what the nix package's wrapper does).
     pub path: String,
     /// `Some(name)` renders a system unit with `User=`; `None` a user unit.
-    pub user: Option<String>,
+    pub user: Option<&'a str>,
 }
 
-pub fn validate_spec(spec: &ServiceSpec) -> Result<()> {
+pub fn validate_spec(spec: &ServiceSpec<'_>) -> Result<()> {
     let check = ensure_unit_safe;
     check(&spec.exec.display().to_string(), "binary path")?;
     check(&spec.config_path.display().to_string(), "config path")?;
@@ -43,7 +43,7 @@ pub fn validate_spec(spec: &ServiceSpec) -> Result<()> {
 }
 
 /// Render the full `ssync.service` unit text for a spec.
-pub fn render_unit(spec: &ServiceSpec) -> String {
+pub fn render_unit(spec: &ServiceSpec<'_>) -> String {
     // system units pull network-online.target in; user managers don't have it,
     // so a user unit only orders after it if something else provides it.
     let wants = if spec.user.is_some() {
@@ -51,11 +51,7 @@ pub fn render_unit(spec: &ServiceSpec) -> String {
     } else {
         ""
     };
-    let user = spec
-        .user
-        .as_deref()
-        .map(|u| format!("User={u}\n"))
-        .unwrap_or_default();
+    let user = spec.user.map(|u| format!("User={u}\n")).unwrap_or_default();
     let wanted_by = if spec.user.is_some() {
         "multi-user.target"
     } else {
@@ -149,17 +145,18 @@ pub fn cmd_service_install(
         let spec = ServiceSpec {
             exec: context.exec,
             config_path: context.config_path,
-            read_write_paths: write_paths.clone(),
+            read_write_paths: write_paths,
             path,
             user: context.user,
         };
         validate_spec(&spec)?;
+        let contents = render_unit(&spec);
         Ok(UnitSet {
             files: vec![UnitFile {
                 name: UNIT_NAME,
-                contents: render_unit(&spec),
+                contents,
             }],
-            write_paths,
+            write_paths: spec.read_write_paths,
             required_executables: age_bins,
             activation: Activation::Restart(UNIT_NAME),
         })
@@ -190,31 +187,29 @@ pub fn cmd_service_install(
 }
 
 pub fn cmd_service_uninstall() -> Result<()> {
-    match systemd::remove(UNIT_NAME, &[UNIT_NAME])? {
-        RemoveResult::Missing(path) => {
-            bail!("nothing to uninstall: {} does not exist", path.display())
-        }
-        RemoveResult::Removed(path) => {
-            println!("removed {}", path.display());
-            Ok(())
-        }
-    }
+    let path = systemd::remove(RemoveSpec {
+        primary: UNIT_NAME,
+        files: &[UNIT_NAME],
+        missing_action: "uninstall",
+    })?;
+    println!("removed {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn spec(user: Option<&str>) -> ServiceSpec {
+    fn spec(user: Option<&'static str>) -> ServiceSpec<'static> {
         ServiceSpec {
-            exec: PathBuf::from("/opt/bin/ssync"),
-            config_path: PathBuf::from("/home/alice/.config/ssync/config.toml"),
+            exec: Path::new("/opt/bin/ssync"),
+            config_path: Path::new("/home/alice/.config/ssync/config.toml"),
             read_write_paths: vec![
                 PathBuf::from("/home/alice/.pi/agent/sessions"),
                 PathBuf::from("/home/alice/.local/share/ssync"),
             ],
             path: "/opt/agedir:/usr/local/bin:/usr/bin:/bin".into(),
-            user: user.map(String::from),
+            user,
         }
     }
 
@@ -295,7 +290,7 @@ mod tests {
         assert!(validate_spec(&s).is_err());
         // `%` is a specifier in every interpolated setting
         let mut s = spec(None);
-        s.exec = PathBuf::from("/opt/%i/ssync");
+        s.exec = Path::new("/opt/%i/ssync");
         assert!(validate_spec(&s).is_err());
         // `"` terminates the template's own quoting
         let mut s = spec(None);

@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::systemd::{
-    self, Activation, HARDENING, RemoveResult, UnitFile, UnitSet, ensure_unit_safe,
+    self, Activation, HARDENING, RemoveSpec, UnitFile, UnitSet, ensure_unit_safe,
 };
 
 const SERVICE_NAME: &str = "ssync-cleanup.service";
@@ -55,22 +55,22 @@ pub fn schedule_of(every: &str) -> Result<Schedule> {
 }
 
 /// Everything that varies between the user-mode and system-mode unit pair.
-pub struct TimerSpec {
+pub struct TimerSpec<'a> {
     /// Absolute path of the ssync binary to run.
-    pub exec: PathBuf,
+    pub exec: &'a Path,
     /// Config file cleanup runs with (embedded in `ExecStart`).
-    pub config_path: PathBuf,
+    pub config_path: &'a Path,
     /// Extra `cleanup` arguments (`--keep 90d`, `--unnamed`, `--agent pi`);
     /// every token already validated unit-safe.
     pub cleanup_args: Vec<String>,
     /// The agents' session dirs — all the sandbox may write.
     pub session_dirs: Vec<PathBuf>,
     /// `Some(name)` renders a system unit with `User=`; `None` a user unit.
-    pub user: Option<String>,
+    pub user: Option<&'a str>,
     pub schedule: Schedule,
 }
 
-pub fn validate_spec(spec: &TimerSpec) -> Result<()> {
+pub fn validate_spec(spec: &TimerSpec<'_>) -> Result<()> {
     ensure_unit_safe(&spec.exec.display().to_string(), "binary path")?;
     ensure_unit_safe(&spec.config_path.display().to_string(), "config path")?;
     for a in &spec.cleanup_args {
@@ -95,12 +95,8 @@ pub fn validate_spec(spec: &TimerSpec) -> Result<()> {
 /// Render `ssync-cleanup.service`: a oneshot under the same hardening set as
 /// the daemon unit, sandboxed to the session dirs (cleanup only deletes local
 /// files; the running daemon tombstones and propagates).
-pub fn render_service(spec: &TimerSpec) -> String {
-    let user = spec
-        .user
-        .as_deref()
-        .map(|u| format!("User={u}\n"))
-        .unwrap_or_default();
+pub fn render_service(spec: &TimerSpec<'_>) -> String {
+    let user = spec.user.map(|u| format!("User={u}\n")).unwrap_or_default();
     let args = spec
         .cleanup_args
         .iter()
@@ -129,7 +125,7 @@ pub fn render_service(spec: &TimerSpec) -> String {
 }
 
 /// Render `ssync-cleanup.timer`.
-pub fn render_timer(spec: &TimerSpec) -> String {
+pub fn render_timer(spec: &TimerSpec<'_>) -> String {
     let trigger = match &spec.schedule {
         Schedule::Calendar(expr) => format!("OnCalendar={expr}\nPersistent=true\n"),
         Schedule::EveryDays(n) => format!("OnBootSec=15min\nOnUnitActiveSec={n}d\n"),
@@ -224,23 +220,25 @@ pub fn cmd_enable(
                 exec: context.exec,
                 config_path: context.config_path,
                 cleanup_args,
-                session_dirs: session_dirs.clone(),
+                session_dirs,
                 user: context.user,
                 schedule,
             };
             validate_spec(&spec)?;
+            let service_contents = render_service(&spec);
+            let timer_contents = render_timer(&spec);
             Ok(UnitSet {
                 files: vec![
                     UnitFile {
                         name: SERVICE_NAME,
-                        contents: render_service(&spec),
+                        contents: service_contents,
                     },
                     UnitFile {
                         name: TIMER_NAME,
-                        contents: render_timer(&spec),
+                        contents: timer_contents,
                     },
                 ],
-                write_paths: session_dirs,
+                write_paths: spec.session_dirs,
                 required_executables: Vec::new(),
                 activation: Activation::EnableNow(TIMER_NAME),
             })
@@ -258,15 +256,13 @@ pub fn cmd_enable(
 }
 
 pub fn cmd_disable() -> Result<()> {
-    match systemd::remove(TIMER_NAME, &[TIMER_NAME, SERVICE_NAME])? {
-        RemoveResult::Missing(path) => {
-            bail!("nothing to disable: {} does not exist", path.display())
-        }
-        RemoveResult::Removed(_) => {
-            println!("removed {TIMER_NAME}");
-            Ok(())
-        }
-    }
+    systemd::remove(RemoveSpec {
+        primary: TIMER_NAME,
+        files: &[TIMER_NAME, SERVICE_NAME],
+        missing_action: "disable",
+    })?;
+    println!("removed {TIMER_NAME}");
+    Ok(())
 }
 
 pub fn cmd_status() -> Result<()> {
@@ -288,16 +284,16 @@ mod tests {
         }
     }
 
-    fn spec(schedule: Schedule, user: Option<&str>) -> TimerSpec {
+    fn spec(schedule: Schedule, user: Option<&'static str>) -> TimerSpec<'static> {
         TimerSpec {
-            exec: PathBuf::from("/usr/local/bin/ssync"),
-            config_path: PathBuf::from("/home/alice/.config/ssync/config.toml"),
+            exec: Path::new("/usr/local/bin/ssync"),
+            config_path: Path::new("/home/alice/.config/ssync/config.toml"),
             cleanup_args: vec!["--keep".into(), "90d".into()],
             session_dirs: vec![
                 PathBuf::from("/home/alice/.pi/agent/sessions"),
                 PathBuf::from("/home/alice/.omp/agent/sessions"),
             ],
-            user: user.map(String::from),
+            user,
             schedule,
         }
     }

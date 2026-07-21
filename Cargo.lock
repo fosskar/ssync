@@ -4314,7 +4314,7 @@ dependencies = [
 
 [[package]]
 name = "ssync"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4329,14 +4329,14 @@ dependencies = [
 
 [[package]]
 name = "ssync-adapters"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "ssync-core"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4351,7 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "ssync-crypto"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "age",
  "anyhow",
@@ -4360,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "ssync-net"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "anyhow",
  "bytes",
