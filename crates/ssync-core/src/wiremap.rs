@@ -13,13 +13,11 @@ use ssync_adapters::{Adapter, SessionIdentity};
 use crate::exclude;
 use crate::pathmap::{PathMap, Resolver};
 
-/// A wire-key lookup failure. The agent's tombstones are frozen for this pass
-/// (#49): a skip that read as deletion would propagate mesh-wide (same class
-/// as the #14 fix).
-pub(crate) struct KeyFailure {
-    /// First failure for this project dir — log it once.
-    pub announce: bool,
-    pub error: anyhow::Error,
+/// Result of resolving a local session to its wire key.
+pub(crate) enum KeyLookup {
+    Key(String),
+    /// Retriable per-key skip (#49); `Some` is the first announcement.
+    Skipped(Option<anyhow::Error>),
 }
 
 /// Wire key ↔ local path translation and freeze state for one engine.
@@ -84,20 +82,19 @@ impl Wiremap {
 
     /// The wire key for a local file (issue #13): translated through the path
     /// map when its project dir is mapped, today's relative path otherwise.
-    /// `Err` = unresolvable this tick; the failure freezes the agent's
-    /// tombstones for this pass and a later pass retries.
-    pub fn key_of(&mut self, id: &SessionIdentity, path: &Path) -> Result<String, KeyFailure> {
+    /// Mapping failures are retriable per-key skips (#49).
+    pub fn key_of(&mut self, id: &SessionIdentity, path: &Path) -> KeyLookup {
         let Some(idx) = self.adapter_index_of_path(path) else {
-            return Ok(index_key(id));
+            return KeyLookup::Key(index_key(id));
         };
         let rel = id.relative_path.to_string_lossy();
         match self.resolver.wire_rel(self.adapters[idx].as_ref(), &rel) {
-            Ok(None) => Ok(index_key(id)),
-            Ok(Some(mapped)) => Ok(format!("{}/{mapped}", id.agent)),
+            Ok(None) => KeyLookup::Key(index_key(id)),
+            Ok(Some(mapped)) => KeyLookup::Key(format!("{}/{mapped}", id.agent)),
             Err(error) => {
                 let dir = path.parent().unwrap_or(path).to_path_buf();
-                let announce = self.resolver.note_failure(&id.agent, dir);
-                Err(KeyFailure { announce, error })
+                let announcement = self.resolver.note_failure(&id.agent, dir).then_some(error);
+                KeyLookup::Skipped(announcement)
             }
         }
     }
@@ -110,25 +107,19 @@ impl Wiremap {
         key: &str,
         plaintext: Vec<u8>,
     ) -> Result<Option<(PathBuf, Vec<u8>)>> {
-        let Some(idx) = self.adapter_index_of_key(key) else {
+        let Some((idx, rel)) = self.key_parts(key) else {
             return Ok(None);
         };
         let adapter = self.adapters[idx].as_ref();
-        let Some(rel) = key
-            .strip_prefix(adapter.agent())
-            .and_then(|r| r.strip_prefix('/'))
-        else {
-            return Ok(None);
-        };
         self.resolver.localize(adapter, rel, plaintext)
     }
 
-    /// [`dest_of`](Self::dest_of) through the path map (for actions without
-    /// plaintext in hand: DeleteLocal). `None` = nothing local to touch.
+    /// Local destination through the path map for actions without plaintext
+    /// in hand (DeleteLocal). `None` = nothing local to touch.
     pub fn local_dest_of(&self, key: &str) -> Option<PathBuf> {
-        let adapter = self.adapter_of_key(key)?;
-        let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
-        self.resolver.local_dest_of(adapter, rel)
+        let (idx, rel) = self.key_parts(key)?;
+        self.resolver
+            .local_dest_of(self.adapters[idx].as_ref(), rel)
     }
 
     /// The wire form of a local file's bytes: header cwd mapped to canonical
@@ -147,48 +138,39 @@ impl Wiremap {
         self.adapter_of_key(key).map(|a| a.session_root())
     }
 
-    /// The absolute session-dir path an index key maps to on this machine
-    /// (unmapped), or `None` when no configured adapter owns the key.
-    pub fn dest_of(&self, key: &str) -> Option<PathBuf> {
-        let adapter = self.adapter_of_key(key)?;
-        let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
-        Some(adapter.session_root().join(rel))
-    }
-
     /// Decode an index key back to its session-root-relative path (the
     /// inverse of the key encoding): strip the `{agent}/` prefix of a
     /// configured adapter.
     pub fn relative_of<'a>(&self, key: &'a str) -> Option<&'a str> {
-        let adapter = self.adapter_of_key(key)?;
-        key.strip_prefix(adapter.agent())?.strip_prefix('/')
+        self.key_parts(key).map(|(_, rel)| rel)
     }
 
     /// The session identity an index key resolves to on this machine, if a
     /// configured adapter can parse its destination path.
     pub fn session_identity_of_key(&self, key: &str) -> Option<SessionIdentity> {
-        self.dest_of(key)
-            .and_then(|dest| self.adapter_of_key(key)?.identify(&dest).ok())
+        let (idx, rel) = self.key_parts(key)?;
+        let adapter = self.adapters[idx].as_ref();
+        adapter.identify(&adapter.session_root().join(rel)).ok()
     }
 
     /// Whether a key falls under its agent's `exclude` patterns (issue #14).
     /// Filtered out of BOTH reconcile inputs, so the key is frozen: never
     /// imported, exported, tombstoned, or merged — here or on write-back.
     pub fn excluded(&self, key: &str) -> bool {
-        let Some(adapter) = self.adapter_of_key(key) else {
+        let Some((idx, rel)) = self.key_parts(key) else {
             return false;
         };
-        let Some(patterns) = self.excludes.get(adapter.agent()) else {
-            return false;
-        };
-        self.relative_of(key)
-            .is_some_and(|rel| exclude::is_excluded(patterns, rel))
+        self.excluded_parts(self.adapters[idx].agent(), rel)
     }
 
     /// Whether a key is invisible to reconcile: excluded (#14) or owned by no
     /// configured adapter (dropped-agent guard — a removed `[[agents]]` entry
     /// must never tombstone peers' sessions).
     pub fn frozen(&self, key: &str) -> bool {
-        self.adapter_of_key(key).is_none() || self.excluded(key)
+        let Some((idx, rel)) = self.key_parts(key) else {
+            return true;
+        };
+        self.excluded_parts(self.adapters[idx].agent(), rel)
     }
 
     /// Whether a tombstone for this key must be withheld this pass: its
@@ -208,8 +190,8 @@ impl Wiremap {
     /// The adapter owning an index key (matching `{agent}/` prefix), if any —
     /// peers may sync agents this node does not have configured.
     fn adapter_of_key(&self, key: &str) -> Option<&dyn Adapter> {
-        self.adapter_index_of_key(key)
-            .map(|i| self.adapters[i].as_ref())
+        let (idx, _) = self.key_parts(key)?;
+        Some(self.adapters[idx].as_ref())
     }
 
     /// The adapter whose session root contains `path`.
@@ -224,11 +206,18 @@ impl Wiremap {
             .position(|a| path.starts_with(a.session_root()))
     }
 
-    fn adapter_index_of_key(&self, key: &str) -> Option<usize> {
-        self.adapters.iter().position(|a| {
-            key.strip_prefix(a.agent())
-                .is_some_and(|r| r.starts_with('/'))
+    fn key_parts<'a>(&self, key: &'a str) -> Option<(usize, &'a str)> {
+        self.adapters.iter().enumerate().find_map(|(idx, adapter)| {
+            key.strip_prefix(adapter.agent())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|rel| (idx, rel))
         })
+    }
+
+    fn excluded_parts(&self, agent: &str, rel: &str) -> bool {
+        self.excludes
+            .get(agent)
+            .is_some_and(|patterns| exclude::is_excluded(patterns, rel))
     }
 }
 
@@ -290,9 +279,11 @@ mod tests {
         let root = scratch("roundtrip");
         let mut wm = pi_map(&root);
         let rel = "--proj--/s.jsonl";
-        let key = wm.key_of(&id("pi", rel), &root.join(rel)).ok().unwrap();
+        let KeyLookup::Key(key) = wm.key_of(&id("pi", rel), &root.join(rel)) else {
+            panic!("key lookup skipped");
+        };
         assert_eq!(key, format!("pi/{rel}"));
-        assert_eq!(wm.dest_of(&key), Some(root.join(rel)));
+        assert_eq!(wm.local_dest_of(&key), Some(root.join(rel)));
         assert_eq!(wm.relative_of(&key), Some(rel));
     }
 
@@ -318,7 +309,7 @@ mod tests {
         let wm = pi_map(&root);
         assert!(wm.frozen("ghost/--proj--/s.jsonl"));
         assert!(!wm.frozen("pi/--proj--/s.jsonl"));
-        assert_eq!(wm.dest_of("ghost/--proj--/s.jsonl"), None);
+        assert_eq!(wm.local_dest_of("ghost/--proj--/s.jsonl"), None);
     }
 
     #[test]
@@ -337,11 +328,15 @@ mod tests {
         let path = root.join(rel);
 
         wm.begin_pass();
-        let first = wm.key_of(&sid, &path).err().unwrap();
-        assert!(first.announce, "first failure logs");
+        let KeyLookup::Skipped(first) = wm.key_of(&sid, &path) else {
+            panic!("mapping unexpectedly succeeded");
+        };
+        assert!(first.is_some(), "first failure logs");
         assert!(wm.tombstone_withheld("pi/--proj--/other.jsonl"));
-        let second = wm.key_of(&sid, &path).err().unwrap();
-        assert!(!second.announce, "repeat failure stays quiet");
+        let KeyLookup::Skipped(second) = wm.key_of(&sid, &path) else {
+            panic!("mapping unexpectedly succeeded");
+        };
+        assert!(second.is_none(), "repeat failure stays quiet");
         // the freeze lasts one pass; the log-once memory does not reset
         wm.begin_pass();
         assert!(!wm.tombstone_withheld("pi/--proj--/other.jsonl"));

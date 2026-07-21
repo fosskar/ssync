@@ -27,7 +27,7 @@ use divergence::{Divergence, Verdict};
 pub use pathmap::PathMap;
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 pub use status::{PeerStatus, StatusReport};
-use wiremap::Wiremap;
+use wiremap::{KeyLookup, Wiremap};
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
 /// its supervisor restarts it with a fresh mount namespace.
@@ -307,13 +307,10 @@ impl Engine {
                 }
             };
             let key = match self.wiremap.key_of(&id, &path) {
-                Ok(k) => k,
-                Err(f) => {
-                    // an unresolvable mapping FREEZES the agent's tombstones
-                    // this pass (#49), recorded inside the wiremap: a skip
-                    // that read as deletion would propagate mesh-wide
-                    if f.announce {
-                        eprintln!("ssync: skipping {}: {:#}", path.display(), f.error);
+                KeyLookup::Key(key) => key,
+                KeyLookup::Skipped(announcement) => {
+                    if let Some(error) = announcement {
+                        eprintln!("ssync: skipping {}: {error:#}", path.display());
                     }
                     continue;
                 }
@@ -332,9 +329,6 @@ impl Engine {
         let mut out = std::collections::HashMap::new();
         for rec in self.node.index_records().await? {
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            // No adapter = frozen, exactly like an excluded key: a dropped
-            // `[[agents]]` entry must never tombstone peers' sessions (the
-            // key would read as "materialised here, now gone").
             if self.wiremap.frozen(&key) {
                 continue;
             }
@@ -384,8 +378,6 @@ impl Engine {
         };
         let mut changed = false;
         for action in reconcile(&self.state, &local, &index) {
-            // withhold tombstones for agents whose mapping failed this pass:
-            // the "file gone" reading is an artifact of the skip, not a delete
             if let Action::Tombstone { key } = &action
                 && self.wiremap.tombstone_withheld(key)
             {
@@ -717,11 +709,9 @@ mod tests {
         assert!(!engine.tick_once().await, "second tick must be a no-op");
 
         let id = engine.wiremap.identify(&session_path).unwrap();
-        let key = engine
-            .wiremap
-            .key_of(&id, &session_path)
-            .map_err(|f| f.error)
-            .unwrap();
+        let KeyLookup::Key(key) = engine.wiremap.key_of(&id, &session_path) else {
+            panic!("session key lookup skipped");
+        };
         let rec = engine
             .node
             .index_record(key)
