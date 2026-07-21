@@ -1,12 +1,12 @@
 //! Regression: a large initial import must not deadlock the daemon.
 //!
 //! iroh-docs delivers replica events to subscribers over bounded channels and
-//! the docs actor *awaits* those sends. `Engine::run` subscribes but reads no
-//! events while `step` runs, so a big enough publish flood (local inserts +
-//! remote inserts, ~1100 events) filled every buffer and wedged the actor —
-//! the daemon then hung forever mid-initial-import (seen in prod on every
-//! boot with ~560 sessions per side). The fix drains the subscription on a
-//! dedicated task so the channel never backs up.
+//! the docs actor *awaits* those sends. The daemon reads no events while
+//! `step` runs, so a big enough publish flood (local inserts + remote
+//! inserts, ~1100 events) filled every buffer and wedged the actor — the
+//! daemon then hung forever mid-initial-import (seen in prod on every boot
+//! with ~560 sessions per side). The fix drains the subscription on a
+//! dedicated task (now inside `Node::signals`) so the channel never backs up.
 
 mod harness;
 
