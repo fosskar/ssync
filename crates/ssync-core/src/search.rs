@@ -42,7 +42,7 @@ pub fn search(adapters: &[Box<dyn Adapter>], query: &str, agent: Option<&str>) -
         if agent.is_some_and(|a| a != adapter.agent()) {
             continue;
         }
-        for path in crate::session_files(adapter.session_root(), adapter.as_ref()) {
+        for path in crate::wiremap::session_files(adapter.session_root(), adapter.as_ref()) {
             let Ok(id) = adapter.identify(&path) else {
                 continue;
             };

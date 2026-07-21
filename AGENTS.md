@@ -25,6 +25,11 @@ Impure shell around pure decision cores:
 - Each tick: `local_snapshot` + `index_snapshot` → pure `reconcile()` → `Vec<Action>`
   {Import, WriteFile, DeleteLocal, Tombstone, Merge} → execute → settle into `SyncState`
   (atomic temp+rename to `data_dir/state.toml`).
+- The `Wiremap` (ssync-core `wiremap.rs`) owns the adapters, the per-agent excludes, and
+  the path-map resolver: every wire-key ↔ local-path translation and every freeze verdict
+  (excluded key #14, dropped-agent guard, failed mapping #49) lives behind it — Engine
+  never touches adapters directly, and the freeze invariants are unit-tested there
+  without iroh.
 - Import path: file → age-encrypt (subprocess) → `Node::publish` (blob + index entry keyed
   `{agent}/{relative_path}`; the ONLY write path — temp-tag prevents the GC race).
 - Export path: index entry → `Node::blob` (local miss → bounded fetch from peers behind

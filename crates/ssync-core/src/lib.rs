@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use notify::{RecursiveMode, Watcher};
-use ssync_adapters::{Adapter, SessionIdentity};
+use ssync_adapters::Adapter;
 use ssync_crypto::AgeIdentity;
 use ssync_net::Node;
 
@@ -21,12 +21,13 @@ mod pathmap;
 mod reconcile;
 pub mod search;
 mod status;
+mod wiremap;
 pub use config::{AgentConfig, Config, Discovery, insert_cluster_path};
 use divergence::{Divergence, Verdict};
 pub use pathmap::PathMap;
-use pathmap::Resolver;
 use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
 pub use status::{PeerStatus, StatusReport};
+use wiremap::{KeyLookup, Wiremap};
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
 /// its supervisor restarts it with a fresh mount namespace.
@@ -35,7 +36,7 @@ const PERSIST_WEDGE_THRESHOLD: u32 = 5;
 /// The sync engine for one node: one or more agent adapters (pi, omp, ...)
 /// sharing a single index namespace, partitioned by the `{agent}/` key prefix.
 pub struct Engine {
-    adapters: Vec<Box<dyn Adapter>>,
+    wiremap: Wiremap,
     identity: AgeIdentity,
     node: Node,
     /// What we last materialised per key; feeds [`reconcile`].
@@ -66,11 +67,6 @@ pub struct Engine {
     rotation_pending: bool,
     /// Import failures in the current pass; a rotation only settles at zero.
     import_errors: usize,
-    /// Per-agent session exclusion patterns (issue #14); a matching key is
-    /// invisible to reconcile from both sides, freezing it everywhere.
-    excludes: std::collections::HashMap<String, Vec<String>>,
-    /// Wire↔local path-map translation (issue #13, map #42); default = inert.
-    resolver: Resolver,
 }
 
 impl Engine {
@@ -85,7 +81,7 @@ impl Engine {
     ) -> Self {
         let recipients_fp = Hash::new(identity.recipients().join("\n")).to_string();
         Self {
-            adapters,
+            wiremap: Wiremap::new(adapters),
             identity,
             node,
             state: SyncState::default(),
@@ -99,8 +95,6 @@ impl Engine {
             recipients_fp,
             rotation_pending: false,
             import_errors: 0,
-            excludes: Default::default(),
-            resolver: Resolver::default(),
         }
     }
 
@@ -122,12 +116,12 @@ impl Engine {
 
     /// Per-agent `exclude` patterns from config (`[[agents]]` tables).
     pub fn set_excludes(&mut self, excludes: std::collections::HashMap<String, Vec<String>>) {
-        self.excludes = excludes;
+        self.wiremap.set_excludes(excludes);
     }
 
     /// The `[[path_map]]` + `canonical_home` from config (issue #13).
     pub fn set_path_map(&mut self, map: PathMap, canonical_home: Option<PathBuf>) {
-        self.resolver = Resolver::new(map, canonical_home);
+        self.wiremap.set_path_map(map, canonical_home);
     }
 
     /// Live index keys (wire form) — status/debug surface; the two-node
@@ -146,84 +140,6 @@ impl Engine {
         self.node.shutdown().await
     }
 
-    /// The adapter owning an index key (matching `{agent}/` prefix), if any —
-    /// peers may sync agents this node does not have configured.
-    fn adapter_of_key(&self, key: &str) -> Option<&dyn Adapter> {
-        self.adapter_index_of_key(key)
-            .map(|i| self.adapters[i].as_ref())
-    }
-
-    /// The adapter whose session root contains `path`.
-    fn adapter_of_path(&self, path: &Path) -> Option<&dyn Adapter> {
-        self.adapters
-            .iter()
-            .map(|a| a.as_ref())
-            .find(|a| path.starts_with(a.session_root()))
-    }
-
-    /// The iroh-docs index key for a session: `{agent}/{relative_path}`. The
-    /// relative path is machine-independent and carries the write-back location,
-    /// so the exporter can reconstruct where the file belongs on any peer.
-    fn index_key(&self, id: &SessionIdentity) -> String {
-        format!("{}/{}", id.agent, id.relative_path.display())
-    }
-
-    /// The wire key for a local file (issue #13): translated through the
-    /// path map when its project dir is mapped, today's relative path
-    /// otherwise. `Err` = unresolvable this tick; the caller skips the file
-    /// (logged once) and a later pass retries.
-    fn mapped_key(&mut self, id: &SessionIdentity, path: &Path) -> Result<String> {
-        let Some(idx) = self.adapter_index_of_path(path) else {
-            return Ok(self.index_key(id));
-        };
-        let rel = id.relative_path.to_string_lossy();
-        let adapter = self.adapters[idx].as_ref();
-        match self.resolver.wire_rel(adapter, &rel)? {
-            None => Ok(self.index_key(id)),
-            Some(mapped) => Ok(format!("{}/{mapped}", id.agent)),
-        }
-    }
-
-    /// Local destination + on-disk bytes for a wire key's plaintext, through
-    /// the path map. `Ok(None)` = not resolvable yet — the caller returns
-    /// false and a later tick retries.
-    fn localize(&mut self, key: &str, plaintext: Vec<u8>) -> Result<Option<(PathBuf, Vec<u8>)>> {
-        let Some(idx) = self.adapter_index_of_key(key) else {
-            return Ok(None);
-        };
-        let adapter = self.adapters[idx].as_ref();
-        let Some(rel) = key
-            .strip_prefix(adapter.agent())
-            .and_then(|r| r.strip_prefix('/'))
-        else {
-            return Ok(None);
-        };
-        self.resolver.localize(adapter, rel, plaintext)
-    }
-
-    /// [`dest_of`](Self::dest_of) through the path map (for actions without
-    /// plaintext in hand: DeleteLocal). `None` = nothing local to touch.
-    fn local_dest_of(&self, key: &str) -> Option<PathBuf> {
-        let adapter = self.adapter_of_key(key)?;
-        let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
-        self.resolver.local_dest_of(adapter, rel)
-    }
-
-    /// Index of the adapter whose session root contains `path`.
-    fn adapter_index_of_path(&self, path: &Path) -> Option<usize> {
-        self.adapters
-            .iter()
-            .position(|a| path.starts_with(a.session_root()))
-    }
-
-    /// Index of the adapter owning an index key (matching `{agent}/` prefix).
-    fn adapter_index_of_key(&self, key: &str) -> Option<usize> {
-        self.adapters.iter().position(|a| {
-            key.strip_prefix(a.agent())
-                .is_some_and(|r| r.starts_with('/'))
-        })
-    }
-
     /// Read → encrypt → blob → upsert index. Dedups on *plaintext* (age
     /// ciphertext is randomized), or the exporter's own write-back echoes.
     /// `force` (recipient-set rotation) bypasses the dedup: the plaintext is
@@ -238,7 +154,7 @@ impl Engine {
         let plaintext = tokio::fs::read(path)
             .await
             .with_context(|| format!("reading session file {}", path.display()))?;
-        let plaintext = self.canonical_plaintext(key, plaintext)?;
+        let plaintext = self.wiremap.canonical_plaintext(key, plaintext)?;
         if !force
             && let Some(w) = winner
             && self.get_plain(w).await.as_deref() == Some(&plaintext)
@@ -248,23 +164,6 @@ impl Engine {
         let ciphertext = self.identity.encrypt(&plaintext)?;
         let hash = self.node.publish(key.to_string(), ciphertext).await?;
         Ok(ImportOutcome::Published(hash))
-    }
-
-    /// The wire form of a local file's bytes: header cwd mapped to canonical
-    /// (issue #13). A machine-local path must never reach the index — an
-    /// unmappable header is a per-key error, not a pass-through (#49).
-    fn canonical_plaintext(&self, key: &str, bytes: Vec<u8>) -> Result<Vec<u8>> {
-        let Some(adapter) = self.adapter_of_key(key) else {
-            return Ok(bytes);
-        };
-        self.resolver.canonical_plaintext(adapter, bytes)
-    }
-
-    /// Identify a path via the adapter whose session root contains it.
-    fn identify(&self, path: &Path) -> Result<SessionIdentity> {
-        self.adapter_of_path(path)
-            .ok_or_else(|| anyhow!("{} is under no configured session root", path.display()))?
-            .identify(path)
     }
 
     /// The divergence verdict for a key, decrypting whatever the cache cannot
@@ -297,13 +196,10 @@ impl Engine {
                 continue; // deleted — never resurrect from stale live entries
             };
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            if self.excluded_key(&key) {
+            if self.wiremap.excluded(&key) {
                 continue; // frozen keys neither count nor report conflicts
             }
-            match self
-                .dest_of(&key)
-                .and_then(|dest| self.adapter_of_key(&key)?.identify(&dest).ok())
-            {
+            match self.wiremap.session_identity_of_key(&key) {
                 Some(id) => sessions.insert((id.agent, id.project_id, id.session_id)),
                 // unconfigured agent or unparseable path: the key is the session
                 None => sessions.insert((key.clone(), String::new(), String::new())),
@@ -311,7 +207,7 @@ impl Engine {
             if rec.versions.len() <= 1 {
                 continue;
             }
-            let Some(rel) = self.relative_of(&key).map(str::to_string) else {
+            let Some(rel) = self.wiremap.relative_of(&key).map(str::to_string) else {
                 continue;
             };
             let diverged = match self.divergence.cached(&key, &rec.versions) {
@@ -352,7 +248,7 @@ impl Engine {
     /// it, so a settled key costs one lookup. Returns the relative path when
     /// it published.
     async fn merge_one(&self, key: &str) -> Result<Option<String>> {
-        let Some(rel) = self.relative_of(key).map(str::to_string) else {
+        let Some(rel) = self.wiremap.relative_of(key).map(str::to_string) else {
             return Ok(None);
         };
         let Some(rec) = self.node.index_record(key).await? else {
@@ -376,43 +272,6 @@ impl Engine {
         Ok(Some(rel))
     }
 
-    /// Decode an index key back to its session-root-relative path (the inverse of
-    /// `index_key`): strip the `{agent}/` prefix of a configured adapter.
-    fn relative_of<'a>(&self, key: &'a str) -> Option<&'a str> {
-        let adapter = self.adapter_of_key(key)?;
-        key.strip_prefix(adapter.agent())?.strip_prefix('/')
-    }
-
-    /// Whether a key falls under its agent's `exclude` patterns (issue #14).
-    /// Filtered out of BOTH reconcile inputs, so the key is frozen: never
-    /// imported, exported, tombstoned, or merged — here or on write-back.
-    fn excluded_key(&self, key: &str) -> bool {
-        let Some(adapter) = self.adapter_of_key(key) else {
-            return false;
-        };
-        let Some(patterns) = self.excludes.get(adapter.agent()) else {
-            return false;
-        };
-        self.relative_of(key)
-            .is_some_and(|rel| exclude::is_excluded(patterns, rel))
-    }
-
-    /// The absolute session-dir path an index key maps to on this machine, or
-    /// `None` when no configured adapter owns the key.
-    fn dest_of(&self, key: &str) -> Option<PathBuf> {
-        let adapter = self.adapter_of_key(key)?;
-        let rel = key.strip_prefix(adapter.agent())?.strip_prefix('/')?;
-        Some(adapter.session_root().join(rel))
-    }
-
-    /// Session files under every configured adapter's root.
-    fn all_session_files(&self) -> Vec<PathBuf> {
-        self.adapters
-            .iter()
-            .flat_map(|a| session_files(a.session_root(), a.as_ref()))
-            .collect()
-    }
-
     /// Write the status snapshot; `announce` additionally logs conflicts (off
     /// for the periodic liveness refresh, which would repeat them every tick).
     async fn write_status(&mut self, path: &Path, announce: bool) {
@@ -431,13 +290,13 @@ impl Engine {
 
     /// Snapshot every configured session dir as `reconcile` input.
     fn local_snapshot(&mut self) -> Vec<LocalFile> {
-        self.resolver.begin_pass();
+        self.wiremap.begin_pass();
         let mut out = Vec::new();
-        for path in self.all_session_files() {
+        for path in self.wiremap.session_files() {
             let Some(stamp) = file_stamp_micros(&path) else {
                 continue;
             };
-            let id = match self.identify(&path) {
+            let id = match self.wiremap.identify(&path) {
                 Ok(id) => id,
                 Err(e) => {
                     // per-key errors are logged, never silently dropped
@@ -447,20 +306,16 @@ impl Engine {
                     continue;
                 }
             };
-            let key = match self.mapped_key(&id, &path) {
-                Ok(k) => k,
-                Err(e) => {
-                    // an unresolvable mapping FREEZES the agent's tombstones
-                    // this pass (#49): a skip that read as deletion would
-                    // propagate mesh-wide (same class as the #14 fix)
-                    let dir = path.parent().unwrap_or(&path).to_path_buf();
-                    if self.resolver.note_failure(&id.agent, dir) {
-                        eprintln!("ssync: skipping {}: {e:#}", path.display());
+            let key = match self.wiremap.key_of(&id, &path) {
+                KeyLookup::Key(key) => key,
+                KeyLookup::Skipped(announcement) => {
+                    if let Some(error) = announcement {
+                        eprintln!("ssync: skipping {}: {error:#}", path.display());
                     }
                     continue;
                 }
             };
-            if self.excluded_key(&key) {
+            if self.wiremap.excluded(&key) {
                 continue;
             }
             out.push(LocalFile { key, path, stamp });
@@ -474,13 +329,10 @@ impl Engine {
         let mut out = std::collections::HashMap::new();
         for rec in self.node.index_records().await? {
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            // No adapter = frozen, exactly like an excluded key: a dropped
-            // `[[agents]]` entry must never tombstone peers' sessions (the
-            // key would read as "materialised here, now gone").
-            if self.adapter_of_key(&key).is_none() || self.excluded_key(&key) {
+            if self.wiremap.frozen(&key) {
                 continue;
             }
-            let merge_allowed = self.adapter_of_key(&key).is_some_and(|a| a.append_only());
+            let merge_allowed = self.wiremap.append_only(&key);
             out.insert(
                 key,
                 IndexEntry {
@@ -526,12 +378,8 @@ impl Engine {
         };
         let mut changed = false;
         for action in reconcile(&self.state, &local, &index) {
-            // withhold tombstones for agents whose mapping failed this pass:
-            // the "file gone" reading is an artifact of the skip, not a delete
             if let Action::Tombstone { key } = &action
-                && self
-                    .adapter_of_key(key)
-                    .is_some_and(|a| self.resolver.agent_failed(a.agent()))
+                && self.wiremap.tombstone_withheld(key)
             {
                 continue;
             }
@@ -616,7 +464,7 @@ impl Engine {
                         return false;
                     }
                 };
-                let (dest, plaintext) = match self.localize(key, plaintext) {
+                let (dest, plaintext) = match self.wiremap.localize(key, plaintext) {
                     Ok(Some(pair)) => pair,
                     Ok(None) => return false, // unresolved yet — retried
                     Err(e) => {
@@ -634,14 +482,14 @@ impl Engine {
             }
             Action::DeleteLocal { key } => {
                 self.state.settle_delete(key);
-                let Some(dest) = self.local_dest_of(key) else {
+                let Some(dest) = self.wiremap.local_dest_of(key) else {
                     return false;
                 };
                 let existed = dest.exists();
                 let _ = tokio::fs::remove_file(&dest).await;
                 // sweep the emptied artifact dir the deletion may leave behind
-                if let Some(adapter) = self.adapter_of_key(key) {
-                    cleanup::remove_empty_parents(&dest, adapter.session_root());
+                if let Some(root) = self.wiremap.session_root_of(key) {
+                    cleanup::remove_empty_parents(&dest, root);
                 }
                 existed
             }
@@ -696,10 +544,10 @@ impl Engine {
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
         })?;
-        for adapter in &self.adapters {
+        for root in self.wiremap.roots() {
             watcher
-                .watch(adapter.session_root(), RecursiveMode::Recursive)
-                .with_context(|| format!("watching {}", adapter.session_root().display()))?;
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("watching {}", root.display()))?;
         }
 
         // Doc events are drained behind the Node seam (Node::signals): only
@@ -732,9 +580,7 @@ impl Engine {
             tokio::select! {
                 Some(res) = rx.recv() => {
                     if let Ok(event) = res
-                        && event.paths.iter().any(|p| {
-                            self.adapter_of_path(p).is_some_and(|a| a.is_session_file(p))
-                        }) {
+                        && event.paths.iter().any(|p| self.wiremap.is_session_file(p)) {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                 }
@@ -796,26 +642,6 @@ fn file_stamp_micros(path: &Path) -> Option<(u64, u64)> {
         .ok()?
         .as_micros() as u64;
     Some((mtime, m.len()))
-}
-
-/// Recursively collect session files under `root` accepted by `adapter`.
-fn session_files(root: &Path, adapter: &dyn Adapter) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if adapter.is_session_file(&path) {
-                out.push(path);
-            }
-        }
-    }
-    out
 }
 
 /// Conflicts to announce this pass: those in `current` not yet logged. The
@@ -882,9 +708,13 @@ mod tests {
         assert!(engine.tick_once().await, "first tick must import");
         assert!(!engine.tick_once().await, "second tick must be a no-op");
 
+        let id = engine.wiremap.identify(&session_path).unwrap();
+        let KeyLookup::Key(key) = engine.wiremap.key_of(&id, &session_path) else {
+            panic!("session key lookup skipped");
+        };
         let rec = engine
             .node
-            .index_record(engine.index_key(&engine.identify(&session_path).unwrap()))
+            .index_record(key)
             .await
             .unwrap()
             .expect("session indexed");
