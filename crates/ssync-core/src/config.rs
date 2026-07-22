@@ -235,8 +235,8 @@ impl Config {
     }
 
     /// The validated [`PathMap`] this config describes (empty = inert).
-    pub fn build_path_map(&self) -> Result<crate::pathmap::PathMap> {
-        crate::pathmap::PathMap::new(
+    pub fn build_path_map(&self) -> Result<crate::PathMap> {
+        crate::PathMap::new(
             self.path_map
                 .iter()
                 .map(|e| {
