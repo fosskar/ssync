@@ -60,16 +60,22 @@ pkgs.testers.runNixOSTest {
     { pkgs, ... }:
     {
       imports = [ self.nixosModules.default ];
+      users.groups.ssync-test = { };
+      users.users.ssync-test = {
+        isSystemUser = true;
+        group = "ssync-test";
+      };
       services.ssync = {
         enable = true;
-        user = "root";
+        user = "ssync-test";
         ageIdentityFile = "/run/ssync-test-key/age.key";
         dataDir = "/srv/ssync-data";
       };
       system.activationScripts.ssyncExternalAge = ''
-        install -d -m 0700 /run/ssync-test-key
+        install -d -m 0700 -o ssync-test -g ssync-test /run/ssync-test-key
         ${pkgs.age}/bin/age-keygen -pq -o /run/ssync-test-key/age.key
         chmod 0600 /run/ssync-test-key/age.key
+        chown ssync-test:ssync-test /run/ssync-test-key/age.key
       '';
     };
 
@@ -105,6 +111,7 @@ pkgs.testers.runNixOSTest {
     custom.wait_for_file("/run/ssync-test-key/age.key")
     custom.wait_for_file("/srv/ssync-data/ticket")
     custom.succeed("test $(stat -c%a /srv/ssync-data) = 700")
+    custom.succeed("test $(stat -c%U /srv/ssync-data) = ssync-test")
     custom.succeed("systemctl show ssync -p ReadWritePaths --value | grep -q /srv/ssync-data")
     custom.succeed("systemctl show ssync -p ReadWritePaths --value | grep -qv /run/ssync-test-key")
     custom.succeed("test -z \"$(systemctl show ssync -p StateDirectory --value)\"")

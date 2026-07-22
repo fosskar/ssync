@@ -179,8 +179,8 @@ in
       description = ''
         Age identity file. If it does not exist under `dataDir`, the daemon
         generates one on first run. A path outside `dataDir` must already
-        exist and remains read-only under the sandbox. Shared mode
-        (`recipients = []`): it must be the *same* key on every machine, so
+        exist; this option does not add a writable sandbox grant for it.
+        Shared mode (`recipients = []`): it must be the *same* key on every machine, so
         point this at a secret you distribute yourself (e.g. sops-nix).
         Per-machine mode: each machine keeps its own key and lists the other
         machines' recipients in `recipients`. The clan service handles
@@ -193,8 +193,9 @@ in
       default = "/var/lib/ssync";
       description = ''
         ssync's own managed state (node key, blobs, docs, index). The default
-        uses systemd's `StateDirectory`; a custom path is created 0700 for
-        `user` and added to the sandbox's writable allow-list.
+        uses systemd's `StateDirectory`; a custom path must be a dedicated
+        nested directory. It is set to mode 0700, owned by `user`, and added
+        to the sandbox's writable allow-list.
       '';
     };
 
@@ -207,7 +208,7 @@ in
         Manage it with `ssync cluster`, or let the clan service generate it
         via clan.vars. When set, peers join one deterministic namespace with
         no ticket exchange; mutually exclusive with `recipients`. A path
-        outside `dataDir` must be pre-provisioned and remains read-only.
+        outside `dataDir` must exist; this option does not make it writable.
       '';
     };
 
@@ -216,7 +217,7 @@ in
       default = null;
       description = ''
         Override the iroh node key path (default: `dataDir/node.key`). A path
-        outside `dataDir` must be pre-provisioned and remains read-only.
+        outside `dataDir` must exist; this option does not make it writable.
       '';
     };
 
@@ -335,6 +336,14 @@ in
 
   config = lib.mkIf cfg.enable {
     assertions = [
+      {
+        assertion =
+          !customDataDir
+          || (
+            lib.hasPrefix "/" cfg.dataDir && !lib.hasSuffix "/" cfg.dataDir && builtins.dirOf cfg.dataDir != "/"
+          );
+        message = "services.ssync.dataDir must be an absolute, dedicated nested directory";
+      }
       {
         assertion = !cfg.autoCleanup.enable || cfg.autoCleanup.keep != null || cfg.autoCleanup.unnamed;
         message = "services.ssync.autoCleanup selects nothing: set keep or unnamed";

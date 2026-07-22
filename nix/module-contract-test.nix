@@ -7,9 +7,9 @@ let
       sessionDir = "/sessions";
     }
   ];
-  nixosService =
+  nixosConfig =
     extra:
-    (import (pkgs.path + "/nixos/lib/eval-config.nix") {
+    import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = null;
       modules = [
         { nixpkgs.hostPlatform = pkgs.stdenv.hostPlatform; }
@@ -23,7 +23,8 @@ let
           // extra;
         }
       ];
-    }).config.systemd.services.ssync.serviceConfig;
+    };
+  nixosService = extra: (nixosConfig extra).config.systemd.services.ssync.serviceConfig;
   nixosDefault = nixosService { };
   nixosCustom = nixosService { dataDir = "/srv/ssync-data"; };
   nixosExternal = nixosService {
@@ -32,6 +33,16 @@ let
     nodeKeyFile = "/run/secrets/node.key";
     clusterFile = "/run/secrets/cluster.toml";
   };
+  unsafeDataDirsRejected =
+    lib.all
+      (
+        dataDir:
+        !(builtins.tryEval (nixosConfig { inherit dataDir; }).config.system.build.toplevel.drvPath).success
+      )
+      [
+        "/srv"
+        "/srv/"
+      ];
 
   hmStub =
     { lib, ... }:
@@ -86,7 +97,6 @@ let
       ];
     }).config.systemd.user.services.ssync.Service;
 
-  words = value: if builtins.isList value then value else lib.splitString " " value;
   hardeningContract =
     service:
     assert service.NoNewPrivileges;
@@ -106,7 +116,12 @@ let
     assert service.RestrictRealtime;
     assert service.RestrictSUIDSGID;
     assert
-      words service.RestrictAddressFamilies == [
+      (
+        if builtins.isList service.RestrictAddressFamilies then
+          service.RestrictAddressFamilies
+        else
+          lib.splitString " " service.RestrictAddressFamilies
+      ) == [
         "AF_INET"
         "AF_INET6"
         "AF_UNIX"
@@ -128,6 +143,7 @@ let
     assert service.UMask == "0077";
     true;
 in
+assert unsafeDataDirsRejected;
 assert hardeningContract nixosDefault;
 assert hardeningContract hmService;
 assert nixosDefault.StateDirectory == "ssync";
