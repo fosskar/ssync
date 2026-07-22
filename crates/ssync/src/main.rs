@@ -363,7 +363,7 @@ fn cmd_cleanup(
 async fn cmd_init(config_path: &Path) -> Result<()> {
     let (config, _pre_existed) = load_or_bootstrap_config(config_path)?;
     let already_had_identity = config.age_identity_path.exists();
-    let id = load_or_generate_identity(&config)?;
+    let id = load_or_generate_identity(&config).await?;
     println!("age recipient: {}", id.recipient_string());
     if !already_had_identity {
         println!(
@@ -395,7 +395,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
     // own key; otherwise the key is shared and a second standalone machine
     // must be given this same key (clan.vars handles either mode).
     if !config.age_identity_path.exists() {
-        let id = AgeIdentity::generate()?;
+        let id = AgeIdentity::generate().await?;
         write_secret(&config.age_identity_path, &id.to_secret_string())?;
         if config.cluster_path.is_none() {
             if config.recipients.is_empty() {
@@ -423,7 +423,7 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         ),
         None => None,
     };
-    let mut identity = load_identity(&config.age_identity_path)?;
+    let mut identity = load_identity(&config.age_identity_path).await?;
     match &cluster {
         Some(c) => identity.add_recipients(c.recipients()),
         None => {
@@ -616,10 +616,10 @@ fn read_secret_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("reading secret {}", path.display()))
 }
 
-fn load_identity(path: &Path) -> Result<AgeIdentity> {
+async fn load_identity(path: &Path) -> Result<AgeIdentity> {
     let text =
         read_secret_text(path).with_context(|| format!("age identity {}", path.display()))?;
-    AgeIdentity::from_secret_string(text.trim())
+    AgeIdentity::from_secret_string(text.trim()).await
 }
 
 /// Load the config if present, else write built-in defaults; returns whether
@@ -636,11 +636,11 @@ fn load_or_bootstrap_config(config_path: &Path) -> Result<(Config, bool)> {
 }
 
 /// Load the shared age identity, generating and persisting one on first run.
-fn load_or_generate_identity(config: &Config) -> Result<AgeIdentity> {
+async fn load_or_generate_identity(config: &Config) -> Result<AgeIdentity> {
     if config.age_identity_path.exists() {
-        load_identity(&config.age_identity_path)
+        load_identity(&config.age_identity_path).await
     } else {
-        let id = AgeIdentity::generate()?;
+        let id = AgeIdentity::generate().await?;
         write_secret(&config.age_identity_path, &id.to_secret_string())?;
         println!(
             "generated age identity {}",

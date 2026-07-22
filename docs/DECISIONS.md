@@ -390,11 +390,13 @@ clan are strictly opt-in layers on top.
 
 **Allow-list (what the sandbox must keep open, and why):**
 
-- `ReadWritePaths = [ sessionDir ]` — watch-and-import needs to write imported sessions
-  back atomically. A `systemd.tmpfiles` rule pre-creates `sessionDir` (owner = the run
-  user, `0700`) so the bind succeeds on first boot before the agent has created it.
-- `StateDirectory=ssync` — the only other writable path (`/var/lib/ssync`: node key, blobs,
-  docs, index, status).
+- `ReadWritePaths` includes every `sessionDir` — watch-and-import needs to write imported
+  sessions back atomically — plus a custom, dedicated `dataDir`, when configured.
+  `systemd.tmpfiles` pre-creates these paths (owner = the run user, `0700`) so the binds
+  succeed on first boot. Custom state paths must be nested to avoid changing ownership
+  of a top-level filesystem directory.
+- The default data path uses `StateDirectory=ssync` for `/var/lib/ssync` (node key,
+  blobs, docs, index, status); custom paths replace it with the explicit writable grant.
 - `RestrictAddressFamilies = AF_INET AF_INET6 AF_UNIX AF_NETLINK` — iroh needs QUIC/UDP
   over IPv4/IPv6 and `AF_NETLINK` to enumerate local interfaces for address discovery.
 - secrets (`/run/secrets/…`) and the Nix store stay readable via `ProtectSystem=strict`

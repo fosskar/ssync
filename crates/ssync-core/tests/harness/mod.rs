@@ -24,19 +24,19 @@ pub struct Sim {
 }
 
 impl Sim {
-    pub fn new(tag: &str) -> Self {
+    pub async fn new(tag: &str) -> Self {
         let base = std::env::temp_dir().join(format!("ssync-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         Self {
             base,
-            secret: AgeIdentity::generate().unwrap().to_secret_string(),
+            secret: AgeIdentity::generate().await.unwrap().to_secret_string(),
         }
     }
 
     /// The shared identity (a fresh instance per call — `Engine` takes it by value).
-    pub fn identity(&self) -> AgeIdentity {
-        AgeIdentity::from_secret_string(&self.secret).unwrap()
+    pub async fn identity(&self) -> AgeIdentity {
+        AgeIdentity::from_secret_string(&self.secret).await.unwrap()
     }
 
     /// Spawn `name`'s node at `base/{name}/data` with a fresh key.
@@ -59,8 +59,8 @@ impl Sim {
     }
 
     /// A peer running one pi-layout agent on the shared identity.
-    pub fn pi_peer(&self, name: &str, agent: &str, node: Node) -> Peer {
-        self.pi_peer_as(name, agent, self.identity(), node)
+    pub async fn pi_peer(&self, name: &str, agent: &str, node: Node) -> Peer {
+        self.pi_peer_as(name, agent, self.identity().await, node)
     }
 
     /// Same, with a per-machine identity (multi-recipient tests).

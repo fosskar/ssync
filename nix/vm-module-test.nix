@@ -56,6 +56,29 @@ pkgs.testers.runNixOSTest {
       '';
     };
 
+  nodes.custom =
+    { pkgs, ... }:
+    {
+      imports = [ self.nixosModules.default ];
+      users.groups.ssync-test = { };
+      users.users.ssync-test = {
+        isSystemUser = true;
+        group = "ssync-test";
+      };
+      services.ssync = {
+        enable = true;
+        user = "ssync-test";
+        ageIdentityFile = "/run/ssync-test-key/age.key";
+        dataDir = "/srv/ssync-data";
+      };
+      system.activationScripts.ssyncExternalAge = ''
+        install -d -m 0700 -o ssync-test -g ssync-test /run/ssync-test-key
+        ${pkgs.age}/bin/age-keygen -pq -o /run/ssync-test-key/age.key
+        chmod 0600 /run/ssync-test-key/age.key
+        chown ssync-test:ssync-test /run/ssync-test-key/age.key
+      '';
+    };
+
   testScript = ''
     machine.wait_for_unit("ssync.service")
     machine.wait_for_file("/var/lib/ssync/age.key")
@@ -82,5 +105,15 @@ pkgs.testers.runNixOSTest {
     cluster.succeed(f"! grep -q 'recipients = ' {ccfg}")
     cluster.wait_until_succeeds("journalctl -u ssync | grep -q 'cluster namespace'", timeout=60)
     cluster.succeed("! test -e /var/lib/ssync/ticket")
+
+    # A custom dataDir carries its storage ownership and sandbox grant with it.
+    custom.wait_for_unit("ssync.service")
+    custom.wait_for_file("/run/ssync-test-key/age.key")
+    custom.wait_for_file("/srv/ssync-data/ticket")
+    custom.succeed("test $(stat -c%a /srv/ssync-data) = 700")
+    custom.succeed("test $(stat -c%U /srv/ssync-data) = ssync-test")
+    custom.succeed("systemctl show ssync -p ReadWritePaths --value | grep -q /srv/ssync-data")
+    custom.succeed("systemctl show ssync -p ReadWritePaths --value | grep -qv /run/ssync-test-key")
+    custom.succeed("test -z \"$(systemctl show ssync -p StateDirectory --value)\"")
   '';
 }

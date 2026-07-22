@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use notify::{RecursiveMode, Watcher};
 use ssync_adapters::Adapter;
 use ssync_crypto::AgeIdentity;
@@ -17,17 +17,16 @@ pub mod cluster;
 mod config;
 mod divergence;
 mod exclude;
-mod pathmap;
 mod reconcile;
 pub mod search;
+mod session_filesystem;
 mod status;
-mod wiremap;
 pub use config::{AgentConfig, Config, Discovery, insert_cluster_path};
 use divergence::{Divergence, Verdict};
-pub use pathmap::PathMap;
-use reconcile::{Action, IndexEntry, IndexHead, LocalFile, SyncState, reconcile};
+use reconcile::{Action, IndexEntry, IndexHead, SyncState, reconcile};
+pub use session_filesystem::PathMap;
+use session_filesystem::SessionFilesystem;
 pub use status::{PeerStatus, StatusReport};
-use wiremap::{KeyLookup, Wiremap};
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
 /// its supervisor restarts it with a fresh mount namespace.
@@ -36,7 +35,7 @@ const PERSIST_WEDGE_THRESHOLD: u32 = 5;
 /// The sync engine for one node: one or more agent adapters (pi, omp, ...)
 /// sharing a single index namespace, partitioned by the `{agent}/` key prefix.
 pub struct Engine {
-    wiremap: Wiremap,
+    filesystem: SessionFilesystem,
     identity: AgeIdentity,
     node: Node,
     /// What we last materialised per key; feeds [`reconcile`].
@@ -45,8 +44,6 @@ pub struct Engine {
     state_path: Option<PathBuf>,
     /// Merges already announced (log once, not per tick).
     merged_logged: std::collections::HashSet<String>,
-    /// Identify failures already announced (log once, not per tick).
-    identify_logged: std::collections::HashSet<PathBuf>,
     /// Conflicts already announced; replaced with the current set on every
     /// announcing pass so a resolved-then-returned conflict logs again.
     conflicts_logged: std::collections::HashSet<String>,
@@ -81,13 +78,12 @@ impl Engine {
     ) -> Self {
         let recipients_fp = Hash::new(identity.recipients().join("\n")).to_string();
         Self {
-            wiremap: Wiremap::new(adapters),
+            filesystem: SessionFilesystem::new(adapters),
             identity,
             node,
             state: SyncState::default(),
             state_path: None,
             merged_logged: Default::default(),
-            identify_logged: Default::default(),
             conflicts_logged: Default::default(),
             persist_enoent: 0,
             divergence: Divergence::default(),
@@ -116,12 +112,12 @@ impl Engine {
 
     /// Per-agent `exclude` patterns from config (`[[agents]]` tables).
     pub fn set_excludes(&mut self, excludes: std::collections::HashMap<String, Vec<String>>) {
-        self.wiremap.set_excludes(excludes);
+        self.filesystem.set_excludes(excludes);
     }
 
     /// The `[[path_map]]` + `canonical_home` from config (issue #13).
     pub fn set_path_map(&mut self, map: PathMap, canonical_home: Option<PathBuf>) {
-        self.wiremap.set_path_map(map, canonical_home);
+        self.filesystem.set_path_map(map, canonical_home);
     }
 
     /// Live index keys (wire form) — status/debug surface; the two-node
@@ -145,23 +141,20 @@ impl Engine {
     /// `force` (recipient-set rotation) bypasses the dedup: the plaintext is
     /// unchanged but the encryption no longer matches the configured set.
     async fn import_action(
-        &self,
+        &mut self,
         key: &str,
         path: &Path,
         winner: Option<Hash>,
         force: bool,
     ) -> Result<ImportOutcome> {
-        let plaintext = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading session file {}", path.display()))?;
-        let plaintext = self.wiremap.canonical_plaintext(key, plaintext)?;
+        let plaintext = self.filesystem.read(key, path).await?;
         if !force
             && let Some(w) = winner
             && self.get_plain(w).await.as_deref() == Some(&plaintext)
         {
             return Ok(ImportOutcome::Unchanged(w));
         }
-        let ciphertext = self.identity.encrypt(&plaintext)?;
+        let ciphertext = self.identity.encrypt(&plaintext).await?;
         let hash = self.node.publish(key.to_string(), ciphertext).await?;
         Ok(ImportOutcome::Published(hash))
     }
@@ -196,10 +189,10 @@ impl Engine {
                 continue; // deleted — never resurrect from stale live entries
             };
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            if self.wiremap.excluded(&key) {
+            if self.filesystem.excluded(&key) {
                 continue; // frozen keys neither count nor report conflicts
             }
-            match self.wiremap.session_identity_of_key(&key) {
+            match self.filesystem.session_identity_of_key(&key) {
                 Some(id) => sessions.insert((id.agent, id.project_id, id.session_id)),
                 // unconfigured agent or unparseable path: the key is the session
                 None => sessions.insert((key.clone(), String::new(), String::new())),
@@ -207,7 +200,7 @@ impl Engine {
             if rec.versions.len() <= 1 {
                 continue;
             }
-            let Some(rel) = self.wiremap.relative_of(&key).map(str::to_string) else {
+            let Some(rel) = self.filesystem.relative_of(&key).map(str::to_string) else {
                 continue;
             };
             let diverged = match self.divergence.cached(&key, &rec.versions) {
@@ -241,14 +234,14 @@ impl Engine {
 
     async fn get_plain(&self, hash: Hash) -> Option<Vec<u8>> {
         let ciphertext = self.node.get_blob(hash).await.ok()?;
-        self.identity.decrypt(&ciphertext).ok()
+        self.identity.decrypt(&ciphertext).await.ok()
     }
 
     /// Publish the lossless union for a diverged key; the cached verdict gates
     /// it, so a settled key costs one lookup. Returns the relative path when
     /// it published.
     async fn merge_one(&self, key: &str) -> Result<Option<String>> {
-        let Some(rel) = self.wiremap.relative_of(key).map(str::to_string) else {
+        let Some(rel) = self.filesystem.relative_of(key).map(str::to_string) else {
             return Ok(None);
         };
         let Some(rec) = self.node.index_record(key).await? else {
@@ -267,7 +260,7 @@ impl Engine {
         let Verdict::Diverged(merged) = self.verdict_of(key, winner, &rec.versions).await else {
             return Ok(None);
         };
-        let ciphertext = self.identity.encrypt(&merged)?;
+        let ciphertext = self.identity.encrypt(&merged).await?;
         self.node.publish(key.to_string(), ciphertext).await?;
         Ok(Some(rel))
     }
@@ -288,51 +281,16 @@ impl Engine {
         }
     }
 
-    /// Snapshot every configured session dir as `reconcile` input.
-    fn local_snapshot(&mut self) -> Vec<LocalFile> {
-        self.wiremap.begin_pass();
-        let mut out = Vec::new();
-        for path in self.wiremap.session_files() {
-            let Some(stamp) = file_stamp_micros(&path) else {
-                continue;
-            };
-            let id = match self.wiremap.identify(&path) {
-                Ok(id) => id,
-                Err(e) => {
-                    // per-key errors are logged, never silently dropped
-                    if self.identify_logged.insert(path.clone()) {
-                        eprintln!("ssync: skipping {}: {e:#}", path.display());
-                    }
-                    continue;
-                }
-            };
-            let key = match self.wiremap.key_of(&id, &path) {
-                KeyLookup::Key(key) => key,
-                KeyLookup::Skipped(announcement) => {
-                    if let Some(error) = announcement {
-                        eprintln!("ssync: skipping {}: {error:#}", path.display());
-                    }
-                    continue;
-                }
-            };
-            if self.wiremap.excluded(&key) {
-                continue;
-            }
-            out.push(LocalFile { key, path, stamp });
-        }
-        out
-    }
-
     /// Snapshot the synced index as `reconcile` input: winning entry plus the
     /// count of distinct live hashes (divergence) per key.
     async fn index_snapshot(&self) -> Result<std::collections::HashMap<String, IndexEntry>> {
         let mut out = std::collections::HashMap::new();
         for rec in self.node.index_records().await? {
             let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            if self.wiremap.frozen(&key) {
+            if self.filesystem.frozen(&key) {
                 continue;
             }
-            let merge_allowed = self.wiremap.append_only(&key);
+            let merge_allowed = self.filesystem.append_only(&key);
             out.insert(
                 key,
                 IndexEntry {
@@ -368,7 +326,7 @@ impl Engine {
         }
         self.import_errors = 0;
 
-        let local = self.local_snapshot();
+        let local = self.filesystem.snapshot();
         let index = match self.index_snapshot().await {
             Ok(i) => i,
             Err(e) => {
@@ -379,7 +337,7 @@ impl Engine {
         let mut changed = false;
         for action in reconcile(&self.state, &local, &index) {
             if let Action::Tombstone { key } = &action
-                && self.wiremap.tombstone_withheld(key)
+                && self.filesystem.tombstone_withheld(key)
             {
                 continue;
             }
@@ -447,51 +405,41 @@ impl Engine {
                 }
             },
             Action::WriteFile { key, hash } => {
-                // dest + on-disk bytes resolve through the path map after
-                // decryption (the header carries the canonical cwd)
                 let ciphertext = match self.node.blob(*hash).await {
-                    Ok(c) => c,
-                    // per-key error, retried next tick like every other arm
-                    Err(e) => {
-                        eprintln!("ssync: fetch {key}: {e:#}");
+                    Ok(ciphertext) => ciphertext,
+                    Err(error) => {
+                        eprintln!("ssync: fetch {key}: {error:#}");
                         return false;
                     }
                 };
-                let plaintext = match self.identity.decrypt(&ciphertext) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("ssync: decrypt {key}: {e:#}");
+                let plaintext = match self.identity.decrypt(&ciphertext).await {
+                    Ok(plaintext) => plaintext,
+                    Err(error) => {
+                        eprintln!("ssync: decrypt {key}: {error:#}");
                         return false;
                     }
                 };
-                let (dest, plaintext) = match self.wiremap.localize(key, plaintext) {
-                    Ok(Some(pair)) => pair,
-                    Ok(None) => return false, // unresolved yet — retried
-                    Err(e) => {
-                        eprintln!("ssync: write {key}: {e:#}");
-                        return false;
+                match self.filesystem.write(key, plaintext).await {
+                    Ok(Some(stamp)) => {
+                        self.state.settle_write(key, *hash, Some(stamp));
+                        true
                     }
-                };
-                if let Err(e) = atomic_write(&dest, &plaintext).await {
-                    eprintln!("ssync: write {}: {e:#}", dest.display());
-                    return false;
+                    Ok(None) => false,
+                    Err(error) => {
+                        eprintln!("ssync: write {key}: {error:#}");
+                        false
+                    }
                 }
-                self.state
-                    .settle_write(key, *hash, file_stamp_micros(&dest));
-                true
             }
             Action::DeleteLocal { key } => {
                 self.state.settle_delete(key);
-                let Some(dest) = self.wiremap.local_dest_of(key) else {
-                    return false;
-                };
-                let existed = dest.exists();
-                let _ = tokio::fs::remove_file(&dest).await;
-                // sweep the emptied artifact dir the deletion may leave behind
-                if let Some(root) = self.wiremap.session_root_of(key) {
-                    cleanup::remove_empty_parents(&dest, root);
+                match self.filesystem.delete(key).await {
+                    Ok(existed) => existed,
+                    Err(error) => {
+                        eprintln!("ssync: delete local {key}: {error:#}");
+                        false
+                    }
                 }
-                existed
             }
             Action::Tombstone { key } => match self.node.index_delete(key).await {
                 Ok(()) => {
@@ -544,7 +492,7 @@ impl Engine {
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);
         })?;
-        for root in self.wiremap.roots() {
+        for root in self.filesystem.roots() {
             watcher
                 .watch(root, RecursiveMode::Recursive)
                 .with_context(|| format!("watching {}", root.display()))?;
@@ -580,7 +528,7 @@ impl Engine {
             tokio::select! {
                 Some(res) = rx.recv() => {
                     if let Ok(event) = res
-                        && event.paths.iter().any(|p| self.wiremap.is_session_file(p)) {
+                        && event.paths.iter().any(|p| self.filesystem.is_session_file(p)) {
                             deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                         }
                 }
@@ -627,23 +575,6 @@ impl ImportOutcome {
     }
 }
 
-/// Metadata stamp `(mtime_micros, len)` used to detect whether a file changed;
-/// mtime is on the iroh-docs microsecond scale so it compares against index
-/// timestamps directly (used for the resurrection guard in `reconcile`).
-fn file_stamp_micros(path: &Path) -> Option<(u64, u64)> {
-    let m = std::fs::metadata(path).ok()?;
-    if !m.is_file() {
-        return None;
-    }
-    let mtime = m
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_micros() as u64;
-    Some((mtime, m.len()))
-}
-
 /// Conflicts to announce this pass: those in `current` not yet logged. The
 /// caller replaces its logged set with `current` afterwards, so a conflict
 /// that resolved and re-diverged announces again.
@@ -656,25 +587,6 @@ fn newly_diverged<'a>(
         .filter(|c| !logged.contains(*c))
         .map(String::as_str)
         .collect()
-}
-
-/// Write `data` to `dest` atomically: temp file in the same dir, then rename, so
-/// a reader (the agent) never observes a partial file (DECISIONS §10).
-async fn atomic_write(dest: &Path, data: &[u8]) -> Result<()> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent dir", dest.display()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .with_context(|| format!("creating {}", parent.display()))?;
-    let tmp: PathBuf = dest.with_extension("ssync-tmp");
-    tokio::fs::write(&tmp, data)
-        .await
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, dest)
-        .await
-        .with_context(|| format!("renaming into {}", dest.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -701,17 +613,17 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
 
         assert!(engine.tick_once().await, "first tick must import");
         assert!(!engine.tick_once().await, "second tick must be a no-op");
 
-        let id = engine.wiremap.identify(&session_path).unwrap();
-        let KeyLookup::Key(key) = engine.wiremap.key_of(&id, &session_path) else {
-            panic!("session key lookup skipped");
-        };
+        let key = format!(
+            "pi/{}",
+            session_path.strip_prefix(&sessions_root).unwrap().display()
+        );
         let rec = engine
             .node
             .index_record(key)
@@ -733,10 +645,10 @@ mod tests {
             .unwrap();
         let engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
-        let v1 = engine.identity.encrypt(b"h\na\n").unwrap();
+        let v1 = engine.identity.encrypt(b"h\na\n").await.unwrap();
         let h1 = engine.node.add_blob(v1).await.unwrap();
         let missing = Hash::new(b"never-added");
 
@@ -760,12 +672,19 @@ mod tests {
             .unwrap();
         let engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
-        let enc = |b: &[u8]| engine.identity.encrypt(b).unwrap();
-        let h1 = engine.node.add_blob(enc(b"h\na\n")).await.unwrap();
-        let h2 = engine.node.add_blob(enc(b"h\nb\n")).await.unwrap();
+        let h1 = engine
+            .node
+            .add_blob(engine.identity.encrypt(b"h\na\n").await.unwrap())
+            .await
+            .unwrap();
+        let h2 = engine
+            .node
+            .add_blob(engine.identity.encrypt(b"h\nb\n").await.unwrap())
+            .await
+            .unwrap();
 
         let Verdict::Diverged(union) = engine.verdict_of("k", h2, &[h1, h2]).await else {
             panic!("fork must read as diverged");
@@ -773,7 +692,11 @@ mod tests {
         assert_eq!(engine.divergence.cached("k", &[h1, h2]), Some(true));
 
         // once the union is the winner, the same key settles
-        let hu = engine.node.add_blob(enc(&union)).await.unwrap();
+        let hu = engine
+            .node
+            .add_blob(engine.identity.encrypt(&union).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             engine.verdict_of("k", hu, &[h1, h2, hu]).await,
             Verdict::Settled
@@ -795,7 +718,7 @@ mod tests {
             .unwrap();
         let engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         let report = engine.status_report().await.unwrap();
@@ -837,7 +760,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
 
@@ -875,7 +798,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         assert!(engine.tick_once().await, "tick must import");
@@ -898,7 +821,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         let state_path = base.join("missing-dir/state.toml");
