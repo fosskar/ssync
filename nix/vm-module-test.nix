@@ -76,6 +76,7 @@ pkgs.testers.runNixOSTest {
         ${pkgs.age}/bin/age-keygen -pq -o /run/ssync-test-key/age.key
         chmod 0600 /run/ssync-test-key/age.key
         chown ssync-test:ssync-test /run/ssync-test-key/age.key
+        install -d -m 0750 -o ssync-test -g ssync-test /srv/ssync-data
       '';
     };
 
@@ -106,12 +107,12 @@ pkgs.testers.runNixOSTest {
     cluster.wait_until_succeeds("journalctl -u ssync | grep -q 'cluster namespace'", timeout=60)
     cluster.succeed("! test -e /var/lib/ssync/ticket")
 
-    # A custom dataDir carries its storage ownership and sandbox grant with it.
+    # A custom dataDir keeps existing ownership while receiving its sandbox grant.
     custom.wait_for_unit("ssync.service")
     custom.wait_for_file("/run/ssync-test-key/age.key")
     custom.wait_for_file("/srv/ssync-data/ticket")
-    custom.succeed("test $(stat -c%a /srv/ssync-data) = 700")
-    custom.succeed("test $(stat -c%U /srv/ssync-data) = ssync-test")
+    custom.succeed("test $(stat -c%a /srv/ssync-data) = 750")
+    custom.succeed("test $(stat -c%U:%G /srv/ssync-data) = ssync-test:ssync-test")
     custom.succeed("systemctl show ssync -p ReadWritePaths --value | grep -q /srv/ssync-data")
     custom.succeed("systemctl show ssync -p ReadWritePaths --value | grep -qv /run/ssync-test-key")
     custom.succeed("test -z \"$(systemctl show ssync -p StateDirectory --value)\"")

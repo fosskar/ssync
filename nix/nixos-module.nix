@@ -10,6 +10,13 @@
 let
   cfg = config.services.ssync;
   customDataDir = cfg.dataDir != "/var/lib/ssync";
+  customDataDirSetup = pkgs.writeShellScript "ssync-create-data-dir" ''
+    if [[ -e ${lib.escapeShellArg cfg.dataDir} ]]; then
+      [[ -d ${lib.escapeShellArg cfg.dataDir} ]]
+    else
+      ${pkgs.coreutils}/bin/install -d -m 0700 -o ${lib.escapeShellArg cfg.user} -- ${lib.escapeShellArg cfg.dataDir}
+    fi
+  '';
   # scalar keys must precede the [[agents]] tables (TOML).
   configFile = pkgs.writeText "ssync-config.toml" (
     ''
@@ -364,10 +371,18 @@ in
     environment.systemPackages = [ cfg.package ];
     environment.etc."ssync/config.toml".source = configFile;
 
-    # ReadWritePaths requires watched and custom state dirs to exist at start.
-    systemd.tmpfiles.rules =
-      map (a: "d \"${a.sessionDir}\" 0700 ${cfg.user} - - -") cfg.agents
-      ++ lib.optional customDataDir "d \"${cfg.dataDir}\" 0700 ${cfg.user} - - -";
+    # ReadWritePaths requires watched dirs to exist at service start.
+    systemd.tmpfiles.rules = map (a: "d \"${a.sessionDir}\" 0700 ${cfg.user} - - -") cfg.agents;
+
+    systemd.services.ssync-data-dir = lib.mkIf customDataDir {
+      description = "Create ssync custom data directory";
+      requiredBy = [ "ssync.service" ];
+      before = [ "ssync.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = customDataDirSetup;
+      };
+    };
 
     systemd.services.ssync = {
       description = "ssync coding-agent session sync";

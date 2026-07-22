@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand};
 use ssync_adapters::adapter_for;
-use ssync_core::{Config, Discovery, Engine, StatusReport};
+use ssync_core::{Config, Discovery, Engine, SessionFilesystem, SessionFsConfig, StatusReport};
 use ssync_crypto::AgeIdentity;
 use ssync_net::iroh_docs::{DocTicket, NamespaceId};
 use ssync_net::{Node, load_or_create_secret_key};
@@ -499,17 +499,21 @@ async fn cmd_daemon(config_path: &Path) -> Result<()> {
         .iter()
         .map(|a| adapter_for(&a.agent, &a.session_dir))
         .collect::<Result<Vec<_>>>()?;
-    let mut engine = Engine::with_adapters(adapters, identity, node);
-    engine.set_excludes(
-        config
-            .agents
-            .iter()
-            .filter(|a| !a.exclude.is_empty())
-            .map(|a| (a.agent.clone(), a.exclude.clone()))
-            .collect(),
-    );
+    let excludes = config
+        .agents
+        .iter()
+        .filter(|agent| !agent.exclude.is_empty())
+        .map(|agent| (agent.agent.clone(), agent.exclude.clone()))
+        .collect();
+    let path_map = config.build_path_map()?;
+    let filesystem = SessionFilesystem::new(SessionFsConfig {
+        adapters,
+        excludes,
+        path_map,
+        canonical_home: config.canonical_home.clone(),
+    })?;
+    let mut engine = Engine::with_filesystem(filesystem, identity, node);
     if !config.path_map.is_empty() {
-        engine.set_path_map(config.build_path_map()?, config.canonical_home.clone());
         println!(
             "ssync: path map active ({} prefix pair(s))",
             config.path_map.len()

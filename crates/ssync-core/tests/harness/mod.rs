@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use ssync_adapters::Adapter;
 use ssync_adapters::pi::PiAdapter;
-use ssync_core::Engine;
+use ssync_core::{Engine, SessionFilesystem, SessionFsConfig};
 use ssync_crypto::AgeIdentity;
 use ssync_net::Node;
 use ssync_net::iroh::SecretKey;
@@ -63,6 +63,33 @@ impl Sim {
         self.pi_peer_as(name, agent, self.identity().await, node)
     }
 
+    pub async fn pi_peer_configured(
+        &self,
+        name: &str,
+        agent: &str,
+        node: Node,
+        excludes: std::collections::HashMap<String, Vec<String>>,
+        path_map: ssync_core::PathMap,
+        canonical_home: Option<PathBuf>,
+    ) -> Peer {
+        let root = self.root(name);
+        Peer {
+            root: root.clone(),
+            dir: self.base.join(name),
+            engine: Engine::with_filesystem(
+                SessionFilesystem::new(SessionFsConfig {
+                    adapters: vec![Box::new(PiAdapter::new(agent, root))],
+                    excludes,
+                    path_map,
+                    canonical_home,
+                })
+                .unwrap(),
+                self.identity().await,
+                node,
+            ),
+        }
+    }
+
     /// Same, with a per-machine identity (multi-recipient tests).
     pub fn pi_peer_as(&self, name: &str, agent: &str, identity: AgeIdentity, node: Node) -> Peer {
         let root = self.root(name);
@@ -87,6 +114,36 @@ impl Sim {
             root: self.root(name),
             dir: self.base.join(name),
             engine: Engine::with_adapters(adapters, identity, node),
+        }
+    }
+
+    pub fn peer_configured(
+        &self,
+        name: &str,
+        adapters: Vec<Box<dyn Adapter>>,
+        configuration: (
+            std::collections::HashMap<String, Vec<String>>,
+            ssync_core::PathMap,
+            Option<PathBuf>,
+        ),
+        identity: AgeIdentity,
+        node: Node,
+    ) -> Peer {
+        let (excludes, path_map, canonical_home) = configuration;
+        Peer {
+            root: self.root(name),
+            dir: self.base.join(name),
+            engine: Engine::with_filesystem(
+                SessionFilesystem::new(SessionFsConfig {
+                    adapters,
+                    excludes,
+                    path_map,
+                    canonical_home,
+                })
+                .unwrap(),
+                identity,
+                node,
+            ),
         }
     }
 }

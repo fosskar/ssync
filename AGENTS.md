@@ -114,8 +114,9 @@ flake.lock. CI is nixbot building the flake checks (plus the nixbot effects in
 - **Async:** tokio (full); one `select!` event loop; `futures_lite::StreamExt`. The
   unbounded event channels are a documented iroh-docs workaround, not a general
   preference. Blocking `std::fs` is fine in CLI, pure-core, and state code.
-- **DI:** constructor injection only (`Engine::with_adapters(Vec<Box<dyn Adapter>>,
-  AgeIdentity, Node)`); no globals or singletons. Test seams are named production methods
+- **DI:** constructor injection only (`SessionFilesystem::new(SessionFsConfig)` →
+  `Engine::with_filesystem(SessionFilesystem, AgeIdentity, Node)`); no globals or singletons.
+  Test seams are named production methods
   (`set_resync_interval`, `spawn_with_gc`, `disable_auto_download`), not mocks.
 - **Modules:** split by concept — a pure decision core gets its own submodule with its own
   unit tests; no `util`/`helpers` grab-bags.

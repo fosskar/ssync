@@ -5,7 +5,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use notify::{RecursiveMode, Watcher};
 use ssync_adapters::Adapter;
 use ssync_crypto::AgeIdentity;
 use ssync_net::Node;
@@ -23,9 +22,9 @@ mod session_filesystem;
 mod status;
 pub use config::{AgentConfig, Config, Discovery, insert_cluster_path};
 use divergence::{Divergence, Verdict};
-use reconcile::{Action, IndexEntry, IndexHead, SyncState, reconcile};
-pub use session_filesystem::PathMap;
-use session_filesystem::SessionFilesystem;
+use reconcile::{Action, SyncState, reconcile};
+use session_filesystem::{LocalAttempt, SessionPass, StatusIndexRecord};
+pub use session_filesystem::{PathMap, SessionFilesystem, SessionFsConfig};
 pub use status::{PeerStatus, StatusReport};
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
@@ -64,6 +63,17 @@ pub struct Engine {
     rotation_pending: bool,
     /// Import failures in the current pass; a rotation only settles at zero.
     import_errors: usize,
+    status_records: Option<Vec<StatusIndexRecord>>,
+}
+struct Execution<'a, 'filesystem> {
+    pass: &'a mut SessionPass<'filesystem>,
+    identity: &'a AgeIdentity,
+    node: &'a Node,
+    state: &'a mut SyncState,
+    divergence: &'a Divergence,
+    merged_logged: &'a mut std::collections::HashSet<String>,
+    rotation_pending: bool,
+    import_errors: &'a mut usize,
 }
 
 impl Engine {
@@ -76,9 +86,24 @@ impl Engine {
         identity: AgeIdentity,
         node: Node,
     ) -> Self {
+        let filesystem = SessionFilesystem::new(SessionFsConfig {
+            adapters,
+            excludes: Default::default(),
+            path_map: PathMap::default(),
+            canonical_home: None,
+        })
+        .expect("Engine::with_adapters requires unique agents and non-overlapping roots");
+        Self::with_filesystem(filesystem, identity, node)
+    }
+
+    pub fn with_filesystem(
+        filesystem: SessionFilesystem,
+        identity: AgeIdentity,
+        node: Node,
+    ) -> Self {
         let recipients_fp = Hash::new(identity.recipients().join("\n")).to_string();
         Self {
-            filesystem: SessionFilesystem::new(adapters),
+            filesystem,
             identity,
             node,
             state: SyncState::default(),
@@ -88,6 +113,7 @@ impl Engine {
             persist_enoent: 0,
             divergence: Divergence::default(),
             resync_interval: std::time::Duration::from_secs(60),
+            status_records: None,
             recipients_fp,
             rotation_pending: false,
             import_errors: 0,
@@ -110,16 +136,6 @@ impl Engine {
         self.resync_interval = interval;
     }
 
-    /// Per-agent `exclude` patterns from config (`[[agents]]` tables).
-    pub fn set_excludes(&mut self, excludes: std::collections::HashMap<String, Vec<String>>) {
-        self.filesystem.set_excludes(excludes);
-    }
-
-    /// The `[[path_map]]` + `canonical_home` from config (issue #13).
-    pub fn set_path_map(&mut self, map: PathMap, canonical_home: Option<PathBuf>) {
-        self.filesystem.set_path_map(map, canonical_home);
-    }
-
     /// Live index keys (wire form) — status/debug surface; the two-node
     /// tests assert wire hygiene through it.
     pub async fn index_keys(&self) -> Result<Vec<String>> {
@@ -134,29 +150,6 @@ impl Engine {
     /// Shut down the underlying node (flushes the blob store).
     pub async fn shutdown(self) -> Result<()> {
         self.node.shutdown().await
-    }
-
-    /// Read → encrypt → blob → upsert index. Dedups on *plaintext* (age
-    /// ciphertext is randomized), or the exporter's own write-back echoes.
-    /// `force` (recipient-set rotation) bypasses the dedup: the plaintext is
-    /// unchanged but the encryption no longer matches the configured set.
-    async fn import_action(
-        &mut self,
-        key: &str,
-        path: &Path,
-        winner: Option<Hash>,
-        force: bool,
-    ) -> Result<ImportOutcome> {
-        let plaintext = self.filesystem.read(key, path).await?;
-        if !force
-            && let Some(w) = winner
-            && self.get_plain(w).await.as_deref() == Some(&plaintext)
-        {
-            return Ok(ImportOutcome::Unchanged(w));
-        }
-        let ciphertext = self.identity.encrypt(&plaintext).await?;
-        let hash = self.node.publish(key.to_string(), ciphertext).await?;
-        Ok(ImportOutcome::Published(hash))
     }
 
     /// The divergence verdict for a key, decrypting whatever the cache cannot
@@ -182,31 +175,36 @@ impl Engine {
     /// Artifact files carry their own index keys but belong to a session
     /// (DECISIONS §9), so the count is distinct session identities, not keys.
     pub async fn status_report(&self) -> Result<StatusReport> {
+        let records = self.node.index_records().await?;
+        let records = self.filesystem.project_status_records(records);
+        self.status_from_records(&records).await
+    }
+
+    async fn status_from_records(&self, records: &[StatusIndexRecord]) -> Result<StatusReport> {
         let mut sessions = std::collections::HashSet::new();
         let mut conflicts = Vec::new();
-        for rec in self.node.index_records().await? {
+        for rec in records {
             let Some(winner) = rec.winner else {
-                continue; // deleted — never resurrect from stale live entries
+                continue;
             };
-            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            if self.filesystem.excluded(&key) {
-                continue; // frozen keys neither count nor report conflicts
+            let key = &rec.key;
+            if self.filesystem.excluded(key) {
+                continue;
             }
-            match self.filesystem.session_identity_of_key(&key) {
+            match self.filesystem.session_identity_of_key(key) {
                 Some(id) => sessions.insert((id.agent, id.project_id, id.session_id)),
-                // unconfigured agent or unparseable path: the key is the session
                 None => sessions.insert((key.clone(), String::new(), String::new())),
             };
             if rec.versions.len() <= 1 {
                 continue;
             }
-            let Some(rel) = self.filesystem.relative_of(&key).map(str::to_string) else {
+            let Some(rel) = self.filesystem.relative_of(key).map(str::to_string) else {
                 continue;
             };
-            let diverged = match self.divergence.cached(&key, &rec.versions) {
-                Some(d) => d,
+            let diverged = match self.divergence.cached(key, &rec.versions) {
+                Some(diverged) => diverged,
                 None => matches!(
-                    self.verdict_of(&key, winner, &rec.versions).await,
+                    self.verdict_of(key, winner, &rec.versions).await,
                     Verdict::Diverged(_)
                 ),
             };
@@ -219,13 +217,13 @@ impl Engine {
             .peer_paths()
             .await
             .into_iter()
-            .map(|p| PeerStatus {
-                id: p.id.to_string(),
-                path: p.kind.to_string(),
+            .map(|peer| PeerStatus {
+                id: peer.id.to_string(),
+                path: peer.kind.to_string(),
             })
             .collect();
         Ok(StatusReport {
-            namespace: self.node.namespace().map(|n| n.to_string()),
+            namespace: self.node.namespace().map(|namespace| namespace.to_string()),
             sessions: sessions.len(),
             conflicts,
             peers,
@@ -237,38 +235,70 @@ impl Engine {
         self.identity.decrypt(&ciphertext).await.ok()
     }
 
-    /// Publish the lossless union for a diverged key; the cached verdict gates
-    /// it, so a settled key costs one lookup. Returns the relative path when
-    /// it published.
-    async fn merge_one(&self, key: &str) -> Result<Option<String>> {
-        let Some(rel) = self.filesystem.relative_of(key).map(str::to_string) else {
+    async fn get_plain_with(identity: &AgeIdentity, node: &Node, hash: Hash) -> Option<Vec<u8>> {
+        let ciphertext = node.get_blob(hash).await.ok()?;
+        identity.decrypt(&ciphertext).await.ok()
+    }
+
+    async fn verdict_with(
+        identity: &AgeIdentity,
+        node: &Node,
+        divergence: &Divergence,
+        key: &str,
+        winner: Hash,
+        versions: &[Hash],
+    ) -> Verdict {
+        let winner_pt = Self::get_plain_with(identity, node, winner).await;
+        let mut plaintexts = Vec::with_capacity(versions.len());
+        if winner_pt.is_some() {
+            for hash in versions {
+                let Some(plaintext) = Self::get_plain_with(identity, node, *hash).await else {
+                    break;
+                };
+                plaintexts.push(plaintext);
+            }
+        }
+        divergence.verdict(key, versions, winner_pt, plaintexts)
+    }
+
+    async fn merge_with(
+        pass: &SessionPass<'_>,
+        identity: &AgeIdentity,
+        node: &Node,
+        divergence: &Divergence,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let Some(relative) = pass.relative_of(key).map(str::to_string) else {
             return Ok(None);
         };
-        let Some(rec) = self.node.index_record(key).await? else {
+        let Some(record) = node.index_record(key).await? else {
             return Ok(None);
         };
-        // a winning tombstone means the session is deleted — never merge it back.
-        let Some(winner) = rec.winner else {
+        // A winning tombstone means the session is deleted; never merge it back.
+        let Some(winner) = record.winner else {
             return Ok(None);
         };
-        if rec.versions.len() <= 1 {
+        if record.versions.len() <= 1 || divergence.cached(key, &record.versions) == Some(false) {
             return Ok(None);
         }
-        if self.divergence.cached(key, &rec.versions) == Some(false) {
-            return Ok(None);
-        }
-        let Verdict::Diverged(merged) = self.verdict_of(key, winner, &rec.versions).await else {
+        let Verdict::Diverged(merged) =
+            Self::verdict_with(identity, node, divergence, key, winner, &record.versions).await
+        else {
             return Ok(None);
         };
-        let ciphertext = self.identity.encrypt(&merged).await?;
-        self.node.publish(key.to_string(), ciphertext).await?;
-        Ok(Some(rel))
+        let ciphertext = identity.encrypt(&merged).await?;
+        node.publish(key.to_string(), ciphertext).await?;
+        Ok(Some(relative))
     }
 
     /// Write the status snapshot; `announce` additionally logs conflicts (off
     /// for the periodic liveness refresh, which would repeat them every tick).
     async fn write_status(&mut self, path: &Path, announce: bool) {
-        if let Ok(report) = self.status_report().await {
+        let report = match self.status_records.take() {
+            Some(records) => self.status_from_records(&records).await,
+            None => self.status_report().await,
+        };
+        if let Ok(report) = report {
             if let Ok(text) = toml::to_string_pretty(&report) {
                 let _ = tokio::fs::write(path, text).await;
             }
@@ -279,31 +309,6 @@ impl Engine {
                 self.conflicts_logged = report.conflicts.into_iter().collect();
             }
         }
-    }
-
-    /// Snapshot the synced index as `reconcile` input: winning entry plus the
-    /// count of distinct live hashes (divergence) per key.
-    async fn index_snapshot(&self) -> Result<std::collections::HashMap<String, IndexEntry>> {
-        let mut out = std::collections::HashMap::new();
-        for rec in self.node.index_records().await? {
-            let key = String::from_utf8(rec.key).context("index key not utf-8")?;
-            if self.filesystem.frozen(&key) {
-                continue;
-            }
-            let merge_allowed = self.filesystem.append_only(&key);
-            out.insert(
-                key,
-                IndexEntry {
-                    head: IndexHead {
-                        timestamp: rec.winner_ts,
-                        hash: rec.winner,
-                    },
-                    distinct_live: rec.versions.len(),
-                    merge_allowed,
-                },
-            );
-        }
-        Ok(out)
     }
 
     /// One pass: snapshot both sides, [`reconcile`], execute. The daemon loop
@@ -326,36 +331,71 @@ impl Engine {
         }
         self.import_errors = 0;
 
-        let local = self.filesystem.snapshot();
-        let index = match self.index_snapshot().await {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("ssync: index snapshot: {e:#}");
+        let records = match self.node.index_records().await {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("ssync: index snapshot: {error:#}");
                 return false;
             }
         };
+        let mut pass = self.filesystem.begin_pass(records);
+        let actions = reconcile(&self.state, pass.views().local, pass.views().index);
+        let local_keys: std::collections::HashSet<String> = pass
+            .views()
+            .local
+            .iter()
+            .map(|file| file.key.clone())
+            .collect();
         let mut changed = false;
-        for action in reconcile(&self.state, &local, &index) {
+        let mut index_changed = false;
+        for action in actions {
             if let Action::Tombstone { key } = &action
-                && self.filesystem.tombstone_withheld(key)
+                && pass.tombstone_withheld(key)
             {
                 continue;
             }
-            changed |= self.execute(&action).await;
+            let action_changed = Self::execute(
+                &action,
+                Execution {
+                    pass: &mut pass,
+                    identity: &self.identity,
+                    node: &self.node,
+                    state: &mut self.state,
+                    divergence: &self.divergence,
+                    merged_logged: &mut self.merged_logged,
+                    rotation_pending: self.rotation_pending,
+                    import_errors: &mut self.import_errors,
+                },
+            )
+            .await;
+            changed |= action_changed;
+            index_changed |= action_changed
+                && matches!(
+                    action,
+                    Action::Import { .. } | Action::Tombstone { .. } | Action::Merge { .. }
+                );
         }
-        // the rotation (or a fresh state) settles only after a clean pass, so
-        // a failed import keeps forcing until every blob is re-encrypted.
-        if self.import_errors == 0 && (self.rotation_pending || self.state.recipients.is_none()) {
+        if index_changed {
+            match self.node.index_records().await {
+                Ok(fresh) => pass.replace_records(fresh),
+                Err(error) => eprintln!("ssync: fresh status index snapshot: {error:#}"),
+            }
+        }
+        // Rotation settles only after a complete clean pass; otherwise the
+        // next pass must retry every key not confirmed under the new recipients.
+        if self.import_errors == 0
+            && pass.pass_complete()
+            && (self.rotation_pending || self.state.recipients.is_none())
+        {
             self.state.recipients = Some(self.recipients_fp.clone());
             self.rotation_pending = false;
         }
-        // prune state for keys gone from both dir and index
-        let live: std::collections::HashSet<&str> = local
-            .iter()
-            .map(|f| f.key.as_str())
-            .chain(index.keys().map(String::as_str))
-            .collect();
-        self.state.keys.retain(|k, _| live.contains(k.as_str()));
+        self.state.keys.retain(|key, _| {
+            local_keys.contains(key)
+                || pass.views().index.contains_key(key)
+                || pass.state_retained(key)
+        });
+        self.status_records = Some(pass.into_records());
         if let Some(path) = &self.state_path {
             match self.state.save(path) {
                 Ok(()) => self.persist_enoent = 0,
@@ -383,89 +423,126 @@ impl Engine {
 
     /// Execute one action and settle it into the carried state, so a
     /// self-write never echoes on the next pass.
-    async fn execute(&mut self, action: &Action) -> bool {
+    async fn execute(action: &Action, execution: Execution<'_, '_>) -> bool {
+        let Execution {
+            pass,
+            identity,
+            node,
+            state,
+            divergence,
+            merged_logged,
+            rotation_pending,
+            import_errors,
+        } = execution;
         match action {
-            Action::Import {
-                key,
-                path,
-                stamp,
-                winner,
-            } => match self
-                .import_action(key, path, *winner, self.rotation_pending)
-                .await
-            {
-                Ok(outcome) => {
-                    self.state.settle_import(key, *stamp, outcome.hash());
-                    matches!(outcome, ImportOutcome::Published(_))
+            Action::Import { key, stamp, winner } => {
+                let plaintext = match pass.read(key, *stamp).await {
+                    LocalAttempt::Completed(plaintext) => plaintext,
+                    LocalAttempt::Retry => {
+                        *import_errors += 1;
+                        return false;
+                    }
+                };
+                let outcome = async {
+                    // Age ciphertext is randomized, so dedup the plaintext unless
+                    // recipient rotation requires fresh encryption.
+                    if !rotation_pending
+                        && let Some(winner) = winner
+                        && Self::get_plain_with(identity, node, *winner)
+                            .await
+                            .as_deref()
+                            == Some(plaintext.as_slice())
+                    {
+                        return Ok(ImportOutcome::Unchanged(*winner));
+                    }
+                    let ciphertext = identity.encrypt(&plaintext).await?;
+                    let hash = node.publish(key.to_string(), ciphertext).await?;
+                    Ok::<_, anyhow::Error>(ImportOutcome::Published(hash))
                 }
-                Err(e) => {
-                    self.import_errors += 1;
-                    eprintln!("ssync: import {}: {e:#}", path.display());
-                    false
+                .await;
+                match outcome {
+                    Ok(outcome) => {
+                        state.settle_import(key, *stamp, outcome.hash());
+                        matches!(outcome, ImportOutcome::Published(_))
+                    }
+                    Err(error) => {
+                        *import_errors += 1;
+                        eprintln!("ssync: import {key}: {error:#}");
+                        false
+                    }
                 }
-            },
+            }
             Action::WriteFile { key, hash } => {
-                let ciphertext = match self.node.blob(*hash).await {
+                let ciphertext = match node.blob(*hash).await {
                     Ok(ciphertext) => ciphertext,
                     Err(error) => {
+                        *import_errors += 1;
                         eprintln!("ssync: fetch {key}: {error:#}");
                         return false;
                     }
                 };
-                let plaintext = match self.identity.decrypt(&ciphertext).await {
+                let plaintext = match identity.decrypt(&ciphertext).await {
                     Ok(plaintext) => plaintext,
                     Err(error) => {
+                        *import_errors += 1;
                         eprintln!("ssync: decrypt {key}: {error:#}");
                         return false;
                     }
                 };
-                match self.filesystem.write(key, plaintext).await {
-                    Ok(Some(stamp)) => {
-                        self.state.settle_write(key, *hash, Some(stamp));
+                match pass.write(key, plaintext).await {
+                    LocalAttempt::Completed(stamp) => {
+                        state.settle_write(key, *hash, Some(stamp));
+                        if rotation_pending || state.recipients.is_none() {
+                            state.keys.get_mut(key).expect("settled above").import_stamp = None;
+                            *import_errors += 1;
+                        }
+                        true
+                    }
+                    LocalAttempt::Retry => {
+                        *import_errors += 1;
+                        false
+                    }
+                }
+            }
+            Action::DeleteLocal { key } => match pass.delete(key).await {
+                LocalAttempt::Completed(existed) => {
+                    state.settle_delete(key);
+                    existed
+                }
+                LocalAttempt::Retry => {
+                    *import_errors += 1;
+                    false
+                }
+            },
+            Action::Tombstone { key } => match node.index_delete(key).await {
+                Ok(()) => {
+                    state.settle_delete(key);
+                    true
+                }
+                Err(error) => {
+                    *import_errors += 1;
+                    eprintln!("ssync: delete {key}: {error:#}");
+                    false
+                }
+            },
+            Action::Merge { key } => {
+                match Self::merge_with(pass, identity, node, divergence, key).await {
+                    Ok(Some(relative)) => {
+                        if merged_logged.insert(key.clone()) {
+                            eprintln!(
+                                "ssync: merged divergent session {relative} (lossless union, nothing lost)"
+                            );
+                        }
                         true
                     }
                     Ok(None) => false,
                     Err(error) => {
-                        eprintln!("ssync: write {key}: {error:#}");
+                        *import_errors += 1;
+                        eprintln!("ssync: merge {key}: {error:#}");
                         false
                     }
                 }
             }
-            Action::DeleteLocal { key } => {
-                self.state.settle_delete(key);
-                match self.filesystem.delete(key).await {
-                    Ok(existed) => existed,
-                    Err(error) => {
-                        eprintln!("ssync: delete local {key}: {error:#}");
-                        false
-                    }
-                }
-            }
-            Action::Tombstone { key } => match self.node.index_delete(key).await {
-                Ok(()) => {
-                    self.state.settle_delete(key);
-                    true
-                }
-                Err(e) => {
-                    eprintln!("ssync: delete {key}: {e:#}");
-                    false
-                }
-            },
-            Action::Merge { key } => match self.merge_one(key).await {
-                Ok(Some(rel)) => {
-                    if self.merged_logged.insert(key.clone()) {
-                        eprintln!(
-                            "ssync: merged divergent session {rel} (lossless union, nothing lost)"
-                        );
-                    }
-                    true
-                }
-                Ok(None) => false,
-                Err(e) => {
-                    eprintln!("ssync: merge {key}: {e:#}");
-                    false
-                }
-            },
         }
     }
 
@@ -488,15 +565,7 @@ impl Engine {
     pub async fn run(&mut self, status_path: &Path) -> Result<()> {
         use std::time::Duration;
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut watcher = notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
-        })?;
-        for root in self.filesystem.roots() {
-            watcher
-                .watch(root, RecursiveMode::Recursive)
-                .with_context(|| format!("watching {}", root.display()))?;
-        }
+        let mut fs_signals = self.filesystem.signals()?;
 
         // Doc events are drained behind the Node seam (Node::signals): only
         // wake pings cross, and peers learned on the live stream are
@@ -526,11 +595,8 @@ impl Engine {
                 }
             };
             tokio::select! {
-                Some(res) = rx.recv() => {
-                    if let Ok(event) = res
-                        && event.paths.iter().any(|p| self.filesystem.is_session_file(p)) {
-                            deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
-                        }
+                Some(()) = fs_signals.recv() => {
+                    deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
                 }
                 ev = erx.recv(), if !events_ended => {
                     match ev {
@@ -634,6 +700,48 @@ mod tests {
         let ciphertext = engine.node.get_blob(hash).await.unwrap();
         assert_ne!(&ciphertext[..], &contents[..], "blob must not be plaintext");
         assert_eq!(engine.get_plain(hash).await.as_deref(), Some(&contents[..]));
+    }
+
+    #[tokio::test]
+    async fn fresh_state_write_back_remains_unsettled_until_republished() {
+        let base = std::env::temp_dir().join(format!("ssync-fresh-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sessions_root = base.join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        let identity = AgeIdentity::generate().await.unwrap();
+        let ciphertext = identity.encrypt(b"session").await.unwrap();
+        let hash = node.add_blob(ciphertext).await.unwrap();
+        let mut engine = Engine::new(PiAdapter::new("pi", &sessions_root), identity, node);
+        let key = "pi/--project--/session.jsonl";
+
+        let mut pass = engine.filesystem.begin_pass(Vec::new());
+        assert!(
+            Engine::execute(
+                &Action::WriteFile {
+                    key: key.to_string(),
+                    hash,
+                },
+                Execution {
+                    pass: &mut pass,
+                    identity: &engine.identity,
+                    node: &engine.node,
+                    state: &mut engine.state,
+                    divergence: &engine.divergence,
+                    merged_logged: &mut engine.merged_logged,
+                    rotation_pending: engine.rotation_pending,
+                    import_errors: &mut engine.import_errors,
+                },
+            )
+            .await
+        );
+        drop(pass);
+
+        assert_eq!(engine.import_errors, 1);
+        assert_eq!(engine.state.keys[key].import_stamp, None);
+        assert!(engine.state.recipients.is_none());
     }
 
     #[tokio::test]
@@ -805,6 +913,31 @@ mod tests {
 
         let report = engine.status_report().await.unwrap();
         assert_eq!(report.sessions, 1, "3 files, 1 session");
+    }
+
+    #[tokio::test]
+    async fn standalone_status_skips_hostile_paths_without_hiding_unconfigured_agents() {
+        let base = std::env::temp_dir().join(format!("ssync-status-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        node.publish("pi/../escape".to_string(), b"bad".to_vec())
+            .await
+            .unwrap();
+        node.publish("ghost/project/session".to_string(), b"good".to_vec())
+            .await
+            .unwrap();
+        let engine = Engine::new(
+            PiAdapter::new("pi", base.join("unreadable-sessions")),
+            AgeIdentity::generate().await.unwrap(),
+            node,
+        );
+
+        let report = engine.status_report().await.unwrap();
+
+        assert_eq!(report.sessions, 1);
     }
 
     #[tokio::test]
