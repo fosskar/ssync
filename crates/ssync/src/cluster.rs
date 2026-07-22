@@ -63,7 +63,7 @@ pub async fn cmd_init(config_path: &Path, path: Option<PathBuf>) -> Result<()> {
     }
     ensure_no_recipients(&config)?;
 
-    let identity = load_or_generate_identity(&config)?;
+    let identity = load_or_generate_identity(&config).await?;
     let node_key_path = config.node_key_file();
     let secret = ssync_net::load_or_create_secret_key(&node_key_path).await?;
     let node_id = secret.public().to_string();
@@ -311,7 +311,7 @@ mod tests {
             std::env::temp_dir().join(format!("ssync-cluster-{}-init-text", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.toml");
-        let identity = ssync_crypto::AgeIdentity::generate().unwrap();
+        let identity = ssync_crypto::AgeIdentity::generate().await.unwrap();
         write_secret(&dir.join("age.key"), &identity.to_secret_string()).unwrap();
         let original = format!(
             "# hand-written config, keep me\nage_identity_path = \"{}\"\ndata_dir = \"{}\"\n# agents to sync\n[[agents]]\nagent = \"pi\"\nsession_dir = \"{}\"\n",

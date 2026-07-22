@@ -20,7 +20,7 @@ use ssync_net::iroh::SecretKey;
 
 #[tokio::test]
 async fn session_created_on_a_appears_on_b() {
-    let sim = Sim::new("base");
+    let sim = Sim::new("base").await;
 
     // --- node A: has a real session file ---
     let rel = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
@@ -29,14 +29,14 @@ async fn session_created_on_a_appears_on_b() {
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    let mut peer_a = sim.pi_peer("a", "pi", node_a).await;
     peer_a.write(rel, contents);
     peer_a.tick().await;
 
     // --- node B: empty session dir, joins A's namespace ---
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "pi", node_b);
+    let mut peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     // sync is async: tick B until the file materializes, byte-identical.
     let dest = peer_b.path(rel);
@@ -46,9 +46,9 @@ async fn session_created_on_a_appears_on_b() {
 
 #[tokio::test]
 async fn per_machine_identities_sync_both_directions() {
-    let sim = Sim::new("permachine");
-    let id_a = AgeIdentity::generate().unwrap();
-    let id_b = AgeIdentity::generate().unwrap();
+    let sim = Sim::new("permachine").await;
+    let id_a = AgeIdentity::generate().await.unwrap();
+    let id_b = AgeIdentity::generate().await.unwrap();
 
     // --- node A: own key, B listed as recipient, has a session ---
     let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
@@ -57,7 +57,9 @@ async fn per_machine_identities_sync_both_directions() {
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut ident_a = AgeIdentity::from_secret_string(&id_a.to_secret_string()).unwrap();
+    let mut ident_a = AgeIdentity::from_secret_string(&id_a.to_secret_string())
+        .await
+        .unwrap();
     ident_a.add_recipients([id_b.recipient_string()]);
     let mut peer_a = sim.pi_peer_as("a", "pi", ident_a, node_a);
     peer_a.write(rel_a, contents_a);
@@ -66,7 +68,9 @@ async fn per_machine_identities_sync_both_directions() {
     // --- node B: own key, A listed as recipient ---
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut ident_b = AgeIdentity::from_secret_string(&id_b.to_secret_string()).unwrap();
+    let mut ident_b = AgeIdentity::from_secret_string(&id_b.to_secret_string())
+        .await
+        .unwrap();
     ident_b.add_recipients([id_a.recipient_string()]);
     let mut peer_b = sim.pi_peer_as("b", "pi", ident_b, node_b);
 
@@ -93,14 +97,21 @@ async fn per_machine_identities_reach_a_third_machine() {
     // every machine must encrypt to *all* peers. three nodes, full recipient
     // mesh, one shared namespace — a session from A must land on B and C, and
     // one from C must land on A and B.
-    let sim = Sim::new("threenode");
-    let ids: Vec<AgeIdentity> = (0..3).map(|_| AgeIdentity::generate().unwrap()).collect();
-    let recipients: Vec<String> = ids.iter().map(|i| i.recipient_string()).collect();
-    let ident = |n: usize| {
-        let mut id = AgeIdentity::from_secret_string(&ids[n].to_secret_string()).unwrap();
-        id.add_recipients(recipients.clone());
-        id
-    };
+    let sim = Sim::new("threenode").await;
+    let mut ids = Vec::with_capacity(3);
+    for _ in 0..3 {
+        ids.push(AgeIdentity::generate().await.unwrap());
+    }
+    let recipients: Vec<String> = ids.iter().map(AgeIdentity::recipient_string).collect();
+    let mut identities = Vec::with_capacity(3);
+    for id in &ids {
+        let mut identity = AgeIdentity::from_secret_string(&id.to_secret_string())
+            .await
+            .unwrap();
+        identity.add_recipients(recipients.clone());
+        identities.push(identity);
+    }
+    let mut identities = identities.into_iter();
 
     let rel_a = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4d.jsonl";
     let contents_a = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"from A\"}\n";
@@ -109,17 +120,17 @@ async fn per_machine_identities_reach_a_third_machine() {
     node_a.create_namespace().await.unwrap();
     let ticket_b = node_a.share().await.unwrap();
     let ticket_c = node_a.share().await.unwrap();
-    let mut peer_a = sim.pi_peer_as("a", "pi", ident(0), node_a);
+    let mut peer_a = sim.pi_peer_as("a", "pi", identities.next().unwrap(), node_a);
     peer_a.write(rel_a, contents_a);
     peer_a.tick().await;
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket_b).await.unwrap();
-    let mut peer_b = sim.pi_peer_as("b", "pi", ident(1), node_b);
+    let mut peer_b = sim.pi_peer_as("b", "pi", identities.next().unwrap(), node_b);
 
     let mut node_c = sim.node("c").await;
     node_c.join(ticket_c).await.unwrap();
-    let mut peer_c = sim.pi_peer_as("c", "pi", ident(2), node_c);
+    let mut peer_c = sim.pi_peer_as("c", "pi", identities.next().unwrap(), node_c);
 
     // A → B and A → C: both peers decrypt A's blob with their own keys.
     let dest_b = peer_b.path(rel_a);
@@ -145,16 +156,16 @@ async fn per_machine_identities_reach_a_third_machine() {
 
 #[tokio::test]
 async fn live_write_propagates_without_restart() {
-    let sim = Sim::new("live");
+    let sim = Sim::new("live").await;
 
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a).await;
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     // start both daemons and let them enter their loops
     let root_a = peer_a.run();
@@ -173,7 +184,7 @@ async fn live_write_propagates_without_restart() {
 
 #[tokio::test]
 async fn shared_namespace_auto_connects_without_ticket() {
-    let sim = Sim::new("shared");
+    let sim = Sim::new("shared").await;
     let ns_secret = ssync_net::generate_key_bytes();
 
     let mut node_a = sim.node("a").await;
@@ -190,8 +201,8 @@ async fn shared_namespace_auto_connects_without_ticket() {
     node_a.sync_with(vec![addr_b]).await.unwrap();
     node_b.sync_with(vec![addr_a]).await.unwrap();
 
-    let peer_a = sim.pi_peer("a", "pi", node_a);
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_a = sim.pi_peer("a", "pi", node_a).await;
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     let root_a = peer_a.run();
     let root_b = peer_b.run();
@@ -215,13 +226,13 @@ async fn shared_namespace_auto_connects_without_ticket() {
 
 #[tokio::test]
 async fn deletion_propagates_and_does_not_resurrect() {
-    let sim = Sim::new("del");
+    let sim = Sim::new("del").await;
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019edddd0001eeee71acbe20delete001.jsonl";
 
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a).await;
     // keep a second unrelated session so the dir is never empty (deletion guard)
     peer_a.write(
         "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl",
@@ -230,7 +241,7 @@ async fn deletion_propagates_and_does_not_resurrect() {
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     peer_a.write(rel, b"header\nto-be-deleted\n");
     // the session's artifact dir (omp subagent transcript) syncs and must be
@@ -272,13 +283,13 @@ async fn deletion_propagates_and_does_not_resurrect() {
 async fn deletion_by_non_author_propagates_back() {
     // a session created on A, deleted on B, must disappear on A (and stay gone)
     // even though A authored the index entry (TODO "deletion by any participant").
-    let sim = Sim::new("xdel");
+    let sim = Sim::new("xdel").await;
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019exdel0001eeee71acbe20xdele001.jsonl";
 
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a).await;
     // second session so neither dir ever goes empty (deletion guard)
     peer_a.write(
         "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl",
@@ -288,7 +299,7 @@ async fn deletion_by_non_author_propagates_back() {
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     let root_a = peer_a.run();
     let root_b = peer_b.run();
@@ -320,7 +331,7 @@ async fn deletion_while_daemon_down_is_not_reimported() {
     // engine 1 imports two sessions and persists its state; one file is
     // deleted "while the daemon is down"; engine 2 (same state file, same
     // node dir) must tombstone the deleted session instead of re-importing it.
-    let sim = Sim::new("down-del");
+    let sim = Sim::new("down-del").await;
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019edown0001eeee71acbe20downdel01.jsonl";
     let keep = "--proj--/keep_019e0000keepkeepkeep71acbe20keep00001.jsonl";
     let state_path = sim.base.join("state.toml");
@@ -328,7 +339,7 @@ async fn deletion_while_daemon_down_is_not_reimported() {
     let ns = {
         let mut node = sim.node("n").await;
         let ns = node.create_namespace().await.unwrap();
-        let mut peer = sim.pi_peer("n", "pi", node);
+        let mut peer = sim.pi_peer("n", "pi", node).await;
         peer.write(rel, b"header\ndelete me\n");
         peer.write(keep, b"keep\n");
         peer.engine.persist_state(&state_path);
@@ -342,7 +353,7 @@ async fn deletion_while_daemon_down_is_not_reimported() {
 
     let mut node = sim.node("n").await;
     node.open_namespace(ns).await.unwrap();
-    let mut peer = sim.pi_peer("n", "pi", node);
+    let mut peer = sim.pi_peer("n", "pi", node).await;
     peer.engine.persist_state(&state_path);
     peer.tick().await;
 
@@ -353,17 +364,17 @@ async fn deletion_while_daemon_down_is_not_reimported() {
 
 #[tokio::test]
 async fn divergent_sessions_merge_and_converge() {
-    let sim = Sim::new("merge");
+    let sim = Sim::new("merge").await;
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019eccccdddd71acbe20merge0000001.jsonl";
 
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a).await;
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     // each machine has its own divergent version of the same session
     peer_a.write(rel, b"header\ncommon\nonly-on-a\n");
@@ -391,21 +402,21 @@ async fn divergent_sessions_merge_and_converge() {
 
 #[tokio::test]
 async fn divergent_writes_are_detected_as_conflict() {
-    let sim = Sim::new("conflict");
+    let sim = Sim::new("conflict").await;
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
 
     // node A publishes its version of the session
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    let mut peer_a = sim.pi_peer("a", "pi", node_a).await;
     peer_a.write(rel, b"version from A\n");
     peer_a.tick().await;
 
     // node B joins, then publishes its OWN divergent version of the same session
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "pi", node_b);
+    let mut peer_b = sim.pi_peer("b", "pi", node_b).await;
     peer_b.write(rel, b"different version from B\n");
     peer_b.tick().await;
 
@@ -431,7 +442,7 @@ async fn divergent_writes_are_detected_as_conflict() {
 
 #[tokio::test]
 async fn pi_and_omp_sessions_sync_side_by_side() {
-    let sim = Sim::new("multiagent");
+    let sim = Sim::new("multiagent").await;
 
     // node A: one pi session and one omp session in their own roots
     let pi_root_a = sim.base.join("a/pi-sessions");
@@ -453,7 +464,7 @@ async fn pi_and_omp_sessions_sync_side_by_side() {
             Box::new(PiAdapter::new("pi", &pi_root_a)) as Box<dyn Adapter>,
             Box::new(PiAdapter::new("omp", &omp_root_a)),
         ],
-        sim.identity(),
+        sim.identity().await,
         node_a,
     );
     peer_a.tick().await;
@@ -471,7 +482,7 @@ async fn pi_and_omp_sessions_sync_side_by_side() {
             Box::new(PiAdapter::new("pi", &pi_root_b)) as Box<dyn Adapter>,
             Box::new(PiAdapter::new("omp", &omp_root_b)),
         ],
-        sim.identity(),
+        sim.identity().await,
         node_b,
     );
 
@@ -487,7 +498,7 @@ async fn pi_and_omp_sessions_sync_side_by_side() {
 
 #[tokio::test]
 async fn omp_blob_store_syncs_binary_blobs() {
-    let sim = Sim::new("blobstore");
+    let sim = Sim::new("blobstore").await;
 
     // node A: one blob as omp writes it — bare hash plus a `.png` alias,
     // identical binary (non-UTF8) content.
@@ -504,7 +515,7 @@ async fn omp_blob_store_syncs_binary_blobs() {
     let mut peer_a = sim.peer(
         "a",
         vec![Box::new(BlobStoreAdapter::new("omp-blobs", &blob_root_a)) as Box<dyn Adapter>],
-        sim.identity(),
+        sim.identity().await,
         node_a,
     );
     peer_a.tick().await;
@@ -517,7 +528,7 @@ async fn omp_blob_store_syncs_binary_blobs() {
     let mut peer_b = sim.peer(
         "b",
         vec![Box::new(BlobStoreAdapter::new("omp-blobs", &blob_root_b)) as Box<dyn Adapter>],
-        sim.identity(),
+        sim.identity().await,
         node_b,
     );
 
@@ -533,7 +544,7 @@ async fn omp_blob_store_syncs_binary_blobs() {
 
 #[tokio::test]
 async fn missed_content_download_is_fetched_on_write() {
-    let sim = Sim::new("fetch");
+    let sim = Sim::new("fetch").await;
     let ns_secret = ssync_net::generate_key_bytes();
 
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019efeeed0001eee71acbe20fetch0001.jsonl";
@@ -551,10 +562,10 @@ async fn missed_content_download_is_fetched_on_write() {
     node_a.sync_with(vec![addr_b]).await.unwrap();
     node_b.sync_with(vec![addr_a]).await.unwrap();
 
-    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    let mut peer_a = sim.pi_peer("a", "pi", node_a).await;
     peer_a.write(rel, contents);
     peer_a.tick().await;
-    let mut peer_b = sim.pi_peer("b", "pi", node_b);
+    let mut peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     // the file can only materialize via the explicit peer fetch
     let dest = peer_b.path(rel);
@@ -564,7 +575,7 @@ async fn missed_content_download_is_fetched_on_write() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_recovers_when_peer_comes_up_late() {
-    let sim = Sim::new("resync");
+    let sim = Sim::new("resync").await;
     let ns_secret = ssync_net::generate_key_bytes();
 
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019eresync001eee71acbe20resync001.jsonl";
@@ -578,7 +589,7 @@ async fn sync_recovers_when_peer_comes_up_late() {
     // dialing a peer that is down. B never learns about A on its own.
     node_a.sync_with(vec![addr_b]).await.unwrap();
 
-    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    let mut peer_a = sim.pi_peer("a", "pi", node_a).await;
     peer_a.write(rel, contents);
     peer_a.engine.set_resync_interval(Duration::from_secs(2));
     peer_a.run();
@@ -594,7 +605,7 @@ async fn sync_recovers_when_peer_comes_up_late() {
         .sync_with(vec![ssync_net::iroh::EndpointAddr::from(bogus)])
         .await
         .unwrap();
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
     let root_b = peer_b.run();
 
     let dest = root_b.join(rel);
@@ -610,7 +621,7 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     // The ticket issuer starts with an empty peer list (`join` only records
     // peers on the joining side), so a missed content download on the issuer
     // is unrecoverable unless it learns the joiner from live sync events.
-    let sim = Sim::new("learn-peer");
+    let sim = Sim::new("learn-peer").await;
 
     let rel = "--proj--/2026-01-01T00-00-00-000Z_019efeeed0001eee71acbe20learn0001.jsonl";
     let contents = b"content the issuer failed to auto-download\n";
@@ -624,7 +635,7 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     let ticket = node_a.share().await.unwrap();
     node_b.join(ticket).await.unwrap();
 
-    let peer_b = sim.pi_peer("b", "pi", node_b);
+    let peer_b = sim.pi_peer("b", "pi", node_b).await;
     peer_b.write(rel, contents);
     peer_b.run();
 
@@ -642,7 +653,7 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
     }
     assert!(synced, "joiner's entry never reached the issuer's index");
 
-    let peer_a = sim.pi_peer("a", "pi", node_a);
+    let peer_a = sim.pi_peer("a", "pi", node_a).await;
     let root_a = peer_a.run();
 
     let dest = root_a.join(rel);
@@ -655,7 +666,7 @@ async fn ticket_issuer_learns_peers_and_recovers_missed_content() {
 /// there when a peer publishes it. Non-excluded traffic flows normally.
 #[tokio::test]
 async fn excluded_projects_neither_publish_nor_materialize() {
-    let sim = Sim::new("exclude");
+    let sim = Sim::new("exclude").await;
 
     let rel_normal =
         "--home-x-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
@@ -667,7 +678,7 @@ async fn excluded_projects_neither_publish_nor_materialize() {
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut peer_a = sim.pi_peer("a", "pi", node_a);
+    let mut peer_a = sim.pi_peer("a", "pi", node_a).await;
     for rel in [rel_normal, rel_secret] {
         peer_a.write(rel, &contents);
     }
@@ -679,7 +690,7 @@ async fn excluded_projects_neither_publish_nor_materialize() {
     // --- node B: no excludes ---
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "pi", node_b);
+    let mut peer_b = sim.pi_peer("b", "pi", node_b).await;
 
     // the normal session reaches B ...
     let dest_normal = peer_b.path(rel_normal);
@@ -721,7 +732,7 @@ async fn excluded_projects_neither_publish_nor_materialize() {
 /// guard propagates deletion to every peer.
 #[tokio::test]
 async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
-    let sim = Sim::new("agent-drop");
+    let sim = Sim::new("agent-drop").await;
     let two_adapters = |root_pi: &Path, root_omp: &Path| -> Vec<Box<dyn Adapter>> {
         vec![
             Box::new(PiAdapter::new("pi", root_pi)),
@@ -744,7 +755,7 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
     let mut peer_a = sim.peer(
         "a",
         two_adapters(&root_pi_a, &root_omp_a),
-        sim.identity(),
+        sim.identity().await,
         node_a,
     );
     peer_a.persist();
@@ -760,7 +771,7 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
     let mut peer_b = sim.peer(
         "b",
         two_adapters(&root_pi_b, &root_omp_b),
-        sim.identity(),
+        sim.identity().await,
         node_b,
     );
     let dest = root_omp_b.join(rel);
@@ -775,7 +786,7 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
     let mut peer_a2 = sim.peer(
         "a",
         vec![Box::new(PiAdapter::new("pi", &root_pi_a)) as Box<dyn Adapter>],
-        sim.identity(),
+        sim.identity().await,
         node_a2,
     );
     peer_a2.persist();
@@ -806,7 +817,7 @@ async fn removing_an_agent_freezes_it_instead_of_tombstoning() {
 /// hard case, omp's home-relative wire keys derived via `canonical_home`.
 #[tokio::test]
 async fn path_mapped_machines_converge() {
-    let sim = Sim::new("pathmap");
+    let sim = Sim::new("pathmap").await;
     let canonical_home = "/canon-home";
     let canonical_cwd = "/canon-home/Projects/x";
 
@@ -820,7 +831,7 @@ async fn path_mapped_machines_converge() {
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut peer_a = sim.pi_peer("a", "omp", node_a);
+    let mut peer_a = sim.pi_peer("a", "omp", node_a).await;
     peer_a.write(rel_a, &canonical_bytes);
     peer_a.tick().await;
     let src_a = peer_a.path(rel_a);
@@ -838,7 +849,7 @@ async fn path_mapped_machines_converge() {
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "omp", node_b);
+    let mut peer_b = sim.pi_peer("b", "omp", node_b).await;
     peer_b.engine.set_path_map(map, Some(canonical_home.into()));
     let root_b = peer_b.root.clone();
 
@@ -936,7 +947,7 @@ async fn path_mapped_machines_converge() {
 /// is active for another agent.
 #[tokio::test]
 async fn path_map_leaves_cwdless_adapters_alone() {
-    let sim = Sim::new("pathmap-blobs");
+    let sim = Sim::new("pathmap-blobs").await;
     let adapters = |root_pi: &Path, root_blobs: &Path| -> Vec<Box<dyn Adapter>> {
         vec![
             Box::new(PiAdapter::new("pi", root_pi)),
@@ -958,7 +969,7 @@ async fn path_map_leaves_cwdless_adapters_alone() {
     let mut peer_a = sim.peer(
         "a",
         adapters(&root_pi_a, &root_blobs_a),
-        sim.identity(),
+        sim.identity().await,
         node_a,
     );
     peer_a.tick().await;
@@ -972,7 +983,7 @@ async fn path_map_leaves_cwdless_adapters_alone() {
     let mut peer_b = sim.peer(
         "b",
         adapters(&root_pi_b, &root_blobs_b),
-        sim.identity(),
+        sim.identity().await,
         node_b,
     );
     peer_b.engine.set_path_map(
@@ -1002,7 +1013,7 @@ async fn path_map_leaves_cwdless_adapters_alone() {
 /// canonical_home) — peers must keep their copies.
 #[tokio::test]
 async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
-    let sim = Sim::new("pathmap-freeze");
+    let sim = Sim::new("pathmap-freeze").await;
 
     let rel = "-Projects-x/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
     // header cwd points INSIDE the prefix B will later map
@@ -1013,7 +1024,7 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let mut node_b = sim.node_with_key("b", key_b.clone()).await;
     let ns = node_b.create_namespace().await.unwrap();
     let ticket = node_b.share().await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "omp", node_b);
+    let mut peer_b = sim.pi_peer("b", "omp", node_b).await;
     peer_b.write(rel, &bytes);
     let src_b = peer_b.path(rel);
     peer_b.persist();
@@ -1023,7 +1034,7 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let mut node_a = sim.node("a").await;
     node_a.join(ticket).await.unwrap();
     let a_addr = node_a.endpoint_addr();
-    let mut peer_a = sim.pi_peer("a", "omp", node_a);
+    let mut peer_a = sim.pi_peer("a", "omp", node_a).await;
     let dest_a = peer_a.path(rel);
     let ok = converge(&mut [&mut peer_a], || file_eq(&dest_a, &bytes)).await;
     assert!(ok, "session did not sync to A");
@@ -1034,7 +1045,7 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let mut node_b2 = sim.node_with_key("b", key_b).await;
     node_b2.open_namespace(ns).await.unwrap();
     node_b2.sync_with(vec![a_addr]).await.unwrap();
-    let mut peer_b2 = sim.pi_peer("b", "omp", node_b2);
+    let mut peer_b2 = sim.pi_peer("b", "omp", node_b2).await;
     peer_b2.engine.set_path_map(
         ssync_core::PathMap::new(vec![("/data".into(), "/other-canon".into())]).unwrap(),
         None, // omp cannot encode home-relative canonicals without this

@@ -16,10 +16,10 @@ use harness::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn initial_import_of_many_sessions_does_not_wedge() {
-    let sim = Sim::new("event-flood");
+    let sim = Sim::new("event-flood").await;
     let mut node = sim.node("n").await;
     node.create_namespace().await.unwrap();
-    let peer = sim.pi_peer("n", "pi", node);
+    let peer = sim.pi_peer("n", "pi", node).await;
     for i in 0..1500u32 {
         peer.write(
             format!(

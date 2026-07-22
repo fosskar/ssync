@@ -24,9 +24,9 @@ async fn winner_of(node: &Node, key: &str) -> Option<Hash> {
 
 #[tokio::test]
 async fn recipient_change_republishes_unchanged_sessions() {
-    let sim = Sim::new("rotation-recipients");
-    let id_a = AgeIdentity::generate().unwrap();
-    let id_b = AgeIdentity::generate().unwrap();
+    let sim = Sim::new("rotation-recipients").await;
+    let id_a = AgeIdentity::generate().await.unwrap();
+    let id_b = AgeIdentity::generate().await.unwrap();
 
     let rel = "--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
     let contents = b"{\"type\":\"session\",\"version\":3}\n{\"msg\":\"unchanged\"}\n";
@@ -42,7 +42,9 @@ async fn recipient_change_republishes_unchanged_sessions() {
     observer.join(ticket).await.unwrap();
 
     // run 1: encrypts to {A} only, persists state (and with it the set).
-    let ident1 = AgeIdentity::from_secret_string(&id_a.to_secret_string()).unwrap();
+    let ident1 = AgeIdentity::from_secret_string(&id_a.to_secret_string())
+        .await
+        .unwrap();
     let mut peer = sim.pi_peer_as("a", "pi", ident1, node_a);
     peer.write(rel, contents);
     peer.persist();
@@ -68,7 +70,9 @@ async fn recipient_change_republishes_unchanged_sessions() {
         .sync_with(vec![observer.endpoint_addr()])
         .await
         .unwrap();
-    let mut ident2 = AgeIdentity::from_secret_string(&id_a.to_secret_string()).unwrap();
+    let mut ident2 = AgeIdentity::from_secret_string(&id_a.to_secret_string())
+        .await
+        .unwrap();
     ident2.add_recipients([id_b.recipient_string()]);
     let mut peer2 = sim.pi_peer_as("a", "pi", ident2, node_a2);
     peer2.persist();
@@ -91,6 +95,7 @@ async fn recipient_change_republishes_unchanged_sessions() {
     for _ in 0..60 {
         if let Ok(ciphertext) = observer.get_blob(h2).await {
             plain = AgeIdentity::from_secret_string(&id_b.to_secret_string())
+                .await
                 .unwrap()
                 .decrypt(&ciphertext)
                 .await
@@ -118,7 +123,7 @@ async fn recipient_change_republishes_unchanged_sessions() {
 
 #[tokio::test]
 async fn namespace_rotation_drops_stale_replica() {
-    let sim = Sim::new("rotation-namespace");
+    let sim = Sim::new("rotation-namespace").await;
     let mut node = sim.node("n").await;
     let old = node.create_namespace().await.unwrap();
     node.publish("pi/x", b"old ciphertext".to_vec())

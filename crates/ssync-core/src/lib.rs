@@ -613,7 +613,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
 
@@ -645,7 +645,7 @@ mod tests {
             .unwrap();
         let engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         let v1 = engine.identity.encrypt(b"h\na\n").await.unwrap();
@@ -672,7 +672,7 @@ mod tests {
             .unwrap();
         let engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         let h1 = engine
@@ -718,7 +718,7 @@ mod tests {
             .unwrap();
         let engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         let report = engine.status_report().await.unwrap();
@@ -760,7 +760,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
 
@@ -798,7 +798,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", &sessions_root),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         assert!(engine.tick_once().await, "tick must import");
@@ -821,7 +821,7 @@ mod tests {
         node.create_namespace().await.unwrap();
         let mut engine = Engine::new(
             PiAdapter::new("pi", base.join("sessions")),
-            AgeIdentity::generate().unwrap(),
+            AgeIdentity::generate().await.unwrap(),
             node,
         );
         let state_path = base.join("missing-dir/state.toml");
