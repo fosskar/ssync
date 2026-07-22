@@ -161,7 +161,7 @@ impl Engine {
         {
             return Ok(ImportOutcome::Unchanged(w));
         }
-        let ciphertext = self.identity.encrypt(&plaintext)?;
+        let ciphertext = self.identity.encrypt(&plaintext).await?;
         let hash = self.node.publish(key.to_string(), ciphertext).await?;
         Ok(ImportOutcome::Published(hash))
     }
@@ -241,7 +241,7 @@ impl Engine {
 
     async fn get_plain(&self, hash: Hash) -> Option<Vec<u8>> {
         let ciphertext = self.node.get_blob(hash).await.ok()?;
-        self.identity.decrypt(&ciphertext).ok()
+        self.identity.decrypt(&ciphertext).await.ok()
     }
 
     /// Publish the lossless union for a diverged key; the cached verdict gates
@@ -267,7 +267,7 @@ impl Engine {
         let Verdict::Diverged(merged) = self.verdict_of(key, winner, &rec.versions).await else {
             return Ok(None);
         };
-        let ciphertext = self.identity.encrypt(&merged)?;
+        let ciphertext = self.identity.encrypt(&merged).await?;
         self.node.publish(key.to_string(), ciphertext).await?;
         Ok(Some(rel))
     }
@@ -457,7 +457,7 @@ impl Engine {
                         return false;
                     }
                 };
-                let plaintext = match self.identity.decrypt(&ciphertext) {
+                let plaintext = match self.identity.decrypt(&ciphertext).await {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("ssync: decrypt {key}: {e:#}");
@@ -736,7 +736,7 @@ mod tests {
             AgeIdentity::generate().unwrap(),
             node,
         );
-        let v1 = engine.identity.encrypt(b"h\na\n").unwrap();
+        let v1 = engine.identity.encrypt(b"h\na\n").await.unwrap();
         let h1 = engine.node.add_blob(v1).await.unwrap();
         let missing = Hash::new(b"never-added");
 
@@ -763,9 +763,16 @@ mod tests {
             AgeIdentity::generate().unwrap(),
             node,
         );
-        let enc = |b: &[u8]| engine.identity.encrypt(b).unwrap();
-        let h1 = engine.node.add_blob(enc(b"h\na\n")).await.unwrap();
-        let h2 = engine.node.add_blob(enc(b"h\nb\n")).await.unwrap();
+        let h1 = engine
+            .node
+            .add_blob(engine.identity.encrypt(b"h\na\n").await.unwrap())
+            .await
+            .unwrap();
+        let h2 = engine
+            .node
+            .add_blob(engine.identity.encrypt(b"h\nb\n").await.unwrap())
+            .await
+            .unwrap();
 
         let Verdict::Diverged(union) = engine.verdict_of("k", h2, &[h1, h2]).await else {
             panic!("fork must read as diverged");
@@ -773,7 +780,11 @@ mod tests {
         assert_eq!(engine.divergence.cached("k", &[h1, h2]), Some(true));
 
         // once the union is the winner, the same key settles
-        let hu = engine.node.add_blob(enc(&union)).await.unwrap();
+        let hu = engine
+            .node
+            .add_blob(engine.identity.encrypt(&union).await.unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             engine.verdict_of("k", hu, &[h1, h2, hu]).await,
             Verdict::Settled

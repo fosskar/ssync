@@ -93,6 +93,7 @@ async fn recipient_change_republishes_unchanged_sessions() {
             plain = AgeIdentity::from_secret_string(&id_b.to_secret_string())
                 .unwrap()
                 .decrypt(&ciphertext)
+                .await
                 .ok();
             break;
         }
