@@ -9,6 +9,7 @@
 }:
 let
   cfg = config.services.ssync;
+  customDataDir = cfg.dataDir != "/var/lib/ssync";
   # scalar keys must precede the [[agents]] tables (TOML).
   configFile = pkgs.writeText "ssync-config.toml" (
     ''
@@ -176,19 +177,25 @@ in
       default = "${cfg.dataDir}/age.key";
       defaultText = lib.literalExpression "\"\${dataDir}/age.key\"";
       description = ''
-        Age identity file. If it does not exist the daemon generates one on
-        first run. Shared mode (`recipients = []`): it must be the *same* key on
-        every machine, so point this at a secret you distribute yourself (e.g.
-        sops-nix). Per-machine mode: each machine keeps its own key and lists
-        the other machines' recipients in `recipients`. The clan service
-        handles per-machine keys for you via clan.vars.
+        Age identity file. If it does not exist under `dataDir`, the daemon
+        generates one on first run. A path outside `dataDir` must already
+        exist and remains read-only under the sandbox. Shared mode
+        (`recipients = []`): it must be the *same* key on every machine, so
+        point this at a secret you distribute yourself (e.g. sops-nix).
+        Per-machine mode: each machine keeps its own key and lists the other
+        machines' recipients in `recipients`. The clan service handles
+        per-machine keys for you via clan.vars.
       '';
     };
 
     dataDir = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/ssync";
-      description = "ssync's own managed state (node key, blobs, docs, index).";
+      description = ''
+        ssync's own managed state (node key, blobs, docs, index). The default
+        uses systemd's `StateDirectory`; a custom path is created 0700 for
+        `user` and added to the sandbox's writable allow-list.
+      '';
     };
 
     clusterFile = lib.mkOption {
@@ -199,14 +206,18 @@ in
         namespace secret, every machine's age recipient, and node-ids.
         Manage it with `ssync cluster`, or let the clan service generate it
         via clan.vars. When set, peers join one deterministic namespace with
-        no ticket exchange; mutually exclusive with `recipients`.
+        no ticket exchange; mutually exclusive with `recipients`. A path
+        outside `dataDir` must be pre-provisioned and remains read-only.
       '';
     };
 
     nodeKeyFile = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      description = "Override the iroh node key path (default: dataDir/node.key).";
+      description = ''
+        Override the iroh node key path (default: `dataDir/node.key`). A path
+        outside `dataDir` must be pre-provisioned and remains read-only.
+      '';
     };
 
     pathMap = lib.mkOption {
@@ -344,9 +355,10 @@ in
     environment.systemPackages = [ cfg.package ];
     environment.etc."ssync/config.toml".source = configFile;
 
-    # ensure the watched session dirs exist so the sandbox's ReadWritePaths bind
-    # succeeds on first boot (owner cfg.user, 0700).
-    systemd.tmpfiles.rules = map (a: "d ${a.sessionDir} 0700 ${cfg.user} - - -") cfg.agents;
+    # ReadWritePaths requires watched and custom state dirs to exist at start.
+    systemd.tmpfiles.rules =
+      map (a: "d \"${a.sessionDir}\" 0700 ${cfg.user} - - -") cfg.agents
+      ++ lib.optional customDataDir "d \"${cfg.dataDir}\" 0700 ${cfg.user} - - -";
 
     systemd.services.ssync = {
       description = "ssync coding-agent session sync";
@@ -356,14 +368,20 @@ in
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/ssync --config ${configFile} daemon";
         User = cfg.user;
-        StateDirectory = "ssync";
         Restart = "on-failure";
         RestartSec = 5;
         # cap glibc malloc arenas: transient session read/encrypt buffers across
         # tokio workers otherwise pin the peak-import high-water mark as RSS.
         Environment = [ "MALLOC_ARENA_MAX=2" ];
       }
-      // hardening;
+      // lib.optionalAttrs (!customDataDir) {
+        StateDirectory = "ssync";
+        StateDirectoryMode = "0700";
+      }
+      // hardening
+      // lib.optionalAttrs customDataDir {
+        ReadWritePaths = hardening.ReadWritePaths ++ [ cfg.dataDir ];
+      };
     };
 
     # scheduled cleanup: prune old sessions via the plain cleanup CLI; the

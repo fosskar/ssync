@@ -10,6 +10,7 @@
   package = self.packages.${system}.default;
   devshell = self.devShells.${system}.default;
   formatting = treefmtEval.config.build.check self;
+  module-contract = import ./module-contract-test.nix { inherit pkgs self; };
 
   # close-to-real end-to-end: two NixOS VMs syncing a session over a virtual LAN.
   vm-sync = import ./vm-test.nix { inherit pkgs self system; };
