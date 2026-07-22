@@ -11,6 +11,7 @@ anyhow.workspace = true
 # backend shells out to the `age` CLI so it gets native post-quantum hybrid keys
 # (`age-keygen -pq`, ML-KEM-768 + X25519), which the Rust crate does not support.
 age = { workspace = true, optional = true }
+tokio.workspace = true
 secrecy = { workspace = true, optional = true }
 
 [features]
