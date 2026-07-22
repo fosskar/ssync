@@ -9,13 +9,13 @@ pub use pathmap::PathMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::reconcile::LocalFile;
 use anyhow::{Context, Result, anyhow, ensure};
 use ssync_adapters::{Adapter, SessionIdentity};
-use crate::reconcile::LocalFile;
+use tokio::io::AsyncWriteExt;
 
 use crate::exclude;
 use pathmap::Resolver;
-
 
 /// Session discovery, translation, policy, and mutation for one engine.
 pub(crate) struct SessionFilesystem {
@@ -51,7 +51,6 @@ impl SessionFilesystem {
         self.resolver = Resolver::new(map, canonical_home);
     }
 
-
     /// Every configured session root (watch targets).
     pub fn roots(&self) -> impl Iterator<Item = &Path> {
         self.adapters.iter().map(|a| a.session_root())
@@ -62,7 +61,6 @@ impl SessionFilesystem {
         self.adapter_of_path(path)
             .is_some_and(|a| a.is_session_file(path))
     }
-
 
     /// Decode an index key back to its session-root-relative path (the
     /// inverse of the key encoding): strip the `{agent}/` prefix of a
@@ -208,7 +206,6 @@ impl SessionFilesystem {
             .canonical_plaintext(self.adapters[idx].as_ref(), bytes)
     }
 
-
     /// Localize and atomically materialize one decrypted wire value.
     pub async fn write(&mut self, key: &str, plaintext: Vec<u8>) -> Result<Option<(u64, u64)>> {
         let Some((idx, rel)) = self.key_parts(key) else {
@@ -279,7 +276,6 @@ fn index_key(id: &SessionIdentity) -> String {
     format!("{}/{}", id.agent, id.relative_path.display())
 }
 
-
 /// Recursively collect session files under `root` accepted by `adapter`.
 pub(crate) fn session_files(root: &Path, adapter: &dyn Adapter) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -287,11 +283,7 @@ pub(crate) fn session_files(root: &Path, adapter: &dyn Adapter) -> Vec<PathBuf> 
     out
 }
 
-fn for_each_session_file(
-    root: &Path,
-    adapter: &dyn Adapter,
-    mut visit: impl FnMut(PathBuf),
-) {
+fn for_each_session_file(root: &Path, adapter: &dyn Adapter, mut visit: impl FnMut(PathBuf)) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -398,13 +390,44 @@ async fn atomic_write(dest: &Path, data: &[u8]) -> Result<()> {
     tokio::fs::create_dir_all(parent)
         .await
         .with_context(|| format!("creating {}", parent.display()))?;
-    let tmp = dest.with_extension("ssync-tmp");
-    tokio::fs::write(&tmp, data)
-        .await
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, dest)
-        .await
-        .with_context(|| format!("renaming into {}", dest.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut attempt = 0_u64;
+    let (tmp, mut file) = loop {
+        let mut name = dest.as_os_str().to_os_string();
+        name.push(format!(
+            ".ssync-tmp-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        let tmp = PathBuf::from(name);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+        {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("exhausted temporary names for {}", dest.display()))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", tmp.display()));
+            }
+        }
+    };
+    if let Err(error) = file.write_all(data).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error).with_context(|| format!("writing {}", tmp.display()));
+    }
+    drop(file);
+    if let Err(error) = tokio::fs::rename(&tmp, dest).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error).with_context(|| format!("renaming into {}", dest.display()));
+    }
     Ok(())
 }
 
@@ -421,15 +444,14 @@ mod tests {
         p
     }
 
-    fn pi_map(root: &Path) -> SessionFilesystem {
+    fn pi_filesystem(root: &Path) -> SessionFilesystem {
         SessionFilesystem::new(vec![Box::new(PiAdapter::new("pi", root))])
     }
-
 
     #[tokio::test]
     async fn snapshot_and_write_round_trip_without_map() {
         let root = scratch("roundtrip");
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         let rel = "--proj--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
         let key = format!("pi/{rel}");
 
@@ -444,40 +466,38 @@ mod tests {
     #[test]
     fn excluded_keys_are_frozen_but_foreign_agents_are_not_excluded() {
         let root = scratch("exclude");
-        let mut wm = pi_map(&root);
-        wm.set_excludes(HashMap::from([(
+        let mut filesystem = pi_filesystem(&root);
+        filesystem.set_excludes(HashMap::from([(
             "pi".to_string(),
             vec!["*secret*".to_string()],
         )]));
-        assert!(wm.excluded("pi/--proj--/secret.jsonl"));
-        assert!(wm.frozen("pi/--proj--/secret.jsonl"));
-        assert!(!wm.excluded("pi/--proj--/s.jsonl"));
+        assert!(filesystem.excluded("pi/--proj--/secret.jsonl"));
+        assert!(filesystem.frozen("pi/--proj--/secret.jsonl"));
+        assert!(!filesystem.excluded("pi/--proj--/s.jsonl"));
         // patterns bind per agent; a key of an unconfigured agent is not
         // excluded (it freezes via the dropped-agent guard instead)
-        assert!(!wm.excluded("ghost/--proj--/secret.jsonl"));
+        assert!(!filesystem.excluded("ghost/--proj--/secret.jsonl"));
     }
 
     #[test]
     fn dropped_agent_keys_are_frozen() {
         let root = scratch("dropped");
-        let wm = pi_map(&root);
-        assert!(wm.frozen("ghost/--proj--/s.jsonl"));
-        assert!(!wm.frozen("pi/--proj--/s.jsonl"));
+        let filesystem = pi_filesystem(&root);
+        assert!(filesystem.frozen("ghost/--proj--/s.jsonl"));
+        assert!(!filesystem.frozen("pi/--proj--/s.jsonl"));
     }
 
     #[test]
     fn mapping_failure_withholds_tombstones_for_the_snapshot_pass() {
         let root = scratch("freeze");
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         filesystem.set_path_map(
             PathMap::new(vec![("/data".into(), "/canon".into())]).unwrap(),
             None,
         );
         let dir = root.join("--proj--");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(
-            "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl",
-        );
+        let path = dir.join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl");
         std::fs::write(&path, b"{\"type\":\"session\",\"version\":3}\n").unwrap();
 
         assert!(filesystem.snapshot().is_empty());
@@ -492,20 +512,16 @@ mod tests {
         let root = scratch("mapped-roundtrip");
         let dir = root.join("--data-Projects-x--");
         std::fs::create_dir_all(&dir).unwrap();
-        let name =
-            "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+        let name = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
         let path = dir.join(name);
         std::fs::write(
             &path,
             b"{\"type\":\"session\",\"version\":3,\"cwd\":\"/data/Projects/x\"}\n",
         )
         .unwrap();
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         filesystem.set_path_map(
-            PathMap::new(vec![
-                ("/data/Projects".into(), "/canon/Projects".into()),
-            ])
-            .unwrap(),
+            PathMap::new(vec![("/data/Projects".into(), "/canon/Projects".into())]).unwrap(),
             None,
         );
 
@@ -527,16 +543,13 @@ mod tests {
         let root = scratch("omp-home");
         let dir = root.join("-Projects-x");
         std::fs::create_dir_all(&dir).unwrap();
-        let name =
-            "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+        let name = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
         std::fs::write(
             dir.join(name),
             b"{\"type\":\"session\",\"version\":3,\"cwd\":\"/data/Projects/x\"}\n",
         )
         .unwrap();
-        let mut filesystem = SessionFilesystem::new(vec![Box::new(PiAdapter::new(
-            "omp", &root,
-        ))]);
+        let mut filesystem = SessionFilesystem::new(vec![Box::new(PiAdapter::new("omp", &root))]);
         filesystem.set_path_map(
             PathMap::new(vec![("/data".into(), "/canon-home".into())]).unwrap(),
             None,
@@ -551,19 +564,15 @@ mod tests {
         let root = scratch("mapped-exclude");
         let dir = root.join("--data-Projects-x--");
         std::fs::create_dir_all(&dir).unwrap();
-        let name =
-            "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+        let name = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
         std::fs::write(
             dir.join(name),
             b"{\"type\":\"session\",\"version\":3,\"cwd\":\"/data/Projects/x\"}\n",
         )
         .unwrap();
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         filesystem.set_path_map(
-            PathMap::new(vec![
-                ("/data/Projects".into(), "/canon/Projects".into()),
-            ])
-            .unwrap(),
+            PathMap::new(vec![("/data/Projects".into(), "/canon/Projects".into())]).unwrap(),
             None,
         );
         filesystem.set_excludes(HashMap::from([(
@@ -579,21 +588,21 @@ mod tests {
     fn append_only_follows_the_owning_adapter() {
         let root = scratch("append");
         let blob_root = scratch("append-blobs");
-        let wm = SessionFilesystem::new(vec![
+        let filesystem = SessionFilesystem::new(vec![
             Box::new(PiAdapter::new("pi", &root)),
             Box::new(BlobStoreAdapter::new("omp-blobs", &blob_root)),
         ]);
-        assert!(wm.append_only("pi/--proj--/s.jsonl"));
-        assert!(!wm.append_only("omp-blobs/abc123"));
-        assert!(!wm.append_only("ghost/x"));
+        assert!(filesystem.append_only("pi/--proj--/s.jsonl"));
+        assert!(!filesystem.append_only("omp-blobs/abc123"));
+        assert!(!filesystem.append_only("ghost/x"));
     }
 
     #[test]
     fn is_session_file_requires_an_owning_root() {
         let root = scratch("owning");
-        let wm = pi_map(&root);
-        assert!(wm.is_session_file(&root.join("--proj--/s.jsonl")));
-        assert!(!wm.is_session_file(Path::new("/elsewhere/--proj--/s.jsonl")));
+        let filesystem = pi_filesystem(&root);
+        assert!(filesystem.is_session_file(&root.join("--proj--/s.jsonl")));
+        assert!(!filesystem.is_session_file(Path::new("/elsewhere/--proj--/s.jsonl")));
     }
 
     #[test]
@@ -627,15 +636,13 @@ mod tests {
     #[tokio::test]
     async fn mapped_artifact_retries_until_main_session_learns_its_project_dir() {
         let root = scratch("mapped-artifact");
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         filesystem.set_path_map(
             PathMap::new(vec![("/data".into(), "/canon".into())]).unwrap(),
             None,
         );
-        let main_key =
-            "pi/--canon-Projects-x--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
-        let artifact_key =
-            "pi/--canon-Projects-x--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/advisor.jsonl";
+        let main_key = "pi/--canon-Projects-x--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+        let artifact_key = "pi/--canon-Projects-x--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a/advisor.jsonl";
 
         assert!(
             filesystem
@@ -647,8 +654,7 @@ mod tests {
         filesystem
             .write(
                 main_key,
-                b"{\"type\":\"session\",\"version\":3,\"cwd\":\"/canon/Projects/x\"}\n"
-                    .to_vec(),
+                b"{\"type\":\"session\",\"version\":3,\"cwd\":\"/canon/Projects/x\"}\n".to_vec(),
             )
             .await
             .unwrap()
@@ -673,12 +679,11 @@ mod tests {
         let root = scratch("header-budget");
         let project = root.join("--project--");
         std::fs::create_dir_all(&project).unwrap();
-        let name =
-            "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+        let name = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
         let mut bytes = vec![b'x'; 64 * 1024];
         bytes.extend_from_slice(b"\n{\"type\":\"session\",\"cwd\":\"/work/project\"}\n");
         std::fs::write(project.join(name), bytes).unwrap();
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         filesystem.set_path_map(
             PathMap::new(vec![("/work".into(), "/canonical".into())]).unwrap(),
             None,
@@ -694,7 +699,7 @@ mod tests {
 
         let root = scratch("contained-write");
         let outside = scratch("contained-write-outside");
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
 
         assert!(
             filesystem
@@ -706,10 +711,7 @@ mod tests {
         symlink(&outside, root.join("--project--")).unwrap();
         assert!(
             filesystem
-                .write(
-                    "pi/--project--/session_id.jsonl",
-                    b"escape".to_vec()
-                )
+                .write("pi/--project--/session_id.jsonl", b"escape".to_vec())
                 .await
                 .is_err()
         );
@@ -722,13 +724,42 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(std::fs::read(outside.join("session_id.jsonl")).unwrap(), b"outside");
+        assert_eq!(
+            std::fs::read(outside.join("session_id.jsonl")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_does_not_follow_existing_temporary_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch("temporary-symlink");
+        let outside = scratch("temporary-symlink-outside");
+        let project = root.join("--project--");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside_file = outside.join("user-file");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside_file, project.join("session_id.ssync-tmp")).unwrap();
+        let mut filesystem = pi_filesystem(&root);
+
+        filesystem
+            .write("pi/--project--/session_id.jsonl", b"session".to_vec())
+            .await
+            .unwrap()
+            .expect("write must resolve");
+
+        assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+        assert_eq!(
+            std::fs::read(project.join("session_id.jsonl")).unwrap(),
+            b"session"
+        );
     }
 
     #[tokio::test]
     async fn write_and_delete_are_atomic_contained_mutations() {
         let root = scratch("atomic-mutation");
-        let mut filesystem = pi_map(&root);
+        let mut filesystem = pi_filesystem(&root);
         let key = "pi/--project--/session_id.jsonl";
 
         let stamp = filesystem
@@ -736,7 +767,10 @@ mod tests {
             .await
             .unwrap()
             .expect("write must resolve");
-        assert_eq!(std::fs::read(root.join("--project--/session_id.jsonl")).unwrap(), b"session");
+        assert_eq!(
+            std::fs::read(root.join("--project--/session_id.jsonl")).unwrap(),
+            b"session"
+        );
         assert_eq!(stamp.1, 7);
         assert!(filesystem.delete(key).await.unwrap());
         assert!(!root.join("--project--").exists());

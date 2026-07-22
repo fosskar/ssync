@@ -196,10 +196,7 @@ impl Resolver {
         if let Some(path) = oversized
             && local_cwd.is_none()
         {
-            bail!(
-                "{}: required session header exceeds 64 KiB",
-                path.display()
-            );
+            bail!("{}: required session header exceeds 64 KiB", path.display());
         }
         let Some(local_cwd) = local_cwd else {
             bail!(
@@ -475,5 +472,4 @@ mod tests {
         assert_eq!(m.canonical_of("/any").unwrap(), None);
         assert_eq!(m.local_of("/any").unwrap(), None);
     }
-
 }
