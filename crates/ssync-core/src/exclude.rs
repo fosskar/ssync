@@ -18,30 +18,38 @@ pub fn is_excluded(patterns: &[String], rel: &str) -> bool {
 /// — sessions nest under per-project dirs, and a project filter must reach
 /// the files below it).
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    // no wildcard: exact match
-    if parts.len() == 1 {
+    if !pattern.contains('*') {
         return pattern == text;
     }
+
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let mut literals = pattern
+        .split('*')
+        .filter(|part| !part.is_empty())
+        .peekable();
     let mut rest = text;
-    // the first literal is anchored at the start, the last at the end
-    if let Some(first) = parts.first() {
-        let Some(r) = rest.strip_prefix(first) else {
-            return false;
-        };
-        rest = r;
-    }
-    let last = parts.last().expect("split yields at least one part");
-    for mid in &parts[1..parts.len() - 1] {
-        if mid.is_empty() {
-            continue; // consecutive `*`s collapse
+    let mut first = true;
+
+    while let Some(literal) = literals.next() {
+        let last = literals.peek().is_none();
+        if first && anchored_start {
+            let Some(tail) = rest.strip_prefix(literal) else {
+                return false;
+            };
+            rest = tail;
+        } else if last && anchored_end {
+            return rest.len() >= literal.len() && rest.ends_with(literal);
+        } else {
+            let Some(offset) = rest.find(literal) else {
+                return false;
+            };
+            rest = &rest[offset + literal.len()..];
         }
-        let Some(at) = rest.find(mid) else {
-            return false;
-        };
-        rest = &rest[at + mid.len()..];
+        first = false;
     }
-    rest.ends_with(last) && (parts.len() == 1 || rest.len() >= last.len())
+
+    true
 }
 
 #[cfg(test)]

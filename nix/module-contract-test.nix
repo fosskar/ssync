@@ -9,7 +9,7 @@ let
   ];
   nixosConfig =
     extra:
-    import (pkgs.path + "/nixos/lib/eval-config.nix") {
+    (import (pkgs.path + "/nixos/lib/eval-config.nix") {
       system = null;
       modules = [
         { nixpkgs.hostPlatform = pkgs.stdenv.hostPlatform; }
@@ -23,26 +23,17 @@ let
           // extra;
         }
       ];
-    };
-  nixosService = extra: (nixosConfig extra).config.systemd.services.ssync.serviceConfig;
+    }).config;
+  nixosService = extra: (nixosConfig extra).systemd.services.ssync.serviceConfig;
   nixosDefault = nixosService { };
   nixosCustom = nixosService { dataDir = "/srv/ssync-data"; };
+  nixosCustomConfig = nixosConfig { dataDir = "/srv/ssync-data"; };
   nixosExternal = nixosService {
     dataDir = "/srv/ssync-data";
     ageIdentityFile = "/run/secrets/age.key";
     nodeKeyFile = "/run/secrets/node.key";
     clusterFile = "/run/secrets/cluster.toml";
   };
-  unsafeDataDirsRejected =
-    lib.all
-      (
-        dataDir:
-        !(builtins.tryEval (nixosConfig { inherit dataDir; }).config.system.build.toplevel.drvPath).success
-      )
-      [
-        "/srv"
-        "/srv/"
-      ];
 
   hmStub =
     { lib, ... }:
@@ -97,6 +88,7 @@ let
       ];
     }).config.systemd.user.services.ssync.Service;
 
+  words = value: if builtins.isList value then value else lib.splitString " " value;
   hardeningContract =
     service:
     assert service.NoNewPrivileges;
@@ -116,12 +108,7 @@ let
     assert service.RestrictRealtime;
     assert service.RestrictSUIDSGID;
     assert
-      (
-        if builtins.isList service.RestrictAddressFamilies then
-          service.RestrictAddressFamilies
-        else
-          lib.splitString " " service.RestrictAddressFamilies
-      ) == [
+      words service.RestrictAddressFamilies == [
         "AF_INET"
         "AF_INET6"
         "AF_UNIX"
@@ -143,7 +130,6 @@ let
     assert service.UMask == "0077";
     true;
 in
-assert unsafeDataDirsRejected;
 assert hardeningContract nixosDefault;
 assert hardeningContract hmService;
 assert nixosDefault.StateDirectory == "ssync";
@@ -155,6 +141,9 @@ assert
     "/sessions"
     "/srv/ssync-data"
   ];
+assert
+  !(builtins.elem "d \"/srv/ssync-data\" 0700 root - - -" nixosCustomConfig.systemd.tmpfiles.rules);
+assert nixosCustomConfig.systemd.services ? ssync-data-dir;
 assert nixosExternal.ReadWritePaths == nixosCustom.ReadWritePaths;
 assert
   hmService.ReadWritePaths == [

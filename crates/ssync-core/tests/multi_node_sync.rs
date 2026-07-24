@@ -98,12 +98,13 @@ async fn per_machine_identities_reach_a_third_machine() {
     // mesh, one shared namespace — a session from A must land on B and C, and
     // one from C must land on A and B.
     let sim = Sim::new("threenode").await;
-    let mut ids = Vec::with_capacity(3);
-    for _ in 0..3 {
-        ids.push(AgeIdentity::generate().await.unwrap());
-    }
+    let ids = vec![
+        AgeIdentity::generate().await.unwrap(),
+        AgeIdentity::generate().await.unwrap(),
+        AgeIdentity::generate().await.unwrap(),
+    ];
     let recipients: Vec<String> = ids.iter().map(AgeIdentity::recipient_string).collect();
-    let mut identities = Vec::with_capacity(3);
+    let mut identities = Vec::new();
     for id in &ids {
         let mut identity = AgeIdentity::from_secret_string(&id.to_secret_string())
             .await
@@ -678,13 +679,19 @@ async fn excluded_projects_neither_publish_nor_materialize() {
     let mut node_a = sim.node("a").await;
     node_a.create_namespace().await.unwrap();
     let ticket = node_a.share().await.unwrap();
-    let mut peer_a = sim.pi_peer("a", "pi", node_a).await;
+    let mut peer_a = sim
+        .pi_peer_configured(
+            "a",
+            "pi",
+            node_a,
+            [("pi".to_string(), vec!["*client-x*".to_string()])].into(),
+            ssync_core::PathMap::default(),
+            None,
+        )
+        .await;
     for rel in [rel_normal, rel_secret] {
         peer_a.write(rel, &contents);
     }
-    peer_a
-        .engine
-        .set_excludes([("pi".to_string(), vec!["*client-x*".to_string()])].into());
     peer_a.tick().await;
 
     // --- node B: no excludes ---
@@ -849,8 +856,16 @@ async fn path_mapped_machines_converge() {
 
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "omp", node_b).await;
-    peer_b.engine.set_path_map(map, Some(canonical_home.into()));
+    let mut peer_b = sim
+        .pi_peer_configured(
+            "b",
+            "omp",
+            node_b,
+            Default::default(),
+            map,
+            Some(canonical_home.into()),
+        )
+        .await;
     let root_b = peer_b.root.clone();
 
     // A's session materializes on B under B's LOCAL encoding, header rewritten
@@ -980,15 +995,16 @@ async fn path_map_leaves_cwdless_adapters_alone() {
     std::fs::create_dir_all(&root_blobs_b).unwrap();
     let mut node_b = sim.node("b").await;
     node_b.join(ticket).await.unwrap();
-    let mut peer_b = sim.peer(
+    let mut peer_b = sim.peer_configured(
         "b",
         adapters(&root_pi_b, &root_blobs_b),
+        (
+            Default::default(),
+            ssync_core::PathMap::new(vec![("/srv/elsewhere".into(), "/canon/x".into())]).unwrap(),
+            None,
+        ),
         sim.identity().await,
         node_b,
-    );
-    peer_b.engine.set_path_map(
-        ssync_core::PathMap::new(vec![("/srv/elsewhere".into(), "/canon/x".into())]).unwrap(),
-        None,
     );
 
     // inbound: A's blob materializes on B despite the active map
@@ -1006,11 +1022,9 @@ async fn path_map_leaves_cwdless_adapters_alone() {
     assert!(ok, "mapped machine did not publish its blob");
 }
 
-/// An unresolvable mapping must FREEZE, never tombstone (#49: skips are
-/// per-key errors, and a skip that reads as deletion propagates mesh-wide).
-/// Here: sessions synced without a map; the machine restarts with a map
-/// that swallows the project but cannot resolve it (omp without
-/// canonical_home) — peers must keep their copies.
+/// An unresolvable mapping makes that agent's membership unknown, so the pass
+/// freezes the whole agent rather than deriving tombstones from a partial view
+/// (#49). A separately configured healthy agent must continue syncing.
 #[tokio::test]
 async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let sim = Sim::new("pathmap-freeze").await;
@@ -1024,7 +1038,17 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let mut node_b = sim.node_with_key("b", key_b.clone()).await;
     let ns = node_b.create_namespace().await.unwrap();
     let ticket = node_b.share().await.unwrap();
-    let mut peer_b = sim.pi_peer("b", "omp", node_b).await;
+    let healthy_b = sim.base.join("b/healthy");
+    std::fs::create_dir_all(&healthy_b).unwrap();
+    let mut peer_b = sim.peer(
+        "b",
+        vec![
+            Box::new(PiAdapter::new("omp", sim.root("b"))),
+            Box::new(PiAdapter::new("pi", &healthy_b)),
+        ],
+        sim.identity().await,
+        node_b,
+    );
     peer_b.write(rel, &bytes);
     let src_b = peer_b.path(rel);
     peer_b.persist();
@@ -1034,7 +1058,17 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let mut node_a = sim.node("a").await;
     node_a.join(ticket).await.unwrap();
     let a_addr = node_a.endpoint_addr();
-    let mut peer_a = sim.pi_peer("a", "omp", node_a).await;
+    let healthy_a = sim.base.join("a/healthy");
+    std::fs::create_dir_all(&healthy_a).unwrap();
+    let mut peer_a = sim.peer(
+        "a",
+        vec![
+            Box::new(PiAdapter::new("omp", sim.root("a"))),
+            Box::new(PiAdapter::new("pi", &healthy_a)),
+        ],
+        sim.identity().await,
+        node_a,
+    );
     let dest_a = peer_a.path(rel);
     let ok = converge(&mut [&mut peer_a], || file_eq(&dest_a, &bytes)).await;
     assert!(ok, "session did not sync to A");
@@ -1045,10 +1079,19 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
     let mut node_b2 = sim.node_with_key("b", key_b).await;
     node_b2.open_namespace(ns).await.unwrap();
     node_b2.sync_with(vec![a_addr]).await.unwrap();
-    let mut peer_b2 = sim.pi_peer("b", "omp", node_b2).await;
-    peer_b2.engine.set_path_map(
-        ssync_core::PathMap::new(vec![("/data".into(), "/other-canon".into())]).unwrap(),
-        None, // omp cannot encode home-relative canonicals without this
+    let mut peer_b2 = sim.peer_configured(
+        "b",
+        vec![
+            Box::new(PiAdapter::new("omp", sim.root("b"))),
+            Box::new(PiAdapter::new("pi", &healthy_b)),
+        ],
+        (
+            Default::default(),
+            ssync_core::PathMap::new(vec![("/data".into(), "/other-canon".into())]).unwrap(),
+            None, // omp cannot encode home-relative canonicals without this
+        ),
+        sim.identity().await,
+        node_b2,
     );
     peer_b2.persist();
 
@@ -1057,11 +1100,12 @@ async fn unresolvable_mapping_freezes_instead_of_tombstoning() {
         peer_b2.tick().await;
         peer_a.tick().await;
     }
-    let rel2 = "-Projects-y/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
-    // sentinel cwd OUTSIDE B's mapped prefix: pass-through on both sides
+    let rel2 =
+        "--elsewhere-y--/2026-05-23T08-00-00-000Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl";
     let sentinel = b"{\"type\":\"session\",\"version\":3,\"id\":\"019e539d-f6ab-71ac-be20-d3ae2b23ea4b\",\"cwd\":\"/elsewhere/y\"}\n".to_vec();
-    peer_a.write(rel2, &sentinel);
-    let dest_b_rel2 = peer_b2.path(rel2);
+    std::fs::create_dir_all(healthy_a.join("--elsewhere-y--")).unwrap();
+    std::fs::write(healthy_a.join(rel2), &sentinel).unwrap();
+    let dest_b_rel2 = healthy_b.join(rel2);
     let ok = converge(&mut [&mut peer_a, &mut peer_b2], || dest_b_rel2.exists()).await;
     assert!(ok, "sentinel did not sync after restart");
 

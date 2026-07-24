@@ -66,6 +66,7 @@ async fn recipient_change_republishes_unchanged_sessions() {
     // recipient-set change forces the re-publish.
     let mut node_a2 = sim.node_with_key("a", node_key).await;
     node_a2.open_namespace(ns).await.unwrap();
+    let node_a2_addr = node_a2.endpoint_addr();
     node_a2
         .sync_with(vec![observer.endpoint_addr()])
         .await
@@ -86,6 +87,10 @@ async fn recipient_change_republishes_unchanged_sessions() {
             h2 = Some(w);
             break;
         }
+        observer
+            .sync_with(vec![node_a2_addr.clone()])
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let h2 = h2.expect("recipient-set change did not re-publish the unchanged session");

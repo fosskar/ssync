@@ -356,6 +356,11 @@ reads the agent's files and owns its own copy; when a remote update arrives, ssy
 the session file back into the agent's dir atomically. The agent and the sync engine never
 fight over the same bytes.
 
+**Amended (0.19):** the agent-facing side of this boundary lives behind
+`SessionFilesystem`. It owns adapters, excludes, bounded discovery, path-map resolution,
+canonical reads, localized atomic writes, and contained deletes.
+`Engine` keeps encryption, mesh I/O, reconciliation, divergence, and `SyncState`.
+
 ---
 
 ## 11. Language & packaging

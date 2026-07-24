@@ -11,7 +11,7 @@
 //! state we recorded when we made it.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use ssync_net::iroh_blobs::Hash;
@@ -25,7 +25,6 @@ pub type Stamp = (u64, u64);
 pub struct LocalFile {
     /// Index key: `{agent}/{relative_path}`.
     pub key: String,
-    pub path: PathBuf,
     pub stamp: Stamp,
 }
 
@@ -195,7 +194,6 @@ pub enum Action {
     /// index hash (if any), so a content-identical no-op still settles state.
     Import {
         key: String,
-        path: PathBuf,
         stamp: Stamp,
         winner: Option<Hash>,
     },
@@ -241,7 +239,6 @@ pub fn reconcile(
                     if !unchanged {
                         actions.push(Action::Import {
                             key: key.to_string(),
-                            path: f.path.clone(),
                             stamp: f.stamp,
                             winner: Some(winner),
                         });
@@ -263,7 +260,6 @@ pub fn reconcile(
                         // written after the deletion ⇒ genuine recreate
                         actions.push(Action::Import {
                             key: key.to_string(),
-                            path: f.path.clone(),
                             stamp: f.stamp,
                             winner: None,
                         });
@@ -272,7 +268,6 @@ pub fn reconcile(
             },
             (Some(f), None) => actions.push(Action::Import {
                 key: key.to_string(),
-                path: f.path.clone(),
                 stamp: f.stamp,
                 winner: None,
             }),
@@ -325,7 +320,6 @@ mod tests {
     fn local(key: &str, stamp: Stamp) -> LocalFile {
         LocalFile {
             key: key.to_string(),
-            path: PathBuf::from(format!("/root/{key}")),
             stamp,
         }
     }
@@ -380,7 +374,6 @@ mod tests {
             a,
             vec![Action::Import {
                 key: "pi/p/s".into(),
-                path: PathBuf::from("/root/pi/p/s"),
                 stamp: (5, 10),
                 winner: None,
             }]
@@ -523,7 +516,6 @@ mod tests {
             a,
             vec![Action::Import {
                 key: "pi/p/s".into(),
-                path: PathBuf::from("/root/pi/p/s"),
                 stamp: (30, 10),
                 winner: None,
             }]

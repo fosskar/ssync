@@ -119,12 +119,13 @@ pub(crate) struct Resolver {
     /// Home context for the wire side of home-relative encodings (omp).
     canonical_home: Option<PathBuf>,
     /// Per project dir: how its keys and bytes translate (`None` value =
-    /// pass-through). Dir↔cwd never changes, so entries never invalidate.
+    /// pass-through). Entries survive while the project remains visible.
     dir_map: HashMap<PathBuf, Option<String>>,
     /// Dirs whose mapping failed, already logged (retry stays quiet).
     logged: HashSet<PathBuf>,
     /// Agents with an unresolvable mapping this pass (#49).
     failed_agents: HashSet<String>,
+    failed_dirs: HashSet<PathBuf>,
 }
 
 impl Resolver {
@@ -141,7 +142,12 @@ impl Resolver {
     /// `Ok(None)` = pass-through (today's relative path IS the wire form).
     /// `Err` = unresolvable this tick; the caller skips the file and a later
     /// pass retries.
-    pub fn wire_rel(&mut self, adapter: &dyn Adapter, rel: &str) -> Result<Option<String>> {
+    pub fn wire_rel(
+        &mut self,
+        adapter: &dyn Adapter,
+        rel: &str,
+        project_files: &[PathBuf],
+    ) -> Result<Option<String>> {
         // adapters without cwd semantics (omp-blobs, codex, claude-code)
         // pass through untouched — their keys and bytes carry no paths the
         // map could act on
@@ -153,7 +159,7 @@ impl Resolver {
         };
         let project_dir = adapter.session_root().join(first);
         Ok(self
-            .dir_mapping(adapter, &project_dir)?
+            .dir_mapping(adapter, &project_dir, project_files)?
             .map(|component| format!("{component}/{rest}")))
     }
 
@@ -161,26 +167,25 @@ impl Resolver {
     /// file's header and cached — a dir's cwd never changes. `Ok(None)` =
     /// pass-through (unmapped). `Err` = header unreadable, round-trip guard
     /// tripped, or encoding needs `canonical_home`: skip and retry.
-    fn dir_mapping(&mut self, adapter: &dyn Adapter, project_dir: &Path) -> Result<Option<String>> {
+    fn dir_mapping(
+        &mut self,
+        adapter: &dyn Adapter,
+        project_dir: &Path,
+        project_files: &[PathBuf],
+    ) -> Result<Option<String>> {
         if let Some(cached) = self.dir_map.get(project_dir) {
             return Ok(cached.clone());
         }
         let mut local_cwd = None;
         let mut oversized = None;
-        for entry in std::fs::read_dir(project_dir)
-            .with_context(|| format!("reading {}", project_dir.display()))?
-        {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            let path = entry.path();
-            if kind.is_symlink()
-                || !kind.is_file()
+        for path in project_files {
+            if path.parent() != Some(project_dir)
                 || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
             {
                 continue;
             }
-            let file = std::fs::File::open(&path)
-                .with_context(|| format!("opening {}", path.display()))?;
+            let file =
+                std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
             let mut bytes = Vec::with_capacity(HEADER_PREFIX_LIMIT + 1);
             file.take((HEADER_PREFIX_LIMIT + 1) as u64)
                 .read_to_end(&mut bytes)
@@ -317,18 +322,38 @@ impl Resolver {
     /// Start a snapshot pass: last pass's failures no longer freeze agents.
     pub fn begin_pass(&mut self) {
         self.failed_agents.clear();
+        self.failed_dirs.clear();
     }
 
     /// Record a mapping failure: freezes `agent`'s tombstones this pass
     /// (#49). Returns whether `dir`'s failure is newly seen — log it once.
     pub fn note_failure(&mut self, agent: &str, dir: PathBuf) -> bool {
         self.failed_agents.insert(agent.to_string());
+        self.failed_dirs.insert(dir.clone());
         self.logged.insert(dir)
     }
 
     /// Whether `agent` had an unresolvable mapping this pass.
     pub fn agent_failed(&self, agent: &str) -> bool {
         self.failed_agents.contains(agent)
+    }
+
+    pub fn any_agent_failed(&self) -> bool {
+        !self.failed_agents.is_empty()
+    }
+
+    pub fn finish_pass(&mut self, seen_projects: &HashSet<PathBuf>, complete_roots: &[PathBuf]) {
+        let belongs_to_complete_root =
+            |dir: &PathBuf| complete_roots.iter().any(|root| dir.starts_with(root));
+        self.dir_map
+            .retain(|dir, _| !belongs_to_complete_root(dir) || seen_projects.contains(dir));
+        self.logged
+            .retain(|dir| !belongs_to_complete_root(dir) || self.failed_dirs.contains(dir));
+    }
+
+    #[cfg(test)]
+    pub fn cache_sizes(&self) -> (usize, usize) {
+        (self.dir_map.len(), self.logged.len())
     }
 }
 
