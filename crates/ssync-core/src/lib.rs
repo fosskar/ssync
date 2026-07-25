@@ -19,12 +19,14 @@ mod exclude;
 mod reconcile;
 pub mod search;
 mod session_filesystem;
+mod session_store;
 mod status;
 pub use config::{AgentConfig, Config, Discovery, insert_cluster_path};
 use divergence::{Divergence, Verdict};
 use reconcile::{Action, SyncState, reconcile};
 use session_filesystem::{LocalAttempt, SessionPass, StatusIndexRecord};
 pub use session_filesystem::{PathMap, SessionFilesystem, SessionFsConfig};
+use session_store::{SessionStore, recipients_fingerprint};
 pub use status::{PeerStatus, StatusReport};
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
@@ -67,8 +69,7 @@ pub struct Engine {
 }
 struct Execution<'a, 'filesystem> {
     pass: &'a mut SessionPass<'filesystem>,
-    identity: &'a AgeIdentity,
-    node: &'a Node,
+    store: SessionStore<'a>,
     state: &'a mut SyncState,
     divergence: &'a Divergence,
     merged_logged: &'a mut std::collections::HashSet<String>,
@@ -101,7 +102,7 @@ impl Engine {
         identity: AgeIdentity,
         node: Node,
     ) -> Self {
-        let recipients_fp = Hash::new(identity.recipients().join("\n")).to_string();
+        let recipients_fp = recipients_fingerprint(&identity);
         Self {
             filesystem,
             identity,
@@ -152,22 +153,9 @@ impl Engine {
         self.node.shutdown().await
     }
 
-    /// The divergence verdict for a key, decrypting whatever the cache cannot
-    /// answer. Decryption stops at the first unavailable blob; the resulting
-    /// short set reads as incomplete in [`Divergence::verdict`].
-    async fn verdict_of(&self, key: &str, winner: Hash, versions: &[Hash]) -> Verdict {
-        let winner_pt = self.get_plain(winner).await;
-        let mut plaintexts = Vec::with_capacity(versions.len());
-        if winner_pt.is_some() {
-            for h in versions {
-                let Some(pt) = self.get_plain(*h).await else {
-                    break;
-                };
-                plaintexts.push(pt);
-            }
-        }
-        self.divergence
-            .verdict(key, versions, winner_pt, plaintexts)
+    /// A view of session bytes at rest: encryption paired with the mesh.
+    fn store(&self) -> SessionStore<'_> {
+        SessionStore::new(&self.identity, &self.node)
     }
 
     /// One index scan: live session count plus the still-diverged sessions
@@ -204,7 +192,8 @@ impl Engine {
             let diverged = match self.divergence.cached(key, &rec.versions) {
                 Some(diverged) => diverged,
                 None => matches!(
-                    self.verdict_of(key, winner, &rec.versions).await,
+                    Self::verdict_of(self.store(), &self.divergence, key, winner, &rec.versions)
+                        .await,
                     Verdict::Diverged(_)
                 ),
             };
@@ -230,29 +219,23 @@ impl Engine {
         })
     }
 
-    async fn get_plain(&self, hash: Hash) -> Option<Vec<u8>> {
-        let ciphertext = self.node.get_blob(hash).await.ok()?;
-        self.identity.decrypt(&ciphertext).await.ok()
-    }
-
-    async fn get_plain_with(identity: &AgeIdentity, node: &Node, hash: Hash) -> Option<Vec<u8>> {
-        let ciphertext = node.get_blob(hash).await.ok()?;
-        identity.decrypt(&ciphertext).await.ok()
-    }
-
-    async fn verdict_with(
-        identity: &AgeIdentity,
-        node: &Node,
+    /// The divergence verdict for a key, decrypting whatever the cache cannot
+    /// answer. Reads are local-only on purpose: decryption stops at the first
+    /// blob this node does not hold, and the resulting short set reads as
+    /// incomplete in [`Divergence::verdict`], so a partial version set never
+    /// merges (DECISIONS §8).
+    async fn verdict_of(
+        store: SessionStore<'_>,
         divergence: &Divergence,
         key: &str,
         winner: Hash,
         versions: &[Hash],
     ) -> Verdict {
-        let winner_pt = Self::get_plain_with(identity, node, winner).await;
+        let winner_pt = store.local_plaintext(winner).await;
         let mut plaintexts = Vec::with_capacity(versions.len());
         if winner_pt.is_some() {
             for hash in versions {
-                let Some(plaintext) = Self::get_plain_with(identity, node, *hash).await else {
+                let Some(plaintext) = store.local_plaintext(*hash).await else {
                     break;
                 };
                 plaintexts.push(plaintext);
@@ -263,15 +246,14 @@ impl Engine {
 
     async fn merge_with(
         pass: &SessionPass<'_>,
-        identity: &AgeIdentity,
-        node: &Node,
+        store: SessionStore<'_>,
         divergence: &Divergence,
         key: &str,
     ) -> Result<Option<String>> {
         let Some(relative) = pass.relative_of(key).map(str::to_string) else {
             return Ok(None);
         };
-        let Some(record) = node.index_record(key).await? else {
+        let Some(record) = store.node().index_record(key).await? else {
             return Ok(None);
         };
         // A winning tombstone means the session is deleted; never merge it back.
@@ -282,12 +264,11 @@ impl Engine {
             return Ok(None);
         }
         let Verdict::Diverged(merged) =
-            Self::verdict_with(identity, node, divergence, key, winner, &record.versions).await
+            Self::verdict_of(store, divergence, key, winner, &record.versions).await
         else {
             return Ok(None);
         };
-        let ciphertext = identity.encrypt(&merged).await?;
-        node.publish(key.to_string(), ciphertext).await?;
+        store.publish(key, &merged).await?;
         Ok(Some(relative))
     }
 
@@ -358,8 +339,7 @@ impl Engine {
                 &action,
                 Execution {
                     pass: &mut pass,
-                    identity: &self.identity,
-                    node: &self.node,
+                    store: SessionStore::new(&self.identity, &self.node),
                     state: &mut self.state,
                     divergence: &self.divergence,
                     merged_logged: &mut self.merged_logged,
@@ -426,8 +406,7 @@ impl Engine {
     async fn execute(action: &Action, execution: Execution<'_, '_>) -> bool {
         let Execution {
             pass,
-            identity,
-            node,
+            store,
             state,
             divergence,
             merged_logged,
@@ -448,15 +427,12 @@ impl Engine {
                     // recipient rotation requires fresh encryption.
                     if !rotation_pending
                         && let Some(winner) = winner
-                        && Self::get_plain_with(identity, node, *winner)
-                            .await
-                            .as_deref()
+                        && store.local_plaintext(*winner).await.as_deref()
                             == Some(plaintext.as_slice())
                     {
                         return Ok(ImportOutcome::Unchanged(*winner));
                     }
-                    let ciphertext = identity.encrypt(&plaintext).await?;
-                    let hash = node.publish(key.to_string(), ciphertext).await?;
+                    let hash = store.publish(key, &plaintext).await?;
                     Ok::<_, anyhow::Error>(ImportOutcome::Published(hash))
                 }
                 .await;
@@ -473,19 +449,11 @@ impl Engine {
                 }
             }
             Action::WriteFile { key, hash } => {
-                let ciphertext = match node.blob(*hash).await {
-                    Ok(ciphertext) => ciphertext,
-                    Err(error) => {
-                        *import_errors += 1;
-                        eprintln!("ssync: fetch {key}: {error:#}");
-                        return false;
-                    }
-                };
-                let plaintext = match identity.decrypt(&ciphertext).await {
+                let plaintext = match store.fetch_plaintext(*hash).await {
                     Ok(plaintext) => plaintext,
                     Err(error) => {
                         *import_errors += 1;
-                        eprintln!("ssync: decrypt {key}: {error:#}");
+                        eprintln!("ssync: materialise {key}: {error:#}");
                         return false;
                     }
                 };
@@ -514,7 +482,7 @@ impl Engine {
                     false
                 }
             },
-            Action::Tombstone { key } => match node.index_delete(key).await {
+            Action::Tombstone { key } => match store.tombstone(key).await {
                 Ok(()) => {
                     state.settle_delete(key);
                     true
@@ -525,24 +493,22 @@ impl Engine {
                     false
                 }
             },
-            Action::Merge { key } => {
-                match Self::merge_with(pass, identity, node, divergence, key).await {
-                    Ok(Some(relative)) => {
-                        if merged_logged.insert(key.clone()) {
-                            eprintln!(
-                                "ssync: merged divergent session {relative} (lossless union, nothing lost)"
-                            );
-                        }
-                        true
+            Action::Merge { key } => match Self::merge_with(pass, store, divergence, key).await {
+                Ok(Some(relative)) => {
+                    if merged_logged.insert(key.clone()) {
+                        eprintln!(
+                            "ssync: merged divergent session {relative} (lossless union, nothing lost)"
+                        );
                     }
-                    Ok(None) => false,
-                    Err(error) => {
-                        *import_errors += 1;
-                        eprintln!("ssync: merge {key}: {error:#}");
-                        false
-                    }
+                    true
                 }
-            }
+                Ok(None) => false,
+                Err(error) => {
+                    *import_errors += 1;
+                    eprintln!("ssync: merge {key}: {error:#}");
+                    false
+                }
+            },
         }
     }
 
@@ -699,7 +665,10 @@ mod tests {
         let hash = rec.winner.expect("live winner");
         let ciphertext = engine.node.get_blob(hash).await.unwrap();
         assert_ne!(&ciphertext[..], &contents[..], "blob must not be plaintext");
-        assert_eq!(engine.get_plain(hash).await.as_deref(), Some(&contents[..]));
+        assert_eq!(
+            engine.store().local_plaintext(hash).await.as_deref(),
+            Some(&contents[..])
+        );
     }
 
     #[tokio::test]
@@ -726,8 +695,7 @@ mod tests {
                 },
                 Execution {
                     pass: &mut pass,
-                    identity: &engine.identity,
-                    node: &engine.node,
+                    store: SessionStore::new(&engine.identity, &engine.node),
                     state: &mut engine.state,
                     divergence: &engine.divergence,
                     merged_logged: &mut engine.merged_logged,
@@ -761,7 +729,14 @@ mod tests {
         let missing = Hash::new(b"never-added");
 
         assert_eq!(
-            engine.verdict_of("pi/p/s", h1, &[h1, missing]).await,
+            Engine::verdict_of(
+                engine.store(),
+                &engine.divergence,
+                "pi/p/s",
+                h1,
+                &[h1, missing]
+            )
+            .await,
             Verdict::Incomplete
         );
         assert_eq!(
@@ -794,7 +769,9 @@ mod tests {
             .await
             .unwrap();
 
-        let Verdict::Diverged(union) = engine.verdict_of("k", h2, &[h1, h2]).await else {
+        let Verdict::Diverged(union) =
+            Engine::verdict_of(engine.store(), &engine.divergence, "k", h2, &[h1, h2]).await
+        else {
             panic!("fork must read as diverged");
         };
         assert_eq!(engine.divergence.cached("k", &[h1, h2]), Some(true));
@@ -806,7 +783,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            engine.verdict_of("k", hu, &[h1, h2, hu]).await,
+            Engine::verdict_of(engine.store(), &engine.divergence, "k", hu, &[h1, h2, hu]).await,
             Verdict::Settled
         );
         assert_eq!(engine.divergence.cached("k", &[h1, h2, hu]), Some(false));
