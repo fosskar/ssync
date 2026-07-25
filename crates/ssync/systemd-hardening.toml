@@ -1,0 +1,42 @@
+# The systemd sandbox the daemon and the cleanup oneshot run under
+# (DECISIONS §12). Single source of truth for all three renderers:
+#
+#   - crates/ssync/src/systemd.rs  — `ssync service install` / `cleanup-timer
+#     enable` (include_str! + `hardening_unit_section`)
+#   - nix/nixos-module.nix         — lib.importTOML
+#   - nix/hm-module.nix            — lib.importTOML
+#
+# Booleans render as `yes`/`no`, arrays as one `Key=value` line per element.
+# Keep it a flat table: both readers order it alphabetically, so the rendered
+# unit is identical everywhere.
+#
+# Allow-list rationale (what the sandbox must keep open) lives in DECISIONS §12;
+# the writable paths are per unit and are NOT set here.
+
+AmbientCapabilities = ""
+CapabilityBoundingSet = ""
+LockPersonality = true
+MemoryDenyWriteExecute = true
+NoNewPrivileges = true
+PrivateDevices = true
+PrivateTmp = true
+ProcSubset = "pid"
+ProtectClock = true
+ProtectControlGroups = true
+ProtectHome = "read-only"
+ProtectHostname = true
+ProtectKernelLogs = true
+ProtectKernelModules = true
+ProtectKernelTunables = true
+ProtectProc = "invisible"
+ProtectSystem = "strict"
+RemoveIPC = true
+# iroh needs QUIC/UDP over IPv4/IPv6 plus AF_NETLINK to enumerate interfaces.
+RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK"
+RestrictNamespaces = true
+RestrictRealtime = true
+RestrictSUIDSGID = true
+SystemCallArchitectures = "native"
+SystemCallErrorNumber = "EPERM"
+SystemCallFilter = ["@system-service", "~@privileged", "~@resources"]
+UMask = "0077"

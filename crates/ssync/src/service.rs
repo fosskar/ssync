@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use ssync_core::Config;
 
 use crate::systemd::{
-    self, Activation, HARDENING, RemoveSpec, UnitFile, UnitSet, ensure_unit_safe,
+    self, Activation, RemoveSpec, UnitFile, UnitSet, ensure_unit_safe, hardening,
 };
 
 /// Everything that varies between the user-mode and system-mode unit.
@@ -79,13 +79,14 @@ pub fn render_unit(spec: &ServiceSpec<'_>) -> String {
          Environment=\"PATH={path}\"\n\
          RuntimeDirectory=ssync\n\
          ReadWritePaths={rw_paths}\n\
-         {HARDENING}\
+         {hardening}\
          \n\
          [Install]\n\
          WantedBy={wanted_by}\n",
         exec = spec.exec.display(),
         config = spec.config_path.display(),
         path = spec.path,
+        hardening = hardening(),
     )
 }
 
@@ -243,18 +244,66 @@ mod tests {
         ));
     }
 
+    /// The sandbox contract, asserted independently of the data file — a
+    /// deliberate second copy, the way nix/module-contract-test.nix is one for
+    /// the nix modules. Weakening a property in `systemd-hardening.toml` must
+    /// fail here, so the plain-binary tier does not depend on `nix flake check`
+    /// (DECISIONS §11) to notice. Before this existed, 20 of the 26 properties
+    /// could be weakened with the whole suite staying green.
     #[test]
-    fn unit_carries_the_shared_hardening_set() {
+    fn unit_carries_the_hardening_contract() {
         let unit = render_unit(&spec(None));
-        // spot-check the load-bearing properties (parity with the nix modules)
-        for needle in [
-            "ProtectSystem=strict",
-            "ProtectHome=read-only",
-            "NoNewPrivileges=yes",
-            "SystemCallFilter=@system-service",
-            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
+        for property in [
+            "AmbientCapabilities=",
+            "CapabilityBoundingSet=",
+            "LockPersonality=yes",
             "MemoryDenyWriteExecute=yes",
+            "NoNewPrivileges=yes",
+            "PrivateDevices=yes",
+            "PrivateTmp=yes",
+            "ProcSubset=pid",
+            "ProtectClock=yes",
+            "ProtectControlGroups=yes",
+            "ProtectHome=read-only",
+            "ProtectHostname=yes",
+            "ProtectKernelLogs=yes",
+            "ProtectKernelModules=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectProc=invisible",
+            "ProtectSystem=strict",
+            "RemoveIPC=yes",
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK",
+            "RestrictNamespaces=yes",
+            "RestrictRealtime=yes",
+            "RestrictSUIDSGID=yes",
+            "SystemCallArchitectures=native",
+            "SystemCallErrorNumber=EPERM",
+            "SystemCallFilter=@system-service",
+            "SystemCallFilter=~@privileged",
+            "SystemCallFilter=~@resources",
             "UMask=0077",
+        ] {
+            assert!(
+                unit.contains(&format!("\n{property}\n")),
+                "missing {property} in unit:\n{unit}"
+            );
+        }
+    }
+
+    /// Nothing in the data file may go unrendered: a property the renderer
+    /// drops would silently leave the sandbox weaker than the file claims.
+    #[test]
+    fn every_hardening_property_reaches_the_unit() {
+        let unit = render_unit(&spec(None));
+        for line in hardening().lines() {
+            assert!(unit.contains(line), "missing {line} in unit:\n{unit}");
+        }
+    }
+
+    #[test]
+    fn unit_carries_the_age_subprocess_environment() {
+        let unit = render_unit(&spec(None));
+        for needle in [
             // SecretFile needs a writable tmpfs under ProtectSystem=strict
             "RuntimeDirectory=ssync",
             "Environment=\"XDG_RUNTIME_DIR=%t/ssync\"",
@@ -264,18 +313,27 @@ mod tests {
         }
     }
 
-    /// The three copies of the hardening set (this unit, the NixOS module,
-    /// the home-manager module) must not drift apart silently.
+    /// The nix modules must keep importing the shared data file rather than
+    /// growing their own copy: an inlined property drifts silently, and the
+    /// old name-only comparison could not see a changed value at all.
     #[test]
-    fn hardening_set_matches_the_nix_modules() {
+    fn nix_modules_import_the_shared_hardening_data() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let keys: Vec<&str> = hardening()
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, _)| key)
+            .collect();
         for module in ["nix/nixos-module.nix", "nix/hm-module.nix"] {
             let nix = std::fs::read_to_string(root.join(module)).unwrap();
-            for line in HARDENING.lines() {
-                let key = line.split_once('=').unwrap().0;
+            assert!(
+                nix.contains("importTOML ../crates/ssync/systemd-hardening.toml"),
+                "{module} no longer imports the shared hardening data"
+            );
+            for key in &keys {
                 assert!(
-                    nix.contains(key),
-                    "{module} missing hardening property {key}"
+                    !nix.contains(&format!("{key} =")),
+                    "{module} inlines hardening property {key} instead of importing it"
                 );
             }
         }

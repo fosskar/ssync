@@ -7,37 +7,50 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use ssync_core::Config;
 
-/// Hardening shared with the NixOS and Home Manager modules (DECISIONS §12).
-pub(crate) const HARDENING: &str = "\
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectClock=yes
-ProtectHostname=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectProc=invisible
-ProcSubset=pid
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-RemoveIPC=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged
-SystemCallFilter=~@resources
-SystemCallErrorNumber=EPERM
-SystemCallArchitectures=native
-UMask=0077
-";
+/// The systemd sandbox (DECISIONS §12), rendered from the file the NixOS and
+/// Home Manager modules import too — so the profile has exactly one definition.
+const HARDENING_TOML: &str = include_str!("../systemd-hardening.toml");
+
+/// The shared `[Service]` hardening lines, newline-terminated. Booleans render
+/// `yes`/`no`, arrays as one `Key=value` line per element; the flat table
+/// iterates alphabetically, matching what the nix modules emit.
+pub(crate) fn hardening() -> &'static str {
+    static RENDERED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let table: toml::Table = HARDENING_TOML
+            .parse()
+            .expect("systemd-hardening.toml is valid TOML");
+        let mut out = String::new();
+        for (key, value) in &table {
+            for rendered in unit_values(key, value) {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(rendered);
+                out.push('\n');
+            }
+        }
+        out
+    });
+    &RENDERED
+}
+
+/// One unit-file value per rendered line. A property is a boolean, a string,
+/// or an array of strings; anything else means the data file grew a shape no
+/// renderer understands, and silently dropping it would weaken the sandbox.
+fn unit_values<'a>(key: &str, value: &'a toml::Value) -> Vec<&'a str> {
+    match value {
+        toml::Value::Boolean(true) => vec!["yes"],
+        toml::Value::Boolean(false) => vec!["no"],
+        toml::Value::String(text) => vec![text.as_str()],
+        toml::Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .unwrap_or_else(|| panic!("hardening {key}: array entries must be strings"))
+            })
+            .collect(),
+        other => panic!("hardening {key}: unsupported value {other}"),
+    }
+}
 
 /// Values resolved by the lifecycle before command-specific unit rendering.
 pub(crate) struct InstallContext<'a> {

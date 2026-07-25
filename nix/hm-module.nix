@@ -60,8 +60,9 @@ let
     ]
     ++ lib.optional cfg.autoCleanup.unnamed "--unnamed"
   );
-  # --- hardening (parity with the NixOS module and `ssync service install`,
-  # crates/ssync/src/service.rs — change all three together) ---
+  # --- hardening (DECISIONS §12) ---
+  # One definition, three consumers: this module, nix/nixos-module.nix, and
+  # `ssync service install` (crates/ssync/src/systemd.rs renders the same file).
   # The daemon needs: RW to the session dirs and dataDir (both under
   # $HOME), the RuntimeDirectory for age key temp files, read access to
   # the secrets it is pointed at, and outbound QUIC/UDP plus netlink for
@@ -71,38 +72,7 @@ let
   # sharing RuntimeDirectory would let the oneshot's exit remove it under
   # the running daemon (systemd#5394 — runtime dirs are not ref-counted),
   # and the oneshot only deletes session files, so no dataDir write access.
-  hardening = {
-    NoNewPrivileges = true;
-    ProtectSystem = "strict";
-    ProtectHome = "read-only";
-    PrivateTmp = true;
-    PrivateDevices = true;
-    ProtectClock = true;
-    ProtectHostname = true;
-    ProtectKernelTunables = true;
-    ProtectKernelModules = true;
-    ProtectKernelLogs = true;
-    ProtectControlGroups = true;
-    ProtectProc = "invisible";
-    ProcSubset = "pid";
-    RestrictNamespaces = true;
-    RestrictRealtime = true;
-    RestrictSUIDSGID = true;
-    RestrictAddressFamilies = "AF_INET AF_INET6 AF_UNIX AF_NETLINK";
-    LockPersonality = true;
-    MemoryDenyWriteExecute = true;
-    RemoveIPC = true;
-    CapabilityBoundingSet = "";
-    AmbientCapabilities = "";
-    SystemCallFilter = [
-      "@system-service"
-      "~@privileged"
-      "~@resources"
-    ];
-    SystemCallErrorNumber = "EPERM";
-    SystemCallArchitectures = "native";
-    UMask = "0077";
-  };
+  hardening = lib.importTOML ../crates/ssync/systemd-hardening.toml;
 in
 {
   options.services.ssync = {
