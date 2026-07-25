@@ -330,11 +330,6 @@ impl Engine {
         let mut changed = false;
         let mut index_changed = false;
         for action in actions {
-            if let Action::Tombstone { key } = &action
-                && pass.tombstone_withheld(key)
-            {
-                continue;
-            }
             let action_changed = Self::execute(
                 &action,
                 Execution {
@@ -947,6 +942,104 @@ mod tests {
         std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
         engine.tick_once().await;
         assert!(!engine.persist_wedged(), "successful persist must reset");
+    }
+
+    /// Freezing an agent (#49) is enforced by `SessionFilesystem`, but the
+    /// consequences land in `tick_once`. These three pin them at the engine
+    /// level: each one passed with its guard deleted before this existed.
+    ///
+    /// Two agents, not one: with a single agent its freeze empties the whole
+    /// local snapshot, and reconcile's empty-dir wipe guard suppresses
+    /// tombstones on its own — the test would pass without the freeze working.
+    async fn frozen_agent_engine(tag: &str) -> (Engine, PathBuf, String) {
+        let base = std::env::temp_dir().join(format!("ssync-frozen-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let name = "2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl";
+        let header: &[u8] = b"{\"type\":\"session\",\"version\":3}\n";
+
+        let pi_root = base.join("pi-sessions");
+        let project = pi_root.join("--p--");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(name), header).unwrap();
+
+        // stays healthy throughout, so the local snapshot is never empty
+        let omp_root = base.join("omp-sessions");
+        let omp_project = omp_root.join("--q--");
+        std::fs::create_dir_all(&omp_project).unwrap();
+        std::fs::write(omp_project.join(name), header).unwrap();
+
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        let engine = Engine::with_adapters(
+            vec![
+                Box::new(PiAdapter::new("pi", &pi_root)),
+                Box::new(PiAdapter::new("omp", &omp_root)),
+            ],
+            AgeIdentity::generate().await.unwrap(),
+            node,
+        );
+        (engine, project, format!("pi/--p--/{name}"))
+    }
+
+    /// An unidentifiable file makes the whole scan incomplete, so the agent is
+    /// frozen for the pass.
+    fn freeze_agent(project: &Path) {
+        std::fs::write(project.join("missing-session-id.jsonl"), b"session").unwrap();
+    }
+
+    #[tokio::test]
+    async fn frozen_agent_does_not_tombstone_a_peers_session() {
+        let (mut engine, project, key) = frozen_agent_engine("tombstone").await;
+        assert!(engine.tick_once().await, "first tick must import");
+        assert!(
+            engine.node.index_record(&key).await.unwrap().is_some(),
+            "session must be indexed before the freeze"
+        );
+
+        // the file vanishes at the same moment the agent goes blind: absence is
+        // an artefact of the skip, not a deletion
+        std::fs::remove_file(project.join(key.rsplit('/').next().unwrap())).unwrap();
+        freeze_agent(&project);
+        engine.tick_once().await;
+
+        let record = engine.node.index_record(&key).await.unwrap();
+        assert!(
+            record.is_some_and(|record| record.winner.is_some()),
+            "a frozen agent must never tombstone: peers would lose the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_agent_keeps_its_carried_state() {
+        let (mut engine, project, key) = frozen_agent_engine("state").await;
+        assert!(engine.tick_once().await, "first tick must import");
+        assert!(engine.state.keys.contains_key(&key));
+
+        freeze_agent(&project);
+        engine.tick_once().await;
+
+        // the key is in neither snapshot while frozen; dropping its state would
+        // make the next healthy pass read the file as never materialised
+        assert!(
+            engine.state.keys.contains_key(&key),
+            "a frozen agent's carried state must survive the pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_pass_does_not_settle_the_recipient_set() {
+        let (mut engine, project, _) = frozen_agent_engine("recipients").await;
+        freeze_agent(&project);
+
+        engine.tick_once().await;
+
+        assert!(
+            engine.state.recipients.is_none(),
+            "settling the fingerprint on a blind pass would skip re-encrypting \
+             every key the pass could not see (issue #22)"
+        );
     }
 
     #[test]
