@@ -96,10 +96,6 @@ impl SessionPass<'_> {
         self.filesystem.local_attempt("delete", key, result)
     }
 
-    pub fn tombstone_withheld(&self, key: &str) -> bool {
-        self.filesystem.tombstone_withheld(key)
-    }
-
     pub fn relative_of<'a>(&self, key: &'a str) -> Option<&'a str> {
         self.filesystem.relative_of(key)
     }
@@ -275,39 +271,44 @@ impl SessionFilesystem {
         self.excluded_parts(self.adapters[idx].agent(), rel)
     }
 
-    /// Whether a key is invisible to reconcile: excluded (#14) or owned by no
-    /// configured adapter (dropped-agent guard — a removed `[[agents]]` entry
-    /// must never tombstone peers' sessions).
+    /// Whether this pass could not see `agent`'s sessions completely: its scan
+    /// aborted or its path-map resolution failed (#49). The one definition —
+    /// every verdict below is this question asked at a different scope, and
+    /// spelling it out per call site is how one of them drifts.
+    fn agent_incomplete(&self, agent: &str) -> bool {
+        self.incomplete_agents.contains(agent) || self.resolver.agent_failed(agent)
+    }
+
+    /// Whether a key is invisible to reconcile: its agent was not fully seen
+    /// (#49), excluded (#14), or owned by no configured adapter (dropped-agent
+    /// guard — a removed `[[agents]]` entry must never tombstone peers'
+    /// sessions). Filtering both reconcile inputs is what keeps a blind pass
+    /// from emitting a tombstone: the key never reaches [`reconcile`] with an
+    /// index entry, and `Action::Tombstone` needs one.
     fn frozen(&self, key: &str) -> bool {
         let Some((idx, rel)) = self.key_parts(key) else {
             return true;
         };
         let agent = self.adapters[idx].agent();
-        self.incomplete_agents.contains(agent)
-            || self.resolver.agent_failed(agent)
-            || self.excluded_parts(agent, rel)
+        self.agent_incomplete(agent) || self.excluded_parts(agent, rel)
     }
 
-    /// Whether a tombstone for this key must be withheld this pass: its
-    /// agent's mapping failed (#49), so "file gone" is an artifact of the
-    /// skip, not a delete.
-    fn tombstone_withheld(&self, key: &str) -> bool {
-        self.adapter_of_key(key).is_some_and(|adapter| {
-            self.incomplete_agents.contains(adapter.agent())
-                || self.resolver.agent_failed(adapter.agent())
-        })
-    }
-
+    /// Whether `key`'s carried state must survive a pass that dropped it from
+    /// both snapshots: the agent was not fully seen, so absence proves nothing
+    /// and forgetting we materialised it would re-import on the next healthy
+    /// pass. Keys of unconfigured agents are not covered — nothing here can be
+    /// blind to an agent it does not have.
     fn state_retained(&self, key: &str) -> bool {
-        self.adapter_of_key(key).is_some_and(|adapter| {
-            self.incomplete_agents.contains(adapter.agent())
-                || self.resolver.agent_failed(adapter.agent())
-        })
+        self.adapter_of_key(key)
+            .is_some_and(|adapter| self.agent_incomplete(adapter.agent()))
     }
 
+    /// [`agent_incomplete`](Self::agent_incomplete) across every configured
+    /// agent: whether this pass saw the whole filesystem.
     fn pass_complete(&self) -> bool {
         self.incomplete_agents.is_empty() && !self.resolver.any_agent_failed()
     }
+
     /// Whether the key's format merges (append-only line union) rather than
     /// newest-wins. `false` for keys of unconfigured agents.
     fn append_only(&self, key: &str) -> bool {
@@ -1039,10 +1040,10 @@ mod tests {
         std::fs::write(&path, b"{\"type\":\"session\",\"version\":3}\n").unwrap();
 
         assert!(filesystem.snapshot().is_empty());
-        assert!(filesystem.tombstone_withheld("pi/--proj--/other.jsonl"));
+        assert!(filesystem.frozen("pi/--proj--/other.jsonl"));
         std::fs::remove_file(path).unwrap();
         assert!(filesystem.snapshot().is_empty());
-        assert!(!filesystem.tombstone_withheld("pi/--proj--/other.jsonl"));
+        assert!(!filesystem.frozen("pi/--proj--/other.jsonl"));
     }
 
     #[tokio::test]
@@ -1129,7 +1130,7 @@ mod tests {
         );
 
         assert!(filesystem.snapshot().is_empty());
-        assert!(filesystem.tombstone_withheld("omp/-Projects-x/other.jsonl"));
+        assert!(filesystem.frozen("omp/-Projects-x/other.jsonl"));
     }
 
     #[test]
@@ -1350,7 +1351,7 @@ mod tests {
         );
 
         assert!(filesystem.snapshot().is_empty());
-        assert!(filesystem.tombstone_withheld("pi/--project--/other.jsonl"));
+        assert!(filesystem.frozen("pi/--project--/other.jsonl"));
     }
 
     #[tokio::test]
