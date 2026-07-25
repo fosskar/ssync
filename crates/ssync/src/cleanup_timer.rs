@@ -10,7 +10,7 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 
 use crate::systemd::{
-    self, Activation, HARDENING, RemoveSpec, UnitFile, UnitSet, ensure_unit_safe,
+    self, Activation, RemoveSpec, UnitFile, UnitSet, ensure_unit_safe, hardening,
 };
 
 const SERVICE_NAME: &str = "ssync-cleanup.service";
@@ -118,9 +118,10 @@ pub fn render_service(spec: &TimerSpec<'_>) -> String {
          ExecStart=\"{exec}\" --config \"{config}\" cleanup{args} --apply\n\
          {user}\
          ReadWritePaths={rw_paths}\n\
-         {HARDENING}",
+         {hardening}",
         exec = spec.exec.display(),
         config = spec.config_path.display(),
+        hardening = hardening(),
     )
 }
 

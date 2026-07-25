@@ -70,50 +70,17 @@ let
     ]
     ++ lib.optional cfg.autoCleanup.unnamed "--unnamed"
   );
-  # --- hardening (parity with the home-manager module and `ssync service
-  # install`, crates/ssync/src/service.rs — change all three together) ---
+  # --- hardening (DECISIONS §12) ---
+  # One definition, three consumers: this module, nix/hm-module.nix, and
+  # `ssync service install` (crates/ssync/src/systemd.rs renders the same file).
   # The daemon needs: RW to the session dirs (under $HOME) and its StateDirectory,
   # read access to the secrets it is pointed at (/run/secrets, /nix/store),
   # and outbound QUIC/UDP plus netlink for iroh. Everything else is denied.
   # The cleanup oneshot reuses the same set (it only deletes session files).
   hardening = {
     ReadWritePaths = map (a: a.sessionDir) cfg.agents;
-    NoNewPrivileges = true;
-    ProtectSystem = "strict";
-    ProtectHome = "read-only";
-    PrivateTmp = true;
-    PrivateDevices = true;
-    ProtectClock = true;
-    ProtectHostname = true;
-    ProtectKernelTunables = true;
-    ProtectKernelModules = true;
-    ProtectKernelLogs = true;
-    ProtectControlGroups = true;
-    ProtectProc = "invisible";
-    ProcSubset = "pid";
-    RestrictNamespaces = true;
-    RestrictRealtime = true;
-    RestrictSUIDSGID = true;
-    RestrictAddressFamilies = [
-      "AF_INET"
-      "AF_INET6"
-      "AF_UNIX"
-      "AF_NETLINK"
-    ];
-    LockPersonality = true;
-    MemoryDenyWriteExecute = true;
-    RemoveIPC = true;
-    CapabilityBoundingSet = "";
-    AmbientCapabilities = "";
-    SystemCallFilter = [
-      "@system-service"
-      "~@privileged"
-      "~@resources"
-    ];
-    SystemCallErrorNumber = "EPERM";
-    SystemCallArchitectures = "native";
-    UMask = "0077";
-  };
+  }
+  // lib.importTOML ../crates/ssync/systemd-hardening.toml;
 in
 {
   options.services.ssync = {
