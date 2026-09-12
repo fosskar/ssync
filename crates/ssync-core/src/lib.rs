@@ -26,7 +26,7 @@ use divergence::{Divergence, Verdict};
 use reconcile::{Action, SyncState, reconcile};
 use session_filesystem::{LocalAttempt, SessionPass, StatusIndexRecord};
 pub use session_filesystem::{PathMap, SessionFilesystem, SessionFsConfig};
-use session_store::{SessionStore, recipients_fingerprint};
+use session_store::{DecryptFailures, SessionStore, recipients_fingerprint};
 pub use status::{PeerStatus, StatusReport};
 
 /// Consecutive state-persist ENOENT failures after which the daemon exits so
@@ -56,6 +56,9 @@ pub struct Engine {
     /// Cached divergence verdicts; skips re-decrypting sessions whose version
     /// set has not changed (e.g. a stale second author entry on every tick).
     divergence: Divergence,
+    /// Blobs that already failed to decrypt; retrying them spawns `age` on
+    /// every tick with no chance of success (issue #109).
+    decrypt_failures: DecryptFailures,
     /// How often the daemon re-initiates sync with the known peers.
     resync_interval: std::time::Duration,
     /// Fingerprint of the configured recipient set (sorted, hashed).
@@ -113,6 +116,7 @@ impl Engine {
             conflicts_logged: Default::default(),
             persist_enoent: 0,
             divergence: Divergence::default(),
+            decrypt_failures: DecryptFailures::default(),
             resync_interval: std::time::Duration::from_secs(60),
             status_records: None,
             recipients_fp,
@@ -155,7 +159,7 @@ impl Engine {
 
     /// A view of session bytes at rest: encryption paired with the mesh.
     fn store(&self) -> SessionStore<'_> {
-        SessionStore::new(&self.identity, &self.node)
+        SessionStore::new(&self.identity, &self.node, &self.decrypt_failures)
     }
 
     /// One index scan: live session count plus the still-diverged sessions
@@ -334,7 +338,7 @@ impl Engine {
                 &action,
                 Execution {
                     pass: &mut pass,
-                    store: SessionStore::new(&self.identity, &self.node),
+                    store: SessionStore::new(&self.identity, &self.node, &self.decrypt_failures),
                     state: &mut self.state,
                     divergence: &self.divergence,
                     merged_logged: &mut self.merged_logged,
@@ -444,10 +448,18 @@ impl Engine {
                 }
             }
             Action::WriteFile { key, hash } => {
+                let known_undecryptable = store.undecryptable(*hash);
                 let plaintext = match store.fetch_plaintext(*hash).await {
                     Ok(plaintext) => plaintext,
+                    // A blob we can never decrypt is a peer's, encrypted without
+                    // us: not ours to re-publish, so it must not hold rotation
+                    // settlement hostage, and it is worth one log line, not one
+                    // per tick.
+                    Err(_) if known_undecryptable => return false,
                     Err(error) => {
-                        *import_errors += 1;
+                        if !store.undecryptable(*hash) {
+                            *import_errors += 1;
+                        }
                         eprintln!("ssync: materialise {key}: {error:#}");
                         return false;
                     }
@@ -690,7 +702,11 @@ mod tests {
                 },
                 Execution {
                     pass: &mut pass,
-                    store: SessionStore::new(&engine.identity, &engine.node),
+                    store: SessionStore::new(
+                        &engine.identity,
+                        &engine.node,
+                        &engine.decrypt_failures,
+                    ),
                     state: &mut engine.state,
                     divergence: &engine.divergence,
                     merged_logged: &mut engine.merged_logged,
@@ -705,6 +721,83 @@ mod tests {
         assert_eq!(engine.import_errors, 1);
         assert_eq!(engine.state.keys[key].import_stamp, None);
         assert!(engine.state.recipients.is_none());
+    }
+
+    #[tokio::test]
+    async fn undecryptable_blob_is_attempted_once() {
+        let base = std::env::temp_dir().join(format!("ssync-undecryptable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        // a peer whose recipient we are not: its ciphertext never decrypts here
+        let stranger = AgeIdentity::generate().await.unwrap();
+        let hash = node
+            .add_blob(stranger.encrypt(b"foreign session").await.unwrap())
+            .await
+            .unwrap();
+        let engine = Engine::new(
+            PiAdapter::new("pi", base.join("sessions")),
+            AgeIdentity::generate().await.unwrap(),
+            node,
+        );
+
+        for _ in 0..5 {
+            assert!(engine.store().local_plaintext(hash).await.is_none());
+            assert!(engine.store().fetch_plaintext(hash).await.is_err());
+        }
+
+        assert_eq!(
+            engine.decrypt_failures.attempts(),
+            1,
+            "a permanent decrypt failure must not re-spawn age (issue #109)"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn undecryptable_blob_does_not_block_rotation_settlement() {
+        let base =
+            std::env::temp_dir().join(format!("ssync-poisoned-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sessions_root = base.join("sessions");
+        let proj = sessions_root.join("--home-simon-Projects-demo--");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4a.jsonl"),
+            b"{\"type\":\"session\",\"version\":3}\n",
+        )
+        .unwrap();
+        let mut node = Node::spawn(&base.join("data"), SecretKey::generate())
+            .await
+            .unwrap();
+        node.create_namespace().await.unwrap();
+        // a peer's session encrypted without us: never ours to materialise or re-publish
+        let stranger = AgeIdentity::generate().await.unwrap();
+        node.publish(
+            "pi/--home-simon-Projects-demo--/2026-05-23T06-55-21-771Z_019e539d-f6ab-71ac-be20-d3ae2b23ea4b.jsonl".to_string(),
+            stranger.encrypt(b"foreign").await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut engine = Engine::new(
+            PiAdapter::new("pi", &sessions_root),
+            AgeIdentity::generate().await.unwrap(),
+            node,
+        );
+
+        engine.tick_once().await;
+        engine.tick_once().await;
+
+        assert_eq!(
+            engine.import_errors, 0,
+            "a permanent failure is not a retryable import error"
+        );
+        assert!(
+            engine.state.recipients.is_some(),
+            "one undecryptable peer blob must not hold the recipient fingerprint unsettled forever"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
