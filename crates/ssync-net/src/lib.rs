@@ -945,11 +945,17 @@ mod tests {
         b.sync_with(vec![addr_a]).await.unwrap();
         let hash = a.publish("pi/p/s", b"ciphertext".to_vec()).await.unwrap();
         let mut seen = false;
-        for _ in 0..60 {
+        for i in 0..60 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if b.index_record("pi/p/s").await.unwrap().is_some() {
                 seen = true;
                 break;
+            }
+            // a live link that never came up stays down; the daemon's
+            // resync tick is what recovers it (ssync-core run loop)
+            if i % 4 == 3 {
+                a.resync().await.unwrap();
+                b.resync().await.unwrap();
             }
         }
         assert!(seen, "index entry never synced to b");
