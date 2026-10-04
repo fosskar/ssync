@@ -40,26 +40,11 @@ in
     outputs.effects.update-flake-inputs = mkEffect {
       name = "effect-update-flake-inputs";
       checkout = true;
-      inputs = [
-        pkgs.git
-        pkgs.nix
-      ];
+      inputs = [ pkgs.nix ];
       secretsMap.git.type = "GitToken";
       effectScript = ''
-        set -euo pipefail
-        token=$(jq -re '.git.data.token' "$HERCULES_CI_SECRETS_JSON")
-        export FORGE_TOKEN="$token"
-        export GITHUB_TOKEN="$token"
-        export NIX_CONFIG="experimental-features = nix-command flakes
-        access-tokens = github.com=$token"
-
-        git config --global user.name 'fosskar[bot]'
-        git config --global user.email '300917551+fosskar[bot]@users.noreply.github.com'
-
-        git config remote.origin.promisor true
-        git config remote.origin.partialclonefilter blob:none
-
-        nix run "github:fosskar/nixfiles#updater-flake-inputs"
+        nix --extra-experimental-features 'nix-command flakes' \
+          run github:fosskar/nixfiles#updater-effect -- flake-inputs
       '';
     };
   };
