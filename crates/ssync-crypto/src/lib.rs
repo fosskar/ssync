@@ -661,13 +661,19 @@ mod tests {
             )
             .await
         });
+        // the shell creates the file before printf writes it; an empty pid
+        // would check /proc itself and never look reaped
+        let mut pid = String::new();
         for _ in 0..100 {
-            if pid_file.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && !contents.is_empty()
+            {
+                pid = contents;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(!pid.is_empty(), "child did not record its pid");
 
         operation.abort();
         assert!(operation.await.unwrap_err().is_cancelled());
