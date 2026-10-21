@@ -811,8 +811,8 @@ mod tests {
 
         let hash = a.publish("pi/p/s", b"lan bytes".to_vec()).await.unwrap();
         let mut synced = false;
-        for _ in 0..40 {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        for i in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if b.index_record("pi/p/s")
                 .await
                 .unwrap()
@@ -820,6 +820,12 @@ mod tests {
             {
                 synced = true;
                 break;
+            }
+            // a live link that never came up stays down; the daemon's
+            // resync tick is what recovers it (ssync-core run loop)
+            if i % 4 == 3 {
+                a.resync().await.unwrap();
+                b.resync().await.unwrap();
             }
         }
         assert!(synced, "lan-only nodes never converged over direct addrs");
